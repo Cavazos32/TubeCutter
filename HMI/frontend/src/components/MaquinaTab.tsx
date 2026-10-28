@@ -312,7 +312,7 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
     pfHasError ||
     pfStartReady ||
     pfPrepBusy ||
-    machineState.cycleActive;
+    !!machineState.pfOperatorStartBlocked;
   const recoveryStage =
     machineState.refillActive && machineState.refillPrompt
       ? machineState.refillPrompt
@@ -818,8 +818,8 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
                   mm
                 </span>
               </div>
-              <p className="mt-1.5 min-h-[1.25rem] truncate text-sm leading-tight text-transparent select-none" aria-hidden="true">
-                {'\u00A0'}
+              <p className="mt-1.5 min-h-[1.25rem] truncate text-sm leading-tight text-slate-500 dark:text-slate-400">
+                {t('cfg_cut_offset_hint')}
               </p>
             </div>
 

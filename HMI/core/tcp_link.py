@@ -12,9 +12,10 @@ from typing import Any, Callable, Optional
 
 CONNECT_TIMEOUT = 2.0
 RECONNECT_SEC = 3.0
-HEARTBEAT_INTERVAL_SEC = 4.0
-HEARTBEAT_STALE_SEC = 12.0
-VERIFY_TIMEOUT_SEC = 3.0
+HEARTBEAT_INTERVAL_SEC = 5.0
+HEARTBEAT_STALE_SEC = 25.0
+VERIFY_TIMEOUT_SEC = 4.0
+PROBE_FAIL_MAX = 5
 RX_TIMEOUT_SEC = 0.5
 RX_JOIN_TIMEOUT_SEC = 1.0
 
@@ -64,6 +65,10 @@ class ModuleTcpClient(ABC):
         self._last_rx_mono = 0.0
         self._last_probe_mono = 0.0
         self._connect_gate = threading.Lock()
+        self._handshake = False
+        self._probe_misses = 0
+        # Evita que los 4 módulos reconecten en el mismo instante (pico WiFi/CPU).
+        self._reconnect_jitter = (hash(f"{host}:{port}") & 0xFF) / 256.0 * RECONNECT_SEC
 
     @property
     def connected(self) -> bool:
@@ -98,6 +103,13 @@ class ModuleTcpClient(ABC):
             return self._connect_locked(timeout=timeout, silent=silent)
 
     def _connect_locked(self, timeout: float, silent: bool) -> bool:
+        with self._conn_lock:
+            if self._connected and self._sock is not None:
+                if (
+                    not self._last_rx_mono
+                    or (time.monotonic() - self._last_rx_mono) < HEARTBEAT_STALE_SEC
+                ):
+                    return True
         self._drop_link(notify=False)
 
         session = 0
@@ -128,20 +140,25 @@ class ModuleTcpClient(ABC):
                 )
                 self._rx_thread.start()
 
-        self._send_probe()
-        if not self._wait_verified(session_start):
-            if not silent:
-                self._emit_error(
-                    f"Sin respuesta de {self._host}:{self._port} tras conectar"
-                )
-            self._drop_link(notify=False)
-            return False
+        self._handshake = True
+        try:
+            self._send_probe()
+            if not self._wait_verified(session_start):
+                if not silent:
+                    self._emit_error(
+                        f"Sin respuesta de {self._host}:{self._port} tras conectar"
+                    )
+                self._drop_link(notify=False)
+                return False
+        finally:
+            self._handshake = False
 
         with self._conn_lock:
             if session != self._session or self._sock is not sock:
                 return False
             self._connected = True
             self._last_probe_mono = time.monotonic()
+            self._probe_misses = 0
 
         self._schedule_connection(True)
         return True
@@ -223,6 +240,7 @@ class ModuleTcpClient(ABC):
     def _bg_loop(self) -> None:
         while not self._stop_bg.is_set():
             if not self._connected:
+                self._stop_bg.wait(self._reconnect_jitter)
                 self.connect(silent=True)
                 self._stop_bg.wait(RECONNECT_SEC)
                 continue
@@ -235,9 +253,11 @@ class ModuleTcpClient(ABC):
             if now - self._last_probe_mono >= HEARTBEAT_INTERVAL_SEC:
                 self._last_probe_mono = now
                 if not self._send_probe():
-                    # No disconnect síncrono desde send: el probe ya falló.
-                    self.disconnect(silent=False)
+                    self._probe_misses += 1
+                    if self._probe_misses >= PROBE_FAIL_MAX:
+                        self.disconnect(silent=False)
                     continue
+                self._probe_misses = 0
 
             self._stop_bg.wait(0.5)
 
@@ -245,9 +265,10 @@ class ModuleTcpClient(ABC):
         line = json.dumps(payload, separators=(",", ":")) + "\n"
         data = line.encode("utf-8")
         with self._io_lock:
-            # Evitar ventana "connected=True / sock muerto": no enviar si el
-            # flag de enlace ya cayó o el socket fue invalidado por RX/drop.
-            if not self._connected or not self._sock:
+            # Durante handshake aún no hay _connected; sí hay socket y RX activo.
+            if not self._sock:
+                return False
+            if not self._connected and not self._handshake:
                 return False
             try:
                 self._sock.sendall(data)
@@ -270,6 +291,7 @@ class ModuleTcpClient(ABC):
                 if session != self._session:
                     break
                 self._last_rx_mono = time.monotonic()
+                self._probe_misses = 0
                 buf += chunk.decode("utf-8", errors="replace")
                 while "\n" in buf:
                     line, buf = buf.split("\n", 1)

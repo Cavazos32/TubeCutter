@@ -99,6 +99,8 @@ export interface MachineState {
   isRunning: boolean;
   isPaused: boolean;
   cycleActive: boolean;
+  /** Producción activa: bloquea Iniciar alimentador (no aplica en pausa/refill/settle). */
+  pfOperatorStartBlocked?: boolean;
   cycleStep: number;
   cycleStepLabel: string;
   cycleMaterialist: boolean;
@@ -168,6 +170,9 @@ export interface MotionState {
   feederCanRTesting: boolean;
   offsetL: number;
   offsetR: number;
+  servoCanReady: boolean;
+  canInitPending: boolean;
+  canInitBusy: boolean;
   laserR: boolean;
   laserL: boolean;
   statusText?: string;

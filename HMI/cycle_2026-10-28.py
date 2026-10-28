@@ -27,8 +27,8 @@ from machine_states import (
     TX_PAUSE,
     TX_STOP,
 )
-from error_catalog import format_ui, lookup
-from plc import CMD_ENCODER, CMD_GRIPPER, CMD_HOLDER, CMD_HOLDER_ENCODER
+from core.error_catalog import format_ui, lookup
+from clients.plc import CMD_ENCODER, CMD_GRIPPER, CMD_HOLDER, CMD_HOLDER_ENCODER
 
 HMI_ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = HMI_ROOT / "config" / "cycle_config.json"

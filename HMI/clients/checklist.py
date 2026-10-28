@@ -399,6 +399,14 @@ class ChecklistManager:
             self._session = None
             self._air_test_active = False
             self._piece_test_started = False
+        total = len(STEP_IDS)
+        if hasattr(host, "append_checklist_register"):
+            host.append_checklist_register(
+                str(emp),
+                self._last_completed_at or _utc_now_iso(),
+                total,
+                total,
+            )
         self._log(f"Checklist: completado (empleado {emp})")
         self.clear_step_error()
         self._notify()

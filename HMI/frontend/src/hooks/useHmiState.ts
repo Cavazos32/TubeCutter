@@ -117,6 +117,9 @@ export function useHmiState() {
       feederCanRTesting: false,
       offsetL: 0,
       offsetR: 0,
+      servoCanReady: false,
+      canInitPending: false,
+      canInitBusy: false,
       laserR: false,
       laserL: false,
     },
@@ -262,9 +265,9 @@ export function useHmiState() {
         }
       };
       es.onerror = () => {
-        setView((prev) => ({ ...prev, connected: false }));
-        // Solo recrear si el browser cerró el stream (no pelear con reconnect nativo).
+        // EventSource dispara onerror en cortes breves; no marcar OFF hasta CLOSED.
         if (es && es.readyState === EventSource.CLOSED) {
+          setView((prev) => ({ ...prev, connected: false }));
           es.close();
           es = null;
           if (!closed) {
@@ -604,6 +607,17 @@ export function useHmiState() {
     api.motionAction('feed_r').catch(() => {});
   }, []);
 
+  const feedCanInit = useCallback(() => {
+    if (
+      !window.confirm(
+        '¿Reiniciar bus CAN y nodos servo del avance de material? Solo si la máquina está libre.'
+      )
+    ) {
+      return;
+    }
+    api.motionAction('feed_can_init').catch(() => {});
+  }, []);
+
   const saveFeedOffset = useCallback((l: number, r: number) => {
     api.setFeedOffset(l, r).catch(() => {});
   }, []);
@@ -891,6 +905,7 @@ export function useHmiState() {
     encSetZeroL,
     feedL,
     feedR,
+    feedCanInit,
     saveFeedOffset,
     toggleValve,
     valveBusy,

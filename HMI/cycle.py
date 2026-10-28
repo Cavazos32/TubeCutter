@@ -1,6 +1,6 @@
 """Cycle — orquestador de lote TCM (secuencia; no perfiles de Motion).
-Habla con Motion / PLC / PreFeeder por TCP. Esperas y timeouts de rutina:
-bloques al inicio de este archivo. Estado máquina bytes 0x40–0x49.
+Habla con Motion / PLC / PreFeeder por TCP. Parámetros de rutina en config/cycle.json.
+Estado máquina bytes 0x40–0x49.
 """
 from __future__ import annotations
 
@@ -27,13 +27,27 @@ from machine_states import (
     TX_PAUSE,
     TX_STOP,
 )
-from error_catalog import format_ui, lookup
-from plc import CMD_ENCODER, CMD_GRIPPER, CMD_HOLDER, CMD_HOLDER_ENCODER
+from core.error_catalog import format_ui, lookup
+from clients.plc import CMD_ENCODER, CMD_GRIPPER, CMD_HOLDER, CMD_HOLDER_ENCODER
 
 HMI_ROOT = Path(__file__).resolve().parent
-CONFIG_PATH = HMI_ROOT / "config" / "cycle_config.json"
+CONFIG_PATH = HMI_ROOT / "config" / "cycle.json"
+LEGACY_CYCLE_CONFIG_PATH = HMI_ROOT / "config" / "cycle_config.json"
+LEGACY_APP_CONFIG_PATH = HMI_ROOT / "config" / "app_config.json"
 
-# --- Delays de secuencia del ciclo (única fuente; editar aquí) ----------------
+APP_CONFIG_JSON_KEYS: tuple[str, ...] = (
+    "andonBuzzerMute",
+    "debugPassword",
+    "maintenanceCycleCount",
+    "checklistRequired",
+    "checklistLastCompletedAt",
+    "checklistSession",
+)
+
+# Marcador visual en cycle.json (ignorado al cargar app/ciclo).
+CYCLE_JSON_SECTION_SEPARATOR_KEY = "--- cycle ---"
+
+# Valores iniciales (se sobrescriben al cargar config/cycle.json).
 HOLDER_ON_MS = 25
 HOLDER_PRECUT_MS = 20
 HOLDER_OPEN_MS = 20
@@ -42,7 +56,7 @@ GRIPPER_RELEASE_MS = 20
 LINEAR_DONE_MS = 20
 DWELL_AT_DEST_MS = 20
 ASENTAR_MS = 20
-CUTTER_PULSE_MS = 50  # ≥ pulso KEEP PLC (100 ms) + margen
+CUTTER_PULSE_MS = 50
 CUTTER_POST_MS = 20
 CUTTER_SETTLE_MS = 20
 
@@ -65,19 +79,12 @@ def cycle_delay_ms(step_key: str) -> int:
     return int(_CYCLE_STEP_DELAY_MS[step_key])
 
 
-# --- Esperas fijas de rutina (segundos; no ms de válvulas) ---------------------
 PURGE_WARNING_LEAD_S = 0.3
 WIP_BLOWER_START_DELAY_S = 0.050
-
-# --- Soplo WIP (duración principal = calculada; estos son límites y umbrales) ---
-WIP_BLOWER_CONTINUOUS = True
 WIP_BLOWER_MIN_TRAVEL_MM = 1.0
-WIP_BLOWER_OFFSET_EPS_MM = 0.5
 WIP_START_CACHE_TOL_MM = 5.0
 WIP_BLOWER_LINEAL_MATCH_MIN_S = 0.2
 WIP_BLOWER_LINEAL_MATCH_MAX_S = 30.0
-
-# --- Timeouts y vigencias de rutina (segundos) ---------------------------------
 MOTION_WAIT_TIMEOUT_S = 25.0
 FEED_WAIT_TIMEOUT_S = 15.0
 PF_READY_TIMEOUT_S = 15.0
@@ -86,15 +93,11 @@ REFILL_LASER_TIMEOUT_S = 10.0
 PLC_ACK_TIMEOUT_S = 2.0
 MOTION_IDLE_NO_TARGET_S = 1.0
 PF_TFEED_DONE_TIMEOUT_S = 30.0
-# Intervalo de log mientras se espera buffer+holgura tras fin de lote (sin tope duro).
 PF_SETTLE_BEFORE_IDLE_S = 15.0
 PF_TFEED_CAPTURE_AFTER_PAUSE_S = 0.5
-
-# --- Tolerancias Motion (mm; no son tiempos) -----------------------------------
 ASDA_HOME_EPS_MM = 0.5
 MOTION_TARGET_TOL_MM = 3.0
 
-# --- Diagnóstico de tiempos (logs / .md; no afectan la secuencia) ------------
 TIMING_LOG_DIR = HMI_ROOT / "logs" / "cycle_timing"
 TIMING_GAP_REPORT_S = 0.050
 TIMING_DELAY_OVERSHOOT_MS = 15
@@ -180,7 +183,7 @@ FLOW_STEPS: list[dict[str, Any]] = [
         "kind": "wait",
         "delayMs": cycle_delay_ms("wait_cutter_pulse"),
         "sbsPause": False,
-        "note": "Ajuste en cycle.py (CUTTER_PULSE_MS)",
+        "note": "Ajuste en config/cycle.json (cutterPulseMs)",
     },
     {"id": 17, "key": "cutter_off", "label": "Apagar cortador", "kind": "action", "sbsPause": False},
     {
@@ -263,60 +266,72 @@ class _OrEvent:
         return any(e.is_set() for e in self._events)
 
 
-_LEGACY_CYCLE_DELAY_JSON_KEYS = frozenset(
-    {
-        "holderOnMs",
-        "holder_on_ms",
-        "holderPrecutMs",
-        "holder_precut_ms",
-        "holderOpenMs",
-        "holder_open_ms",
-        "grippersOnMs",
-        "grippers_on_ms",
-        "gripperReleaseMs",
-        "gripper_release_ms",
-        "cutterPulseMs",
-        "cutter_pulse_ms",
-        "cutterPostMs",
-        "cutter_post_ms",
-        "cutterSettleMs",
-        "cutter_settle_ms",
-        "linearDoneMs",
-        "linear_done_ms",
-        "asentarMs",
-        "asentar_ms",
-        "dwellAtDestMs",
-        "dwell_at_dest_ms",
-    }
-)
-
-_LEGACY_CYCLE_TIMEOUT_JSON_KEYS = frozenset(
-    {
-        "motionWaitTimeoutS",
-        "motion_wait_timeout_s",
-        "feedWaitTimeoutS",
-        "feed_wait_timeout_s",
-        "pfReadyTimeoutS",
-        "pf_ready_timeout_s",
-        "pieceWatchTimeoutS",
-        "piece_watch_timeout_s",
-    }
-)
+_LEGACY_CYCLE_JSON_ALIASES: dict[str, str] = {
+    "holder_on_ms": "holderOnMs",
+    "holder_precut_ms": "holderPrecutMs",
+    "holder_open_ms": "holderOpenMs",
+    "grippers_on_ms": "grippersOnMs",
+    "gripper_release_ms": "gripperReleaseMs",
+    "cutter_pulse_ms": "cutterPulseMs",
+    "cutter_post_ms": "cutterPostMs",
+    "cutter_settle_ms": "cutterSettleMs",
+    "linear_done_ms": "linearDoneMs",
+    "asentar_ms": "asentarMs",
+    "dwell_at_dest_ms": "dwellAtDestMs",
+    "motion_wait_timeout_s": "motionWaitTimeoutS",
+    "feed_wait_timeout_s": "feedWaitTimeoutS",
+    "pf_ready_timeout_s": "pfReadyTimeoutS",
+    "piece_watch_timeout_s": "pieceWatchTimeoutS",
+}
 
 
 @dataclass
 class CycleConfig:
     deposit_batch_size: int = 50
-    deposit_extra_mm: float = 30.0
-    deposit_stack_gap_mm: float = 20.0
+    deposit_extra_mm: float = 120.0
+    deposit_stack_gap_mm: float = 100.0
     deposit_max_travel_mm: float = 1500.0
-    gripper_clearance_mm: float = 10.0
+    gripper_clearance_mm: float = 5.0
     cut_offset_mm: float = 0.0
-    wip_blower_inicio_offset_mm: float = 8.0
     feed_sides: str = "LR"
-    pf_trigger_enabled: bool = True
+    pf_trigger_enabled: bool = False
     refill_mm: float = 55.0
     refill_asda_mm: float = -300.0
+    plc_blower_sec: float = 0.2
+    holder_on_ms: int = 25
+    holder_precut_ms: int = 20
+    holder_open_ms: int = 20
+    grippers_on_ms: int = 20
+    gripper_release_ms: int = 20
+    linear_done_ms: int = 20
+    dwell_at_dest_ms: int = 20
+    asentar_ms: int = 20
+    cutter_pulse_ms: int = 50
+    cutter_post_ms: int = 20
+    cutter_settle_ms: int = 20
+    purge_warning_lead_s: float = 0.3
+    wip_blower_start_delay_s: float = 0.050
+    wip_blower_min_travel_mm: float = 1.0
+    wip_start_cache_tol_mm: float = 5.0
+    wip_blower_lineal_match_min_s: float = 0.2
+    wip_blower_lineal_match_max_s: float = 30.0
+    motion_wait_timeout_s: float = 25.0
+    feed_wait_timeout_s: float = 15.0
+    pf_ready_timeout_s: float = 15.0
+    piece_watch_timeout_s: float = 20.0
+    refill_laser_timeout_s: float = 10.0
+    plc_ack_timeout_s: float = 2.0
+    motion_idle_no_target_s: float = 1.0
+    pf_tfeed_done_timeout_s: float = 30.0
+    pf_settle_before_idle_s: float = 15.0
+    pf_tfeed_capture_after_pause_s: float = 0.5
+    asda_home_eps_mm: float = 0.5
+    motion_target_tol_mm: float = 3.0
+    timing_gap_report_s: float = 0.050
+    timing_delay_overshoot_ms: int = 15
+    timing_cmd_slow_s: float = 0.080
+    timing_encoder_outlier_mm: float = 120.0
+    timing_summary_every_pieces: int = 100
 
     @staticmethod
     def normalize_feed_sides(raw: Any) -> str:
@@ -374,12 +389,77 @@ class CycleConfig:
             "depositMaxTravelMm": "deposit_max_travel_mm",
             "gripperClearanceMm": "gripper_clearance_mm",
             "cutOffsetMm": "cut_offset_mm",
-            "wipBlowerInicioOffsetMm": "wip_blower_inicio_offset_mm",
             "feedSides": "feed_sides",
             "pfTriggerEnabled": "pf_trigger_enabled",
             "refillMm": "refill_mm",
             "refillAsdaMm": "refill_asda_mm",
+            "plcBlowerSec": "plc_blower_sec",
+            "holderOnMs": "holder_on_ms",
+            "holderPrecutMs": "holder_precut_ms",
+            "holderOpenMs": "holder_open_ms",
+            "grippersOnMs": "grippers_on_ms",
+            "gripperReleaseMs": "gripper_release_ms",
+            "linearDoneMs": "linear_done_ms",
+            "dwellAtDestMs": "dwell_at_dest_ms",
+            "asentarMs": "asentar_ms",
+            "cutterPulseMs": "cutter_pulse_ms",
+            "cutterPostMs": "cutter_post_ms",
+            "cutterSettleMs": "cutter_settle_ms",
+            "purgeWarningLeadS": "purge_warning_lead_s",
+            "wipBlowerStartDelayS": "wip_blower_start_delay_s",
+            "wipBlowerMinTravelMm": "wip_blower_min_travel_mm",
+            "wipStartCacheTolMm": "wip_start_cache_tol_mm",
+            "wipBlowerLinealMatchMinS": "wip_blower_lineal_match_min_s",
+            "wipBlowerLinealMatchMaxS": "wip_blower_lineal_match_max_s",
+            "motionWaitTimeoutS": "motion_wait_timeout_s",
+            "feedWaitTimeoutS": "feed_wait_timeout_s",
+            "pfReadyTimeoutS": "pf_ready_timeout_s",
+            "pieceWatchTimeoutS": "piece_watch_timeout_s",
+            "refillLaserTimeoutS": "refill_laser_timeout_s",
+            "plcAckTimeoutS": "plc_ack_timeout_s",
+            "motionIdleNoTargetS": "motion_idle_no_target_s",
+            "pfTfeedDoneTimeoutS": "pf_tfeed_done_timeout_s",
+            "pfSettleBeforeIdleS": "pf_settle_before_idle_s",
+            "pfTfeedCaptureAfterPauseS": "pf_tfeed_capture_after_pause_s",
+            "asdaHomeEpsMm": "asda_home_eps_mm",
+            "motionTargetTolMm": "motion_target_tol_mm",
+            "timingGapReportS": "timing_gap_report_s",
+            "timingDelayOvershootMs": "timing_delay_overshoot_ms",
+            "timingCmdSlowS": "timing_cmd_slow_s",
+            "timingEncoderOutlierMm": "timing_encoder_outlier_mm",
+            "timingSummaryEveryPieces": "timing_summary_every_pieces",
         }
+
+    @classmethod
+    def _int_attrs(cls) -> frozenset[str]:
+        return frozenset(
+            {
+                "deposit_batch_size",
+                "holder_on_ms",
+                "holder_precut_ms",
+                "holder_open_ms",
+                "grippers_on_ms",
+                "gripper_release_ms",
+                "linear_done_ms",
+                "dwell_at_dest_ms",
+                "asentar_ms",
+                "cutter_pulse_ms",
+                "cutter_post_ms",
+                "cutter_settle_ms",
+                "timing_delay_overshoot_ms",
+                "timing_summary_every_pieces",
+            }
+        )
+
+    @classmethod
+    def _float_attrs(cls) -> frozenset[str]:
+        km = cls._key_map()
+        return frozenset(
+            attr
+            for json_key, attr in km.items()
+            if attr not in cls._int_attrs()
+            and attr not in ("feed_sides", "pf_trigger_enabled")
+        )
 
     @staticmethod
     def _as_bool(raw: Any, default: bool = True) -> bool:
@@ -392,25 +472,10 @@ class CycleConfig:
         return bool(raw)
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CycleConfig:
-        int_attrs = {
-            "deposit_batch_size",
-        }
-        float_attrs = {
-            "deposit_extra_mm",
-            "deposit_stack_gap_mm",
-            "deposit_max_travel_mm",
-            "gripper_clearance_mm",
-            "cut_offset_mm",
-            "wip_blower_inicio_offset_mm",
-            "refill_mm",
-            "refill_asda_mm",
-        }
+        int_attrs = cls._int_attrs()
+        float_attrs = cls._float_attrs()
         kw: dict[str, Any] = {}
         for json_key, attr in cls._key_map().items():
-            if json_key in _LEGACY_CYCLE_DELAY_JSON_KEYS:
-                continue
-            if json_key in _LEGACY_CYCLE_TIMEOUT_JSON_KEYS:
-                continue
             if json_key in data:
                 raw = data[json_key]
             elif attr in data:
@@ -439,51 +504,172 @@ class CycleConfig:
         return out
 
 
+def _read_cycle_json(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _cycle_json_cycle_keys() -> frozenset[str]:
+    return frozenset(CycleConfig._key_map().keys())
+
+
+def merge_cycle_json_document(
+    app: dict[str, Any], cycle: dict[str, Any]
+) -> dict[str, Any]:
+    """App arriba, parámetros de ciclo debajo (orden estable en disco)."""
+    out: dict[str, Any] = {}
+    for key in APP_CONFIG_JSON_KEYS:
+        if key in app:
+            out[key] = app[key]
+    out[CYCLE_JSON_SECTION_SEPARATOR_KEY] = None
+    for key in sorted(_cycle_json_cycle_keys()):
+        if key in cycle:
+            out[key] = cycle[key]
+    return out
+
+
+def apply_cycle_config_runtime(cfg: CycleConfig) -> None:
+    """Sincroniza constantes de módulo usadas por la secuencia y FLOW_STEPS."""
+    global HOLDER_ON_MS, HOLDER_PRECUT_MS, HOLDER_OPEN_MS, GRIPPERS_ON_MS
+    global GRIPPER_RELEASE_MS, LINEAR_DONE_MS, DWELL_AT_DEST_MM, ASENTAR_MS
+    global CUTTER_PULSE_MS, CUTTER_POST_MS, CUTTER_SETTLE_MS
+    global PURGE_WARNING_LEAD_S, WIP_BLOWER_START_DELAY_S
+    global WIP_BLOWER_MIN_TRAVEL_MM, WIP_START_CACHE_TOL_MM
+    global WIP_BLOWER_LINEAL_MATCH_MIN_S, WIP_BLOWER_LINEAL_MATCH_MAX_S
+    global MOTION_WAIT_TIMEOUT_S, FEED_WAIT_TIMEOUT_S, PF_READY_TIMEOUT_S
+    global PIECE_WATCH_TIMEOUT_S, REFILL_LASER_TIMEOUT_S, PLC_ACK_TIMEOUT_S
+    global MOTION_IDLE_NO_TARGET_S, PF_TFEED_DONE_TIMEOUT_S
+    global PF_SETTLE_BEFORE_IDLE_S, PF_TFEED_CAPTURE_AFTER_PAUSE_S
+    global ASDA_HOME_EPS_MM, MOTION_TARGET_TOL_MM
+    global TIMING_GAP_REPORT_S, TIMING_DELAY_OVERSHOOT_MS, TIMING_CMD_SLOW_S
+    global TIMING_ENCODER_OUTLIER_MM, TIMING_SUMMARY_EVERY_PIECES
+
+    HOLDER_ON_MS = int(cfg.holder_on_ms)
+    HOLDER_PRECUT_MS = int(cfg.holder_precut_ms)
+    HOLDER_OPEN_MS = int(cfg.holder_open_ms)
+    GRIPPERS_ON_MS = int(cfg.grippers_on_ms)
+    GRIPPER_RELEASE_MS = int(cfg.gripper_release_ms)
+    LINEAR_DONE_MS = int(cfg.linear_done_ms)
+    DWELL_AT_DEST_MM = int(cfg.dwell_at_dest_ms)
+    ASENTAR_MS = int(cfg.asentar_ms)
+    CUTTER_PULSE_MS = int(cfg.cutter_pulse_ms)
+    CUTTER_POST_MS = int(cfg.cutter_post_ms)
+    CUTTER_SETTLE_MS = int(cfg.cutter_settle_ms)
+    PURGE_WARNING_LEAD_S = float(cfg.purge_warning_lead_s)
+    WIP_BLOWER_START_DELAY_S = float(cfg.wip_blower_start_delay_s)
+    WIP_BLOWER_MIN_TRAVEL_MM = float(cfg.wip_blower_min_travel_mm)
+    WIP_START_CACHE_TOL_MM = float(cfg.wip_start_cache_tol_mm)
+    WIP_BLOWER_LINEAL_MATCH_MIN_S = float(cfg.wip_blower_lineal_match_min_s)
+    WIP_BLOWER_LINEAL_MATCH_MAX_S = float(cfg.wip_blower_lineal_match_max_s)
+    MOTION_WAIT_TIMEOUT_S = float(cfg.motion_wait_timeout_s)
+    FEED_WAIT_TIMEOUT_S = float(cfg.feed_wait_timeout_s)
+    PF_READY_TIMEOUT_S = float(cfg.pf_ready_timeout_s)
+    PIECE_WATCH_TIMEOUT_S = float(cfg.piece_watch_timeout_s)
+    REFILL_LASER_TIMEOUT_S = float(cfg.refill_laser_timeout_s)
+    PLC_ACK_TIMEOUT_S = float(cfg.plc_ack_timeout_s)
+    MOTION_IDLE_NO_TARGET_S = float(cfg.motion_idle_no_target_s)
+    PF_TFEED_DONE_TIMEOUT_S = float(cfg.pf_tfeed_done_timeout_s)
+    PF_SETTLE_BEFORE_IDLE_S = float(cfg.pf_settle_before_idle_s)
+    PF_TFEED_CAPTURE_AFTER_PAUSE_S = float(cfg.pf_tfeed_capture_after_pause_s)
+    ASDA_HOME_EPS_MM = float(cfg.asda_home_eps_mm)
+    MOTION_TARGET_TOL_MM = float(cfg.motion_target_tol_mm)
+    TIMING_GAP_REPORT_S = float(cfg.timing_gap_report_s)
+    TIMING_DELAY_OVERSHOOT_MS = int(cfg.timing_delay_overshoot_ms)
+    TIMING_CMD_SLOW_S = float(cfg.timing_cmd_slow_s)
+    TIMING_ENCODER_OUTLIER_MM = float(cfg.timing_encoder_outlier_mm)
+    TIMING_SUMMARY_EVERY_PIECES = int(cfg.timing_summary_every_pieces)
+
+    _CYCLE_STEP_DELAY_MS.update(
+        {
+            "wait_holder_on": HOLDER_ON_MS,
+            "wait_grippers_on": GRIPPERS_ON_MS,
+            "wait_holder_open": HOLDER_OPEN_MS,
+            "wait_linear_done": LINEAR_DONE_MS,
+            "wait_holder_precut": HOLDER_PRECUT_MS,
+            "wait_cutter_pulse": CUTTER_PULSE_MS,
+            "wait_cutter_post": CUTTER_POST_MS,
+            "wait_deposit_dwell": DWELL_AT_DEST_MM,
+            "wait_gripper_release": GRIPPER_RELEASE_MS,
+            "wait_asentar": ASENTAR_MS,
+        }
+    )
+    for step in FLOW_STEPS:
+        key = step.get("key")
+        if isinstance(key, str) and key in _CYCLE_STEP_DELAY_MS:
+            step["delayMs"] = _CYCLE_STEP_DELAY_MS[key]
+
+
+def migrate_legacy_config_files(path: Path = CONFIG_PATH) -> dict[str, Any]:
+    """Une cycle.json + legados app_config / cycle_config; borra legados tras fusionar."""
+    raw = _read_cycle_json(path)
+    legacy_cycle = _read_cycle_json(LEGACY_CYCLE_CONFIG_PATH)
+    legacy_app = _read_cycle_json(LEGACY_APP_CONFIG_PATH)
+    cycle_keys = _cycle_json_cycle_keys()
+    for src in (legacy_app, legacy_cycle, raw):
+        for key, val in src.items():
+            if key in APP_CONFIG_JSON_KEYS or key in cycle_keys:
+                raw[key] = val
+            elif key in _LEGACY_CYCLE_JSON_ALIASES:
+                canon = _LEGACY_CYCLE_JSON_ALIASES[key]
+                if canon in cycle_keys:
+                    raw[canon] = val
+    for legacy_path in (LEGACY_APP_CONFIG_PATH, LEGACY_CYCLE_CONFIG_PATH):
+        if legacy_path.is_file():
+            try:
+                legacy_path.unlink()
+            except OSError:
+                pass
+    return raw
+
+
 def load_cycle_config(path: Path = CONFIG_PATH) -> CycleConfig:
-    if path.exists():
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-            cfg = CycleConfig.from_dict(raw if isinstance(raw, dict) else {})
-            # Migrar claves nuevas si el JSON viejo no las traía
-            if isinstance(raw, dict):
-                missing = (
-                    ("feedSides" not in raw and "feed_sides" not in raw)
-                    or ("refillMm" not in raw and "refill_mm" not in raw)
-                    or ("refillAsdaMm" not in raw and "refill_asda_mm" not in raw)
-                    or (
-                        "wipBlowerInicioOffsetMm" not in raw
-                        and "wip_blower_inicio_offset_mm" not in raw
-                    )
-                    or (
-                        "gripperClearanceMm" not in raw
-                        and "gripper_clearance_mm" not in raw
-                    )
-                    or (
-                        "depositStackGapMm" not in raw
-                        and "deposit_stack_gap_mm" not in raw
-                    )
-                    or (
-                        "depositMaxTravelMm" not in raw
-                        and "deposit_max_travel_mm" not in raw
-                    )
-                    or (
-                        "pfTriggerEnabled" not in raw
-                        and "pf_trigger_enabled" not in raw
-                    )
-                )
-                if missing:
-                    save_cycle_config(cfg, path)
-            return cfg
-        except (json.JSONDecodeError, OSError, TypeError, ValueError):
-            pass
-    cfg = CycleConfig()
+    raw = migrate_legacy_config_files(path)
+    cycle_keys = _cycle_json_cycle_keys()
+    cycle_raw = {k: raw[k] for k in cycle_keys if k in raw}
+    cfg = CycleConfig.from_dict({**CycleConfig().to_dict(), **cycle_raw})
+    apply_cycle_config_runtime(cfg)
     save_cycle_config(cfg, path)
     return cfg
+
+
 def save_cycle_config(cfg: CycleConfig, path: Path = CONFIG_PATH) -> None:
+    raw = migrate_legacy_config_files(path)
+    app = {k: raw[k] for k in APP_CONFIG_JSON_KEYS if k in raw}
+    doc = merge_cycle_json_document(app, cfg.to_dict())
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps(cfg.to_dict(), indent=2, ensure_ascii=False) + "\n",
+        json.dumps(doc, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
+
+
+def save_app_config_section(
+    app: dict[str, Any],
+    cycle: dict[str, Any] | None = None,
+    path: Path = CONFIG_PATH,
+) -> None:
+    raw = migrate_legacy_config_files(path)
+    cycle_keys = _cycle_json_cycle_keys()
+    if cycle is None:
+        cycle = {k: raw[k] for k in cycle_keys if k in raw}
+    if not cycle:
+        cycle = CycleConfig().to_dict()
+    doc = merge_cycle_json_document(app, cycle)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(doc, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+def read_app_config_section(path: Path = CONFIG_PATH) -> dict[str, Any]:
+    raw = migrate_legacy_config_files(path)
+    return {k: raw[k] for k in APP_CONFIG_JSON_KEYS if k in raw}
 
 class CycleHost(Protocol):
     """Puente hacia clientes TCP + señales de estado (implementado por HmiState)."""
@@ -776,25 +962,28 @@ class CycleRunner:
             return CycleConfig(**asdict(self._cfg))
 
     def reload_config(self) -> CycleConfig:
-        """Recarga cycle_config.json — usado al Start para aplicar últimos guardados."""
+        """Recarga config/cycle.json."""
         with self._lock:
             self._cfg = load_cycle_config()
             return CycleConfig(**asdict(self._cfg))
 
     def update_config(self, data: dict[str, Any]) -> CycleConfig:
         with self._lock:
+            allowed = set(CycleConfig._key_map().keys())
             incoming = {
                 k: v
                 for k, v in dict(data or {}).items()
-                if k not in _LEGACY_CYCLE_DELAY_JSON_KEYS
-                and k not in _LEGACY_CYCLE_TIMEOUT_JSON_KEYS
+                if k in allowed
             }
             merged = self._cfg.to_dict()
             merged.update(incoming)
             self._cfg = CycleConfig.from_dict(merged)
             save_cycle_config(self._cfg)
+            apply_cycle_config_runtime(self._cfg)
             cfg = CycleConfig(**asdict(self._cfg))
         self._host.cycle_log("Cycle config guardada")
+        if hasattr(self._host, "sync_plc_blower_from_cycle"):
+            self._host.sync_plc_blower_from_cycle()
         return cfg
     def state_byte(self) -> int:
         with self._lock:
@@ -3334,36 +3523,8 @@ class CycleRunner:
         )
         return False
 
-    def _wip_blower_pulse(self, at_mm: float, blower_sec: float, tag: str) -> bool:
-        """ON → dwell → OFF explícito. False = abort/falla (no mover con blower ON)."""
-        if self._should_abort():
-            return False
-        if not self._host.cmd_plc_blower(True, duration_sec=blower_sec):
-            self._raise_fault("wip_blower")
-            self._host.cycle_log(
-                f"WIP Delivery blower ON FAIL @ {tag}={at_mm:.1f} mm "
-                f"— no dwell / no continuar"
-            )
-            return False
-        self._host.cycle_log(
-            f"WIP Delivery blower ON @ {tag}={at_mm:.1f} mm hold={blower_sec:g}s"
-        )
-        if not self._wait_duration_s(blower_sec):
-            # Abort a mitad: apagar blower best-effort; no continuar
-            self._host.cmd_plc_blower(False)
-            return False
-        if not self._host.cmd_plc_blower(False):
-            self._raise_fault("wip_blower")
-            self._host.cycle_log(
-                f"WIP Delivery blower OFF FAIL @ {tag}={at_mm:.1f} mm "
-                f"— no continuar (blower puede seguir activo)"
-            )
-            return False
-        self._host.cycle_log(f"WIP Delivery blower OFF ok @ {tag}={at_mm:.1f} mm")
-        return True
-
     def _wip_motion_zero(self, rpm: float, *, prefetch_running: bool) -> bool:
-        """HOME a 0 con blower OFF (modo stop). False = abort/falla."""
+        """HOME a 0 (sin soplo). False = abort/falla."""
         self._arm_motion_leg(prefetch_running)
         self._host.cycle_log("WIP Delivery MOVE → HOME=0.0 mm")
         if not self._host.cmd_motion_move_zero(rpm):
@@ -3380,30 +3541,6 @@ class CycleRunner:
         self._host.cycle_log("WIP Delivery move ok @ HOME=0.0 mm")
         return True
 
-    def _wip_motion_to(
-        self, mm: float, rpm: float, *, prefetch_running: bool, tag: str
-    ) -> bool:
-        """Move ABS firmado (solo con blower OFF). False = abort/falla."""
-        self._arm_motion_leg(prefetch_running)
-        self._host.cycle_log(f"WIP Delivery MOVE → {tag}={float(mm):.1f} mm")
-        if not self._host.cmd_motion_move_mm(float(mm), rpm):
-            if not self._should_abort() and not self._fault:
-                kind = ""
-                if hasattr(self._host, "last_move_fail_kind"):
-                    kind = self._host.last_move_fail_kind()
-                self._raise_fault("E065" if kind == "transport" else "home_cmd")
-                self._host.cycle_log(
-                    f"WIP Delivery move FAIL @ {tag}={float(mm):.1f} mm"
-                )
-            return False
-        if not self._wait_motion(
-            target_mm=float(mm),
-            reissue=lambda: self._host.cmd_motion_move_mm(float(mm), rpm),
-        ):
-            return False
-        self._host.cycle_log(f"WIP Delivery move ok @ {tag}={float(mm):.1f} mm")
-        return True
-
     def _home_with_wip_delivery(
         self,
         start_mm: float | None,
@@ -3412,14 +3549,9 @@ class CycleRunner:
         prefetch_running: bool,
     ) -> bool:
         op = self._begin_op("home")
-        if WIP_BLOWER_CONTINUOUS:
-            ok = self._home_with_wip_delivery_continuous(
-                start_mm, rpm, prefetch_running=prefetch_running
-            )
-        else:
-            ok = self._home_with_wip_delivery_stop(
-                start_mm, rpm, prefetch_running=prefetch_running
-            )
+        ok = self._home_with_wip_delivery_continuous(
+            start_mm, rpm, prefetch_running=prefetch_running
+        )
         sec = self._end_op(op, ok=ok)
         self._metro_snap("post-home", target_mm=0.0)
         if ok:
@@ -3531,85 +3663,6 @@ class CycleRunner:
         # salió largo (ACK metido en t_lineal, HOME más corto que |L|).
         self._cancel_wip_blower()
         return True
-
-    def _home_with_wip_delivery_stop(
-        self,
-        start_mm: float | None,
-        rpm: float,
-        *,
-        prefetch_running: bool,
-    ) -> bool:
-        """HOME + WIP stop–soplo–stop: fin(+offset)→soplo → inicio→soplo → HOME 0.
-
-        `start_mm` = magnitud ABS en punta final (lado grippers), post depósito
-        y despeje. No es estimación.
-
-        Secuencia (blower montado en offset respecto a cada punta):
-        1) Desde punta final → move a (start − offset) → soplo
-        2) Move a punta inicial (lado cortador = offset) → soplo
-        3) HOME 0
-        """
-        if start_mm is None:
-            self._raise_fault("wip_start")
-            self._host.cycle_log(
-                "WIP start ausente — falta ref depósito/despeje/Stage2 (no se estima)"
-            )
-            return False
-
-        start_abs = abs(float(start_mm))
-        if not self._validate_wip_start_mm(start_abs):
-            return False
-
-        travel = start_abs
-        blower_sec = float(self._host.plc_blower_sec())
-        # Offset >0 = hacia el centro desde cada punta (fin↓, inicio↑ desde 0).
-        offset = float(self.get_config().wip_blower_inicio_offset_mm)
-        use_offset = abs(offset) > WIP_BLOWER_OFFSET_EPS_MM
-
-        if travel < WIP_BLOWER_MIN_TRAVEL_MM:
-            self._host.cycle_log(
-                f"WIP Delivery: omitido (travel={travel:.1f} mm) — HOME directo"
-            )
-            return self._wip_motion_zero(rpm, prefetch_running=prefetch_running)
-
-        fin_mm = start_abs - offset if use_offset else start_abs
-        inicio_mm = offset if use_offset else 0.0
-        # Evitar cruzar o soplar fuera del tramo [0, start].
-        if fin_mm < 0.0:
-            fin_mm = 0.0
-        if fin_mm < inicio_mm:
-            self._host.cycle_log(
-                f"WIP Delivery: offset={offset:.1f} mm demasiado grande para "
-                f"start={start_abs:.1f} mm — clamp fin={inicio_mm:.1f} mm"
-            )
-            fin_mm = inicio_mm
-
-        self._host.cycle_log(
-            f"WIP Delivery: fin(grippers)={start_abs:.1f} → offset soplo={fin_mm:.1f} "
-            f"→ inicio(cortador)={inicio_mm:.1f} → HOME "
-            f"({blower_sec:g}s c/u, offset={offset:.1f})"
-        )
-
-        # 1) Punta final (grippers): move offset → soplo
-        if abs(fin_mm - start_abs) > WIP_BLOWER_OFFSET_EPS_MM:
-            if not self._wip_motion_to(
-                fin_mm, rpm, prefetch_running=prefetch_running, tag="fin_offset"
-            ):
-                return False
-        if not self._wip_blower_pulse(fin_mm, blower_sec, "fin"):
-            return False
-
-        # 2) Punta inicial (cortador): move → soplo
-        if abs(inicio_mm - fin_mm) > WIP_BLOWER_OFFSET_EPS_MM:
-            if not self._wip_motion_to(
-                inicio_mm, rpm, prefetch_running=prefetch_running, tag="inicio"
-            ):
-                return False
-        if not self._wip_blower_pulse(inicio_mm, blower_sec, "inicio"):
-            return False
-
-        # 3) HOME 0
-        return self._wip_motion_zero(rpm, prefetch_running=prefetch_running)
 
     def _wait_feed(
         self,

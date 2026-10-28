@@ -20,11 +20,11 @@ export interface BackendCycleConfig {
   depositMaxTravelMm?: number;
   gripperClearanceMm?: number;
   cutOffsetMm?: number;
-  wipBlowerInicioOffsetMm?: number;
   feedSides?: 'L' | 'R' | 'LR' | string;
   pfTriggerEnabled?: boolean;
   refillMm?: number;
   refillAsdaMm?: number;
+  plcBlowerSec?: number;
 }
 
 export interface BackendFlowStep {
@@ -77,6 +77,9 @@ export interface BackendCycleSnapshot {
   /** Clave JSON que el backend debe emitir en snapshot.cycle (booleano). */
   purgeHandsWarning?: boolean;
   asdaMoveWarning?: boolean;
+  postLotPfSettle?: boolean;
+  /** Bloquea Iniciar alimentador en Máquina (producción activa sin pausa). */
+  pfOperatorStartBlocked?: boolean;
   config: BackendCycleConfig;
   /** Ausente en SSE slim (la UI conserva el último flow). */
   flow?: BackendFlowStep[];
@@ -96,6 +99,9 @@ export interface BackendMotion {
   enc_l: string;
   feedOffsetMmL: number;
   feedOffsetMmR: number;
+  servoCanReady?: boolean;
+  canInitPending?: boolean;
+  canInitBusy?: boolean;
   laserR?: boolean;
   laserL?: boolean;
   safetyExhaust?: boolean;

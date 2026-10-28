@@ -14,7 +14,7 @@ from pathlib import Path
 from flask import Flask, Response, jsonify, request, send_from_directory
 from waitress import serve
 
-from state import get_state
+from core.state import get_state
 
 HMI_ROOT = Path(__file__).resolve().parent
 FRONTEND_DIR = HMI_ROOT / "frontend"
@@ -131,12 +131,6 @@ def ensure_frontend_dist() -> bool:
 def _broadcast_sse() -> None:
     """Empuja el snapshot más reciente. Si la cola está llena, descarta lo viejo
     y conserva el cliente — no cortar el SSE (el ciclo notifica muchas veces/s)."""
-    try:
-        from latency_debug import mark as lat_mark
-
-        lat_mark("10", source="sse")
-    except ImportError:
-        pass
     data = json.dumps(get_state().snapshot(slim=True), separators=(",", ":"))
     for q in list(_sse_queues):
         try:
