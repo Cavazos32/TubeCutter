@@ -1,0 +1,916 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { BackendFlowStep, BackendSnapshot } from '../api/backendTypes';
+import * as api from '../api/hmiApi';
+import {
+  logKey,
+  mapAndonConnection,
+  mapAndonState,
+  mapAppConfig,
+  mapChecklistState,
+  mapCycleConfig,
+  isPurgeBusy,
+  mapMachineState,
+  mapMotionState,
+  mapPlcState,
+  mapPreFeederState,
+  mergeAllLogs,
+  mergeLogTail,
+  parseLogs,
+  valveByteFromId,
+} from '../api/mappers';
+import type {
+  AndonState,
+  ConnectionState,
+  CycleConfig,
+  LogEntry,
+  MachineState,
+  MotionState,
+  PfRefillChannel,
+  PlcState,
+  PreFeederState,
+  TabType,
+} from '../types';
+import type { ChecklistState } from '../types/checklist';
+
+/** Bloqueo tras toggle: evita doble click ON→OFF antes de que el KEEP/pulso asiente. */
+const VALVE_TOGGLE_LOCK_MS = 450;
+
+export interface HmiViewState {
+  connected: boolean;
+  machineState: MachineState;
+  motionState: MotionState;
+  plcState: PlcState;
+  preFeederState: PreFeederState;
+  andonState: AndonState;
+  andonConn: ConnectionState;
+  andonBuzzerMute: boolean;
+  maintenanceCycleCount: number;
+  checklistState: ChecklistState;
+  cycleConfig: CycleConfig;
+  cycleStep: number;
+  cycleActive: boolean;
+  cycleFlow: BackendFlowStep[];
+  resumeEnabled: boolean;
+  logs: LogEntry[];
+  models: { name: string; mm: number; rpm: number; qty?: number }[];
+  selectedModelIndex: number;
+}
+
+const DEFAULT_MACHINE: MachineState = {
+  model: '—',
+  offsetMm: 0,
+  mm: -45,
+  rpm: 1200,
+  statusText: 'Conectando…',
+  machineByte: 0x44,
+  machineName: '',
+  isRunning: false,
+  isPaused: false,
+  cycleActive: false,
+  cycleStep: 0,
+  cycleStepLabel: '',
+  cycleMaterialist: false,
+  cycleBusy: false,
+  refillActive: false,
+  refillAwaitingConfirm: false,
+  refillPrompt: '',
+  recoveryPrompt: '',
+  recoveryAwaitingConfirm: false,
+  trayPieces: 0,
+  recoveryAfterError: false,
+  e050Lot: false,
+  e050FinishPiece: false,
+  refillSkipCut: false,
+  purgeHandsWarning: false,
+  asdaMoveWarning: false,
+  purgeBusy: false,
+  stepByStep: false,
+  pauseEnabled: false,
+  progress: 0,
+  cycleTimeSec: 0,
+  lastPieceSec: 0,
+  avgPieceSec: 0,
+  piecesCount: 0,
+  targetPieces: 1,
+  cycleCompleted: false,
+  safetyExhaust: false,
+  errorActive: false,
+  lastFault: undefined,
+};
+
+export function useHmiState() {
+  const [view, setView] = useState<HmiViewState>({
+    connected: false,
+    machineState: DEFAULT_MACHINE,
+    motionState: {
+      connection: { connected: false, ip: '', port: 0 },
+      targetPositionMm: -45,
+      currentPositionMm: 0,
+      rpm: 1200,
+      actualRpm: 0,
+      isMoving: false,
+      hasError: false,
+      inPosition: true,
+      encoderR: null,
+      encoderL: null,
+      feederCanLTesting: false,
+      feederCanRTesting: false,
+      offsetL: 0,
+      offsetR: 0,
+      laserR: false,
+      laserL: false,
+    },
+    plcState: {
+      connection: { connected: false, ip: '', port: 0 },
+      blowerSec: 2,
+      valves: [],
+    },
+    preFeederState: {
+      connection: { connected: false, ip: '', port: 0 },
+      isRunning: false,
+      sensorsL: [],
+      sensorsR: [],
+      idleMode: false,
+      refillL: { material: false, dereeler: false, servo: false, feeder: false, pulseS: 1 },
+      refillR: { material: false, dereeler: false, servo: false, feeder: false, pulseS: 1 },
+    },
+    andonState: {
+      connection: { connected: false, ip: '10.10.32.61', port: 8769 },
+      green: false,
+      yellow: false,
+      red: false,
+      buzzer: false,
+      manual: false,
+      machineByte: 0x44,
+      pressure: false,
+    },
+    andonConn: { connected: false, ip: '10.10.32.61', port: 8769 },
+    andonBuzzerMute: false,
+    maintenanceCycleCount: 0,
+    checklistState: {
+      required: false,
+      lastCompletedAt: null,
+      currentStepId: '',
+      session: null,
+      workerBusy: false,
+      workerPhase: '',
+      workerError: '',
+      stepError: '',
+      airTestActive: false,
+      pieceTestStarted: false,
+      stepStatus: { ready: false },
+    },
+    cycleConfig: {} as CycleConfig,
+    cycleStep: 0,
+    cycleActive: false,
+    cycleFlow: [],
+    resumeEnabled: false,
+    logs: [],
+    models: [],
+    selectedModelIndex: 0,
+  });
+
+  const targetQtyRef = useRef(1);
+  /** True si el operador editó Target Pieces; no re-sembrar desde el modelo. */
+  const targetQtyTouchedRef = useRef(false);
+  const lastModelIdxRef = useRef<number | null>(null);
+  const snapRef = useRef<BackendSnapshot | null>(null);
+  /** Purga activa (último snapshot): bloquea Pausa, Posición inicial y Carga de material. */
+  const purgeBusyNow = () => isPurgeBusy(snapRef.current?.cycle);
+  const logsRef = useRef<LogEntry[]>([]);
+  /** Claves de líneas ya limpiadas: evita que un SSE en vuelo las vuelva a sembrar. */
+  const blockedLogKeysRef = useRef<Set<string>>(new Set());
+  const lastSseAtRef = useRef(0);
+  const encPollRef = useRef(false);
+  /** Estado lógico local por válvula (fuente de verdad entre clicks). */
+  const valveOnRef = useRef<Record<string, boolean>>({});
+  const valveLockRef = useRef<Record<string, boolean>>({});
+  const [valveBusy, setValveBusy] = useState<Record<string, boolean>>({});
+  // JOG Materialista: la duración la determina el estado ON/OFF de la HMI.
+  // No existe auto-off local por pulseS; el PF central recibe un comando hold.
+
+  const applySnapshot = useCallback((snap: BackendSnapshot) => {
+    const prevFlow = snapRef.current?.cycle.flow;
+    const flow =
+      snap.cycle.flow && snap.cycle.flow.length > 0
+        ? snap.cycle.flow
+        : prevFlow ?? [];
+    if ((!snap.cycle.flow || snap.cycle.flow.length === 0) && flow.length) {
+      snap = { ...snap, cycle: { ...snap.cycle, flow } };
+    }
+    snapRef.current = snap;
+    const logs = mergeLogTail(logsRef.current, snap, blockedLogKeysRef.current);
+    logsRef.current = logs;
+    const model = snap.models[snap.selectedModel];
+    // Al cambiar de modelo (o primera carga), tomar qty del modelo.
+    // No pisar un 1 intencional del operador con model.qty>1 en cada SSE/poll.
+    if (lastModelIdxRef.current !== snap.selectedModel) {
+      lastModelIdxRef.current = snap.selectedModel;
+      targetQtyTouchedRef.current = false;
+    }
+    if (!targetQtyTouchedRef.current && model?.qty && model.qty >= 1) {
+      targetQtyRef.current = model.qty;
+    }
+    const targetQty = targetQtyRef.current;
+    const plc = mapPlcState(snap);
+    const pfState = mapPreFeederState(snap);
+    // Sincronizar lectura ON/OFF desde servidor solo si la válvula no está bloqueada.
+    for (const v of plc.valves) {
+      if (!valveLockRef.current[v.id]) {
+        valveOnRef.current[v.id] = v.active;
+      }
+    }
+    setView({
+      connected: true,
+      machineState: mapMachineState(snap, targetQty),
+      motionState: mapMotionState(snap),
+      plcState: plc,
+      preFeederState: pfState,
+      andonState: mapAndonState(snap),
+      andonConn: mapAndonConnection(snap),
+      ...mapAppConfig(snap),
+      checklistState: mapChecklistState(snap),
+      cycleConfig: mapCycleConfig(snap.cycle.config),
+      cycleStep: snap.cycle.step,
+      cycleActive: snap.cycle.active,
+      cycleFlow: flow,
+      resumeEnabled: snap.resumeEnabled,
+      logs,
+      models: snap.models,
+      selectedModelIndex: snap.selectedModel,
+    });
+  }, []);
+
+  useEffect(() => {
+    let closed = false;
+    let es: EventSource | null = null;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let pollTimer: ReturnType<typeof setInterval> | undefined;
+
+    const connect = () => {
+      if (closed) return;
+      es = new EventSource('/api/events');
+      es.onopen = () => {
+        setView((prev) => (prev.connected ? prev : { ...prev, connected: true }));
+      };
+      es.onmessage = (ev) => {
+        try {
+          lastSseAtRef.current = Date.now();
+          applySnapshot(JSON.parse(ev.data));
+        } catch {
+          // ignore
+        }
+      };
+      es.onerror = () => {
+        setView((prev) => ({ ...prev, connected: false }));
+        // Solo recrear si el browser cerró el stream (no pelear con reconnect nativo).
+        if (es && es.readyState === EventSource.CLOSED) {
+          es.close();
+          es = null;
+          if (!closed) {
+            retryTimer = setTimeout(connect, 1500);
+          }
+        }
+      };
+    };
+
+    api.getState().then(applySnapshot).catch(() => {});
+    connect();
+
+    // Respaldo: solo si el SSE lleva >4 s mudo (no competir con el stream).
+    pollTimer = setInterval(() => {
+      if (closed) return;
+      if (Date.now() - lastSseAtRef.current < 4000) return;
+      api.getState().then(applySnapshot).catch(() => {});
+    }, 4000);
+
+    return () => {
+      closed = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      if (pollTimer) clearInterval(pollTimer);
+      es?.close();
+    };
+  }, [applySnapshot]);
+
+  const ensureEncPoll = useCallback(() => {
+    if (!encPollRef.current) {
+      encPollRef.current = true;
+      api.setEncPoll(true).catch(() => {});
+      api.getFeedOffset().catch(() => {});
+    }
+  }, []);
+
+  const onTabChange = useCallback(
+    (tab: TabType) => {
+      if (tab === 'motion') ensureEncPoll();
+    },
+    [ensureEncPoll]
+  );
+
+  const selectModel = useCallback((index: number) => {
+    api.selectModel(index).catch(() => {});
+  }, []);
+
+  const setTargetQty = useCallback((qty: number) => {
+    targetQtyTouchedRef.current = true;
+    targetQtyRef.current = Math.max(1, qty);
+    if (snapRef.current) {
+      applySnapshot(snapRef.current);
+    }
+  }, [applySnapshot]);
+
+  const start = useCallback(() => {
+    api.startCycle(targetQtyRef.current).then((res) => {
+      if (res && res.ok === false && res.error) window.alert(res.error);
+    }).catch(() => {});
+  }, []);
+
+  const stop = useCallback(() => {
+    api.stopMachine().catch(() => {});
+  }, []);
+
+  const resume = useCallback(() => {
+    if (purgeBusyNow()) return;
+    api.resumeMachine().catch(() => {});
+  }, []);
+
+  const pauseCycle = useCallback(() => {
+    if (purgeBusyNow()) return;
+    api.pauseCycle().catch(() => {});
+  }, []);
+
+  const resetCycleCmd = useCallback(async () => {
+    try {
+      const res = await api.resetError({ confirm: true, doHome: false });
+      if (res && (res as { ok?: boolean }).ok === false) {
+        const err = (res as { error?: string }).error;
+        if (err) window.alert(err);
+      }
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const machineHomeCmd = useCallback(async () => {
+    if (purgeBusyNow()) return;
+    try {
+      const res = await api.machineHome();
+      if (res.ok === false && res.error) window.alert(String(res.error));
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const setCutOffset = useCallback(async (mm: number) => {
+    const res = await api.setCycleConfig({ cutOffsetMm: mm });
+    return res.config;
+  }, []);
+
+  const toggleCycleMaterialist = useCallback(() => {
+    if (purgeBusyNow()) return;
+    const snap = snapRef.current;
+    const cur =
+      view.machineState.cycleMaterialist || !!(snap?.cycle.materialist ?? false);
+    const next = !cur;
+    const prevBusy = view.machineState.cycleBusy;
+    const prevSnapBusy = snap?.cycle.busy;
+    // Optimista: el botón refleja el clic al instante (SSE puede tardar).
+    setView((prev) => ({
+      ...prev,
+      machineState: {
+        ...prev.machineState,
+        cycleMaterialist: next,
+        cycleBusy: next ? false : prev.machineState.cycleBusy,
+      },
+    }));
+    if (snapRef.current) {
+      snapRef.current = {
+        ...snapRef.current,
+        cycle: {
+          ...snapRef.current.cycle,
+          materialist: next,
+          busy: next ? false : snapRef.current.cycle.busy,
+        },
+      };
+    }
+    const revert = () => {
+      setView((prev) => ({
+        ...prev,
+        machineState: {
+          ...prev.machineState,
+          cycleMaterialist: cur,
+          cycleBusy: prevBusy,
+        },
+      }));
+      if (snapRef.current) {
+        snapRef.current = {
+          ...snapRef.current,
+          cycle: {
+            ...snapRef.current.cycle,
+            materialist: cur,
+            busy: prevSnapBusy,
+          },
+        };
+      }
+    };
+    api
+      .cycleMaterialist(next)
+      .then((res) => {
+        if (res && (res as { ok?: boolean }).ok === false) {
+          revert();
+          const err = (res as { error?: string }).error;
+          if (err) window.alert(err);
+        }
+      })
+      .catch(() => {
+        revert();
+      });
+  }, [view.machineState.cycleMaterialist, view.machineState.cycleBusy]);
+
+  const toggleCycleBusy = useCallback(() => {
+    const snap = snapRef.current;
+    const cur = view.machineState.cycleBusy || !!(snap?.cycle.busy ?? false);
+    const next = !cur;
+    setView((prev) => ({
+      ...prev,
+      machineState: {
+        ...prev.machineState,
+        cycleBusy: next,
+        cycleMaterialist: next ? false : prev.machineState.cycleMaterialist,
+      },
+    }));
+    if (snapRef.current) {
+      snapRef.current = {
+        ...snapRef.current,
+        cycle: {
+          ...snapRef.current.cycle,
+          busy: next,
+          materialist: next ? false : snapRef.current.cycle.materialist,
+        },
+      };
+    }
+    api
+      .cycleBusy(next)
+      .then((res) => {
+        if (res && (res as { ok?: boolean }).ok === false) {
+          const err = (res as { error?: string }).error;
+          if (err) window.alert(err);
+        }
+      })
+      .catch(() => {});
+  }, [view.machineState.cycleBusy]);
+
+  const setCycleStepByStep = useCallback((on: boolean) => {
+    api
+      .setCycleStepByStep(on)
+      .then((res) => {
+        if (res && res.ok === false && res.error) {
+          window.alert(res.error);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  const startRefill = useCallback(async (opts?: { mm?: number; asdaMm?: number }) => {
+    try {
+      const res = await api.startCycleRefill(opts);
+      if (res && res.ok === false && res.error) {
+        window.alert(res.error);
+      }
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const confirmRefill = useCallback(async (ok: boolean) => {
+    try {
+      const res = await api.confirmCycleRefill(ok);
+      if (res && res.ok === false && res.error) {
+        window.alert(res.error);
+      }
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const confirmRecoveryReview = useCallback(async (ok: boolean = true) => {
+    try {
+      const res = await api.confirmRecoveryReview(ok);
+      if (res && res.ok === false && res.error) {
+        window.alert(res.error);
+      }
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const retryRefill = useCallback(async (mm?: number) => {
+    try {
+      const res = await api.retryCycleRefill(mm != null ? { mm } : undefined);
+      if (res && res.ok === false && res.error) {
+        window.alert(res.error);
+      }
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const reloadFeedOffset = useCallback(async () => {
+    const res = await api.getFeedOffset();
+    if (res.ok) {
+      setView((prev) => ({
+        ...prev,
+        motionState: {
+          ...prev.motionState,
+          offsetL: res.feedOffsetMmL ?? prev.motionState.offsetL,
+          offsetR: res.feedOffsetMmR ?? prev.motionState.offsetR,
+        },
+      }));
+    }
+  }, []);
+
+  const saveCycleConfig = useCallback(async (cfg: Partial<CycleConfig>) => {
+    const res = await api.setCycleConfig(cfg);
+    const mapped = mapCycleConfig(res.config);
+    // Si el body pedía L/R/LR y el server omitió el campo, no perder la selección.
+    const feedSides =
+      cfg.feedSides === 'L' || cfg.feedSides === 'R' || cfg.feedSides === 'LR'
+        ? cfg.feedSides
+        : mapped.feedSides;
+    const pfTriggerEnabled =
+      typeof cfg.pfTriggerEnabled === 'boolean'
+        ? cfg.pfTriggerEnabled
+        : mapped.pfTriggerEnabled;
+    const next = { ...mapped, feedSides, pfTriggerEnabled };
+    setView((prev) => ({ ...prev, cycleConfig: next }));
+    return next;
+  }, []);
+
+  const reloadCycleConfig = useCallback(async () => {
+    const res = await api.reloadCycleConfigFromDisk();
+    const mapped = mapCycleConfig(res.config);
+    setView((prev) => ({ ...prev, cycleConfig: mapped }));
+    return mapped;
+  }, []);
+
+  const setMmRpm = useCallback((mm: number, rpm: number) => {
+    api.setMmRpm(mm, rpm).catch(() => {});
+  }, []);
+
+  const motionMove = useCallback((mm: number, rpm: number) => {
+    api.setMmRpm(mm, rpm).catch(() => {});
+    api.motionAction('move', { mm, rpm }).catch(() => {});
+  }, []);
+
+  const motionStop = useCallback(() => {
+    api.motionAction('stop').catch(() => {});
+  }, []);
+
+  const motionServoOn = useCallback(() => {
+    api.motionAction('on').catch(() => {});
+  }, []);
+
+  const motionServoOff = useCallback(() => {
+    api.motionAction('off').catch(() => {});
+  }, []);
+
+  const motionMoveZero = useCallback(() => {
+    const snap = snapRef.current;
+    const rpm = snap?.rpm ?? view.motionState.rpm;
+    api.motionAction('move_zero', { rpm }).catch(() => {});
+  }, [view.motionState.rpm]);
+
+  const motionSearchHome = useCallback(() => {
+    api.motionAction('home').catch(() => {});
+  }, []);
+
+  const motionReset = useCallback(() => {
+    api.motionAction('motion_reset').catch(() => {});
+  }, []);
+
+  const encSetZeroR = useCallback(() => {
+    api.motionAction('enc_set0_r').catch(() => {});
+  }, []);
+
+  const encSetZeroL = useCallback(() => {
+    api.motionAction('enc_set0_l').catch(() => {});
+  }, []);
+
+  const feedL = useCallback(() => {
+    api.motionAction('feed_l').catch(() => {});
+  }, []);
+
+  const feedR = useCallback(() => {
+    api.motionAction('feed_r').catch(() => {});
+  }, []);
+
+  const saveFeedOffset = useCallback((l: number, r: number) => {
+    api.setFeedOffset(l, r).catch(() => {});
+  }, []);
+
+  const toggleValve = useCallback((valveId: string) => {
+    if (valveLockRef.current[valveId]) return;
+
+    const snap = snapRef.current;
+    if (!snap) return;
+    // Con ErrorState / issue: solo cortador manual; resto bloqueado hasta Reset.
+    const plcFault =
+      snap.plc.status?.kind === 'error' ||
+      Object.values(snap.plc.valves || {}).some((v) => v.error === true);
+    const isCutter = valveId === 'cutter-r' || valveId === 'cutter-l';
+    if (plcFault && !isCutter) return;
+
+    const valves = mapPlcState(snap).valves;
+    const byte = valveByteFromId(valves, valveId);
+    if (byte == null) return;
+
+    const current = snap.plc.valves[String(byte)];
+    const knownOn =
+      valveOnRef.current[valveId] ??
+      (current?.on === true);
+    const newOn = !knownOn;
+
+    valveLockRef.current[valveId] = true;
+    valveOnRef.current[valveId] = newOn;
+    setValveBusy((prev) => ({ ...prev, [valveId]: true }));
+
+    const extra: Record<string, unknown> = { byte, on: newOn };
+    if (valveId === 'blower' && newOn) {
+      const sec = Number(
+        snapRef.current?.plc?.blowerSec ?? snap.plc.blowerSec ?? 2
+      );
+      extra.durationSec = Number.isFinite(sec) ? Math.max(0.2, sec) : 2;
+    }
+    if (snap.plc.valves[String(byte)]) {
+      snap.plc.valves[String(byte)] = {
+        ...snap.plc.valves[String(byte)],
+        on: newOn,
+      };
+    }
+    setView((prev) => ({
+      ...prev,
+      plcState: {
+        ...prev.plcState,
+        valves: prev.plcState.valves.map((v) =>
+          v.id === valveId ? { ...v, active: newOn } : v
+        ),
+      },
+    }));
+    api.plcAction('valve', extra).catch(() => {});
+
+    window.setTimeout(() => {
+      valveLockRef.current[valveId] = false;
+      setValveBusy((prev) => {
+        const next = { ...prev };
+        delete next[valveId];
+        return next;
+      });
+      // Releer estado del snap (puede haber llegado evento OFF del blower, etc.)
+      const latest = snapRef.current?.plc.valves[String(byte)];
+      if (latest && latest.on !== null && latest.on !== undefined) {
+        valveOnRef.current[valveId] = !!latest.on;
+      }
+    }, VALVE_TOGGLE_LOCK_MS);
+  }, []);
+
+  const setBlowerSec = useCallback((sec: number) => {
+    const v = Math.max(0.2, Math.min(300, Number(sec)));
+    if (!Number.isFinite(v)) return;
+    if (snapRef.current?.plc) {
+      snapRef.current.plc.blowerSec = v;
+    }
+    setView((prev) => ({
+      ...prev,
+      plcState: { ...prev.plcState, blowerSec: v },
+    }));
+    api.plcAction('set_blower_sec', { blowerSec: v }).catch(() => {});
+  }, []);
+
+  const plcReset = useCallback(() => {
+    api.plcAction('reset').catch(() => {});
+  }, []);
+
+  const plcAllOff = useCallback(() => {
+    api.plcAction('all_off').catch(() => {});
+  }, []);
+
+  const pfStart = useCallback(() => {
+    api.prefeederAction('start').then((res) => {
+      if (res.ok === false && res.error) window.alert(res.error);
+    }).catch(() => {});
+  }, []);
+
+  const pfStop = useCallback(() => {
+    api.prefeederAction('stop').then((res) => {
+      if (res.ok === false && res.error) window.alert(res.error);
+    }).catch(() => {});
+  }, []);
+
+  const pfReset = useCallback(() => {
+    api.prefeederAction('reset').then((res) => {
+      if (res.ok === false && res.error) window.alert(res.error);
+    }).catch(() => {});
+  }, []);
+
+  const pfMaterialist = useCallback(() => {
+    if (purgeBusyNow()) return;
+    api.prefeederAction('materialist').catch(() => {});
+  }, []);
+
+  const pfTriggerR = useCallback(() => {
+    api.prefeederAction('trigger_r').then((res) => {
+      if (res.ok === false && res.error) window.alert(res.error);
+    }).catch(() => {});
+  }, []);
+
+  const pfTriggerL = useCallback(() => {
+    api.prefeederAction('trigger_l').then((res) => {
+      if (res.ok === false && res.error) window.alert(res.error);
+    }).catch(() => {});
+  }, []);
+
+  const pfRefillPaint = useCallback(
+    (side: 'L' | 'R', channel: PfRefillChannel, on: boolean) => {
+      const key = side === 'L' ? 'refillL' : 'refillR';
+      setView((prev) => {
+        const cur = prev.preFeederState[key];
+        const next = { ...cur, [channel]: on };
+        if (channel === 'material') {
+          next.dereeler = on;
+          next.servo = on;
+          next.feeder = on;
+          next.material = on;
+        } else {
+          next.material = next.dereeler && next.servo && next.feeder;
+        }
+        return {
+          ...prev,
+          preFeederState: { ...prev.preFeederState, [key]: next },
+        };
+      });
+    },
+    []
+  );
+
+  const pfRefill = useCallback((side: 'L' | 'R', channel: PfRefillChannel, on: boolean) => {
+    pfRefillPaint(side, channel, on);
+    api.prefeederAction('refill', { side, channel, on }).then((res) => {
+      if (res.ok === false && res.error) {
+        pfRefillPaint(side, channel, false);
+        window.alert(res.error);
+      }
+    }).catch(() => {
+      pfRefillPaint(side, channel, false);
+    });
+  }, [pfRefillPaint]);
+
+  const andonSetOut = useCallback((out: 'green' | 'yellow' | 'red' | 'buzzer', on: boolean) => {
+    api.andonAction('set_out', { out, on }).catch(() => {});
+  }, []);
+
+  const andonAllOff = useCallback(() => {
+    api.andonAction('all_off').catch(() => {});
+  }, []);
+
+  const andonResumeAuto = useCallback(() => {
+    api.andonAction('resume_auto').catch(() => {});
+  }, []);
+
+  const andonMachineState = useCallback((byte: number) => {
+    api.andonAction('state', { byte }).catch(() => {});
+  }, []);
+
+  const clearLogs = useCallback((target: 'main' | 'motion' | 'plc' | 'prefeeder' | 'andon' | 'all') => {
+    const moduleOf = {
+      main: 'MAQUINA',
+      motion: 'MOTION',
+      plc: 'PLC',
+      prefeeder: 'PREFEEDER',
+      andon: 'ANDON',
+    } as const;
+
+    const matchesTarget = (mod: LogEntry['module']) =>
+      target === 'all' || (target in moduleOf && mod === moduleOf[target as keyof typeof moduleOf]);
+
+    const blockEntries = (entries: LogEntry[]) => {
+      const blocked = blockedLogKeysRef.current;
+      for (const e of entries) {
+        if (matchesTarget(e.module)) blocked.add(logKey(e));
+      }
+      if (blocked.size > 4000) blocked.clear();
+    };
+
+    const applyLocalClear = () => {
+      const next =
+        target === 'all'
+          ? []
+          : logsRef.current.filter((l) => !matchesTarget(l.module));
+      logsRef.current = next;
+      setView((prev) => ({ ...prev, logs: next }));
+    };
+
+    blockEntries(logsRef.current);
+    if (snapRef.current) blockEntries(mergeAllLogs(snapRef.current));
+    applyLocalClear();
+    void api.clearLog(target).then(() => {
+      if (snapRef.current) blockEntries(mergeAllLogs(snapRef.current));
+      applyLocalClear();
+    }).catch(() => {});
+  }, []);
+
+  const setAndonBuzzerMute = useCallback(async (mute: boolean) => {
+    setView((prev) => ({ ...prev, andonBuzzerMute: mute }));
+    try {
+      const res = await api.setAppConfig({ andonBuzzerMute: mute });
+      if (res?.config) {
+        setView((prev) => ({
+          ...prev,
+          andonBuzzerMute: !!res.config.andonBuzzerMute,
+        }));
+      }
+    } catch {
+      // Revertir optimista si el POST falló
+      setView((prev) => ({ ...prev, andonBuzzerMute: !mute }));
+    }
+  }, []);
+
+  const filterLogs = useCallback(
+    (module: LogEntry['module'] | 'ALL'): LogEntry[] => {
+      if (module === 'ALL') return view.logs;
+      return view.logs.filter((l) => l.module === module || l.module === 'SYSTEM');
+    },
+    [view.logs]
+  );
+
+  const reconnectNetwork = useCallback(async () => {
+    await api.reconnectNetwork().catch(() => {});
+  }, []);
+
+  const reconnectModule = useCallback(async (module: string) => {
+    await api.reconnectModule(module).catch(() => {});
+  }, []);
+
+  const updateChecklistState = useCallback((checklistState: ChecklistState) => {
+    setView((prev) => ({ ...prev, checklistState }));
+  }, []);
+
+  return {
+    view,
+    onTabChange,
+    reconnectNetwork,
+    reconnectModule,
+    updateChecklistState,
+    selectModel,
+    setTargetQty,
+    start,
+    stop,
+    resume,
+    pauseCycle,
+    resetCycleCmd,
+    machineHomeCmd,
+    setCutOffset,
+    toggleCycleMaterialist,
+    toggleCycleBusy,
+    setCycleStepByStep,
+    startRefill,
+    confirmRefill,
+    retryRefill,
+    confirmRecoveryReview,
+    reloadFeedOffset,
+    saveCycleConfig,
+    reloadCycleConfig,
+    setMmRpm,
+    motionMove,
+    motionStop,
+    motionServoOn,
+    motionServoOff,
+    motionSearchHome,
+    motionMoveZero,
+    motionReset,
+    encSetZeroR,
+    encSetZeroL,
+    feedL,
+    feedR,
+    saveFeedOffset,
+    toggleValve,
+    valveBusy,
+    setBlowerSec,
+    plcReset,
+    plcAllOff,
+    pfStart,
+    pfStop,
+    pfReset,
+    pfMaterialist,
+    pfTriggerR,
+    pfTriggerL,
+    pfRefill,
+    andonSetOut,
+    andonAllOff,
+    andonResumeAuto,
+    andonMachineState,
+    clearLogs,
+    setAndonBuzzerMute,
+    filterLogs,
+    parseLogs,
+  };
+}

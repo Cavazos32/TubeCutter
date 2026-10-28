@@ -1,0 +1,574 @@
+"""TCM HMI — Flask + React (frontend)."""
+
+from __future__ import annotations
+
+import atexit
+import json
+import os
+import queue
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from flask import Flask, Response, jsonify, request, send_from_directory
+from waitress import serve
+
+from state import get_state
+
+HMI_ROOT = Path(__file__).resolve().parent
+FRONTEND_DIR = HMI_ROOT / "frontend"
+DIST_DIR = FRONTEND_DIR / "dist"
+SRC_DIR = FRONTEND_DIR / "src"
+
+app = Flask(__name__, static_folder=str(DIST_DIR), static_url_path="")
+_sse_queues: list[queue.Queue[str | None]] = []
+_SSE_MAX_CLIENTS = 3
+HMI_HOST = os.environ.get("HMI_HOST", "0.0.0.0")
+HMI_PORT = int(os.environ.get("HMI_PORT", "5050"))
+# 1 = rebuild UI al arrancar si src > dist (default). 0 = no tocar npm.
+HMI_AUTO_BUILD_UI = os.environ.get("HMI_AUTO_BUILD_UI", "1").strip() not in (
+    "0",
+    "false",
+    "False",
+    "no",
+)
+
+
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _newest_mtime(root: Path) -> float:
+    newest = 0.0
+    if root.is_file():
+        return _mtime(root)
+    if not root.is_dir():
+        return 0.0
+    for f in root.rglob("*"):
+        if f.is_file():
+            newest = max(newest, _mtime(f))
+    return newest
+
+
+def _frontend_sources_mtime() -> float:
+    newest = 0.0
+    for p in (
+        SRC_DIR,
+        FRONTEND_DIR / "index.html",
+        FRONTEND_DIR / "package.json",
+        FRONTEND_DIR / "vite.config.ts",
+        FRONTEND_DIR / "vite.config.js",
+        FRONTEND_DIR / "tailwind.config.js",
+        FRONTEND_DIR / "postcss.config.js",
+    ):
+        newest = max(newest, _newest_mtime(p))
+    return newest
+
+
+def frontend_dist_is_stale() -> bool:
+    """True si no hay dist o el código fuente es más reciente que dist."""
+    index = DIST_DIR / "index.html"
+    if not index.is_file():
+        return True
+    return _frontend_sources_mtime() > (_mtime(index) + 0.5)
+
+
+def ensure_frontend_dist() -> bool:
+    """
+    Recompila frontend/dist si está ausente o desactualizado.
+    Devuelve True si dist/index.html existe al final.
+    """
+    index = DIST_DIR / "index.html"
+    if not frontend_dist_is_stale():
+        return True
+
+    if not HMI_AUTO_BUILD_UI:
+        print(
+            "[HMI] UI desactualizada (src > dist). "
+            "Ejecuta: cd frontend && npm run build  "
+            "(o HMI_AUTO_BUILD_UI=1 al arrancar)"
+        )
+        return index.is_file()
+
+    if not (FRONTEND_DIR / "package.json").is_file():
+        print("[HMI] No hay frontend/package.json — no se puede compilar UI")
+        return index.is_file()
+
+    print("[HMI] Compilando frontend (src más reciente que dist)…")
+    t0 = time.monotonic()
+    try:
+        # Windows: npm.cmd; npm run build en frontend/
+        npm = "npm.cmd" if sys.platform == "win32" else "npm"
+        proc = subprocess.run(
+            [npm, "run", "build"],
+            cwd=str(FRONTEND_DIR),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+    except FileNotFoundError:
+        print("[HMI] npm no encontrado — no se pudo recompilar UI")
+        return index.is_file()
+    except subprocess.TimeoutExpired:
+        print("[HMI] Timeout compilando UI (>180s)")
+        return index.is_file()
+
+    elapsed = time.monotonic() - t0
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()[-800:]
+        print(f"[HMI] Falló npm run build ({elapsed:.1f}s):\n{err}")
+        return index.is_file()
+
+    print(f"[HMI] UI lista en frontend/dist ({elapsed:.1f}s)")
+    return index.is_file()
+
+
+def _broadcast_sse() -> None:
+    """Empuja el snapshot más reciente. Si la cola está llena, descarta lo viejo
+    y conserva el cliente — no cortar el SSE (el ciclo notifica muchas veces/s)."""
+    try:
+        from latency_debug import mark as lat_mark
+
+        lat_mark("10", source="sse")
+    except ImportError:
+        pass
+    data = json.dumps(get_state().snapshot(slim=True), separators=(",", ":"))
+    for q in list(_sse_queues):
+        try:
+            q.put_nowait(data)
+        except queue.Full:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                q.put_nowait(data)
+            except queue.Full:
+                pass
+
+
+def _init_state() -> None:
+    get_state().subscribe(_broadcast_sse)
+
+
+_init_state()
+
+
+@app.after_request
+def _no_cache_spa_shell(resp: Response):
+    """Evita que el navegador conserve index.html apuntando a JS viejo hasheado."""
+    ct = resp.content_type or ""
+    if request.path in ("/", "/index.html") or ct.startswith("text/html"):
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+    # Vite marca <script crossorigin>; sin ACAO Chrome no ejecuta el módulo.
+    if request.path.startswith("/assets/"):
+        origin = request.headers.get("Origin") or "*"
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
+    return resp
+
+
+@app.errorhandler(404)
+def _api_json_404(_err):
+    # static_url_path="" hace que rutas /api desconocidas caigan en 404 HTML de Flask;
+    # el frontend hace res.json() y revienta con Unexpected token '<'.
+    if request.path.startswith("/api/"):
+        return jsonify({"ok": False, "error": "not_found", "path": request.path}), 404
+    # JS/CSS hasheado ausente: no devolver index.html (página en blanco).
+    if request.path.startswith("/assets/"):
+        return jsonify({"error": "asset_not_found", "path": request.path}), 404
+    if DIST_DIR.joinpath("index.html").is_file():
+        return send_from_directory(DIST_DIR, "index.html")
+    return jsonify({"error": "not found"}), 404
+
+
+@app.errorhandler(405)
+def _api_json_405(_err):
+    if request.path.startswith("/api/"):
+        return jsonify({"ok": False, "error": "method_not_allowed", "path": request.path}), 405
+    return jsonify({"error": "method_not_allowed"}), 405
+
+
+@atexit.register
+def _shutdown() -> None:
+    try:
+        get_state().stop()
+    except Exception:
+        pass
+
+
+@app.route("/")
+def index():
+    if DIST_DIR.joinpath("index.html").is_file():
+        return send_from_directory(DIST_DIR, "index.html")
+    return (
+        "<h1>TCM HMI</h1><p>Ejecuta <code>cd frontend &amp;&amp; npm install &amp;&amp; npm run build</code></p>",
+        503,
+        {"Content-Type": "text/html; charset=utf-8"},
+    )
+
+
+@app.route("/api/state")
+def api_state():
+    return jsonify(get_state().snapshot())
+
+
+@app.route("/api/events")
+def api_events():
+    # Limitar SSE: cada cliente ocupa un hilo Waitress; demasiados = HMI “congelada”.
+    while len(_sse_queues) >= _SSE_MAX_CLIENTS:
+        old = _sse_queues.pop(0)
+        try:
+            old.put_nowait(None)
+        except queue.Full:
+            pass
+
+    q: queue.Queue[str | None] = queue.Queue(maxsize=4)
+    _sse_queues.append(q)
+
+    def stream():
+        try:
+            try:
+                yield f"data: {json.dumps(get_state().snapshot())}\n\n"
+            except Exception as exc:
+                print(f"[HMI] SSE snapshot: {exc}", flush=True)
+                yield "event: error\ndata: {\"ok\":false}\n\n"
+                return
+            while True:
+                try:
+                    payload = q.get(timeout=15)
+                except queue.Empty:
+                    yield ": keepalive\n\n"
+                    continue
+                if payload is None:
+                    break
+                yield f"data: {payload}\n\n"
+        finally:
+            if q in _sse_queues:
+                _sse_queues.remove(q)
+
+    # No poner header Connection: waitress lo trata como hop-by-hop y responde 500.
+    return Response(
+        stream(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/api/network/reconnect")
+def api_network_reconnect():
+    return jsonify({"ok": True, "links": get_state().reconnect_all_modules()})
+
+
+@app.post("/api/network/reconnect/<module>")
+def api_network_reconnect_module(module: str):
+    ok = get_state().reconnect_module(module)
+    return jsonify({"ok": ok})
+
+
+@app.post("/api/model")
+def api_model():
+    body = request.get_json(silent=True) or {}
+    idx = int(body.get("index", 0))
+    get_state().select_model(idx)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/motion/mm-rpm")
+def api_mm_rpm():
+    body = request.get_json(silent=True) or {}
+    get_state().set_mm_rpm(float(body.get("mm", -45)), float(body.get("rpm", 1200)))
+    return jsonify({"ok": True})
+
+
+@app.post("/api/start")
+def api_start():
+    body = request.get_json(silent=True) or {}
+    qty = body.get("qty")
+    return jsonify(get_state().cmd_start(qty=int(qty) if qty is not None else None))
+
+
+@app.post("/api/stop")
+def api_stop():
+    return jsonify(get_state().cmd_stop())
+
+
+@app.post("/api/resume")
+def api_resume():
+    return jsonify(get_state().cmd_resume())
+
+
+@app.post("/api/cycle/pause")
+def api_cycle_pause():
+    return jsonify(get_state().cmd_cycle_pause())
+
+
+@app.post("/api/cycle/reset")
+def api_cycle_reset():
+    body = request.get_json(silent=True) or {}
+    return jsonify(
+        get_state().cmd_error_reset(
+            confirm=bool(body.get("confirm", False)),
+            do_home=bool(body.get("doHome", False)),
+        )
+    )
+
+
+@app.post("/api/machine/home")
+def api_machine_home():
+    """Home máquina: ASDA→0 + encoders Set0 + All Off (no Buscar HOME 0x01)."""
+    return jsonify(get_state().cmd_machine_home())
+
+
+@app.post("/api/error/reset")
+def api_error_reset():
+    body = request.get_json(silent=True) or {}
+    return jsonify(
+        get_state().cmd_error_reset(
+            confirm=bool(body.get("confirm", False)),
+            do_home=bool(body.get("doHome", False)),
+        )
+    )
+
+
+@app.post("/api/cycle/materialist")
+def api_cycle_materialist():
+    body = request.get_json(silent=True) or {}
+    return jsonify(get_state().cmd_cycle_materialist(_parse_on(body)))
+
+
+@app.post("/api/cycle/busy")
+def api_cycle_busy():
+    body = request.get_json(silent=True) or {}
+    return jsonify(get_state().cmd_cycle_busy(_parse_on(body)))
+
+
+def _parse_on(body: dict, default: bool = True) -> bool:
+    """Acepta on bool / 0-1 / true-false; no forzar True si viene false."""
+    if "on" not in body:
+        return default
+    v = body.get("on")
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
+
+
+@app.post("/api/cycle/step-by-step")
+def api_cycle_step_by_step():
+    body = request.get_json(silent=True) or {}
+    return jsonify(get_state().cmd_cycle_step_by_step(_parse_on(body)))
+
+
+@app.post("/api/cycle/refill")
+def api_cycle_refill():
+    body = request.get_json(silent=True) or {}
+    feed_mm = body.get("mm", body.get("feedMm"))
+    asda_mm = body.get("asdaMm")
+    return jsonify(
+        get_state().cmd_cycle_refill(
+            feed_mm=float(feed_mm) if feed_mm is not None else None,
+            asda_mm=float(asda_mm) if asda_mm is not None else None,
+        )
+    )
+
+
+@app.post("/api/cycle/refill/confirm")
+def api_cycle_refill_confirm():
+    body = request.get_json(silent=True) or {}
+    ok = body.get("ok", body.get("confirm", True))
+    return jsonify(get_state().cmd_cycle_refill_confirm(bool(ok)))
+
+
+@app.post("/api/cycle/recovery/review")
+def api_cycle_recovery_review():
+    body = request.get_json(silent=True) or {}
+    ok = body.get("ok", body.get("confirm", True))
+    return jsonify(get_state().cmd_recovery_review(bool(ok)))
+
+
+@app.post("/api/cycle/refill/retry")
+def api_cycle_refill_retry():
+    body = request.get_json(silent=True) or {}
+    feed_mm = body.get("mm", body.get("feedMm"))
+    return jsonify(
+        get_state().cmd_cycle_refill_retry(
+            feed_mm=float(feed_mm) if feed_mm is not None else None
+        )
+    )
+
+
+@app.get("/api/cycle/config")
+def api_cycle_config_get():
+    return jsonify({"ok": True, "config": get_state().get_cycle_config()})
+
+
+@app.post("/api/cycle/config")
+def api_cycle_config_set():
+    body = request.get_json(silent=True) or {}
+    cfg = get_state().set_cycle_config(body)
+    return jsonify({"ok": True, "config": cfg})
+
+
+@app.post("/api/cycle/config/reload")
+def api_cycle_config_reload():
+    cfg = get_state().reload_cycle_config()
+    return jsonify({"ok": True, "config": cfg})
+
+
+@app.get("/api/app/config")
+def api_app_config_get():
+    return jsonify({"ok": True, "config": get_state().get_app_config()})
+
+
+@app.post("/api/app/config")
+def api_app_config_set():
+    body = request.get_json(silent=True) or {}
+    cfg = get_state().set_app_config(body)
+    return jsonify({"ok": True, "config": cfg})
+
+
+@app.post("/api/debug/unlock")
+def api_debug_unlock():
+    body = request.get_json(silent=True) or {}
+    password = str(body.get("password", ""))
+    ok = get_state().check_debug_password(password)
+    return jsonify({"ok": ok, "error": None if ok else "invalid_password"})
+
+
+@app.post("/api/checklist")
+def api_checklist():
+    body = request.get_json(silent=True) or {}
+    action = str(body.pop("action", ""))
+    return jsonify(get_state().cmd_checklist(action, **body))
+
+
+@app.post("/api/maintenance/cycle-counter/reset")
+def api_maintenance_cycle_counter_reset():
+    body = request.get_json(silent=True) or {}
+    result = get_state().reset_maintenance_cycle_count(
+        str(body.get("employeeId", "")),
+        str(body.get("password", "")),
+    )
+    return jsonify(result)
+
+
+@app.post("/api/motion")
+def api_motion():
+    body = request.get_json(silent=True) or {}
+    action = body.pop("action", "")
+    return jsonify(get_state().cmd_motion(action, **body))
+
+
+@app.post("/api/plc")
+def api_plc():
+    body = request.get_json(silent=True) or {}
+    action = body.pop("action", "")
+    return jsonify(get_state().cmd_plc(action, **body))
+
+
+@app.post("/api/prefeeder")
+def api_pf():
+    body = request.get_json(silent=True) or {}
+    action = body.pop("action", "")
+    return jsonify(get_state().cmd_pf(action, **body))
+
+
+@app.post("/api/andon")
+def api_andon():
+    body = request.get_json(silent=True) or {}
+    action = body.pop("action", "")
+    return jsonify(get_state().cmd_andon(action, **body))
+
+
+@app.post("/api/log/clear")
+def api_log_clear():
+    body = request.get_json(silent=True) or {}
+    get_state().clear_log(body.get("target", "main"))
+    return jsonify({"ok": True})
+
+
+@app.post("/api/motion/enc-poll")
+def api_enc_poll():
+    body = request.get_json(silent=True) or {}
+    if body.get("enable", True):
+        get_state().start_enc_poll()
+    else:
+        get_state().stop_enc_poll()
+    return jsonify({"ok": True})
+
+
+@app.get("/api/motion/feed-offset")
+def api_motion_feed_offset_get():
+    return jsonify(get_state().refresh_feed_offset())
+
+
+@app.post("/api/motion/feed-offset")
+def api_motion_feed_offset_set():
+    body = request.get_json(silent=True) or {}
+    return jsonify(
+        get_state().set_feed_offset(
+            float(body.get("feedOffsetMmL", body.get("offsetMm", 0.0))),
+            float(body.get("feedOffsetMmR", body.get("offsetMmB", 0.0))),
+        )
+    )
+
+
+@app.route("/<path:asset_path>")
+def spa_assets(asset_path: str):
+    # Nunca devolver index.html para /api/*: el frontend hace res.json() y falla con
+    # Unexpected token '<' si recibe HTML (404 SPA).
+    if asset_path == "api" or asset_path.startswith("api/"):
+        return jsonify({"ok": False, "error": "not_found", "path": f"/{asset_path}"}), 404
+    target = DIST_DIR / asset_path
+    if target.is_file():
+        return send_from_directory(DIST_DIR, asset_path)
+    # JS/CSS hasheado ausente no debe devolver HTML (el navegador queda en blanco).
+    if asset_path.startswith("assets/"):
+        return jsonify({"error": "asset_not_found", "path": asset_path}), 404
+    if DIST_DIR.joinpath("index.html").is_file():
+        return send_from_directory(DIST_DIR, "index.html")
+    return jsonify({"error": "not found"}), 404
+
+
+def main() -> None:
+    ensure_frontend_dist()
+    get_state().start()
+    addr = f"{HMI_HOST}:{HMI_PORT}"
+    ui = DIST_DIR / "index.html"
+    if ui.is_file():
+        stale = " (src más nuevo — rebuild falló o desactivado)" if frontend_dist_is_stale() else ""
+        print(f"TCM HMI — http://{addr}  (UI: frontend/dist){stale}", flush=True)
+    else:
+        print(
+            f"TCM HMI — http://{addr}  (UI no compilada — cd frontend && npm run build)",
+            flush=True,
+        )
+    # Más hilos + timeout de canal: evita CloseWait eternos que dejan la HMI sin responder.
+    serve(app, listen=addr, threads=24, channel_timeout=30)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nHMI detenido.", flush=True)
+    except Exception:
+        import traceback
+
+        traceback.print_exc()
+        if sys.stdin.isatty():
+            try:
+                input("El HMI se detuvo. Enter para cerrar...")
+            except EOFError:
+                pass
+        sys.exit(1)

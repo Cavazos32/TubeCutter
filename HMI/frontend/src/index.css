@@ -1,0 +1,31 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+html,
+body,
+#root {
+  height: 100%;
+  min-height: 100%;
+  margin: 0;
+  padding: 0;
+  width: 100%;
+}
+
+html {
+  /* Escala base: legible en pantalla de planta sin forzar scroll vertical */
+  font-size: 100%;
+}
+
+body {
+  background-color: #f8fafc; /* slate-50 */
+  overflow: hidden;
+}
+
+html.dark body {
+  background-color: #020617; /* slate-950 */
+}
+
+#root {
+  background-color: inherit;
+}

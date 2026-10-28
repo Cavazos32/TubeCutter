@@ -1,0 +1,220 @@
+/** Tipos del snapshot JSON del backend Flask (state.py). */
+
+export interface BackendBanner {
+  text: string;
+  kind: 'info' | 'warn' | 'error' | 'ok';
+}
+
+export interface BackendModel {
+  name: string;
+  mm: number;
+  rpm: number;
+  qty?: number;
+  cantidad?: number;
+}
+
+export interface BackendCycleConfig {
+  depositBatchSize: number;
+  depositExtraMm: number;
+  depositStackGapMm?: number;
+  depositMaxTravelMm?: number;
+  gripperClearanceMm?: number;
+  cutOffsetMm?: number;
+  wipBlowerInicioOffsetMm?: number;
+  feedSides?: 'L' | 'R' | 'LR' | string;
+  pfTriggerEnabled?: boolean;
+  refillMm?: number;
+  refillAsdaMm?: number;
+}
+
+export interface BackendFlowStep {
+  id: number;
+  key: string;
+  label: string;
+  kind: 'action' | 'wait' | 'parallel';
+  delayMs?: number;
+  parallelRole?: 'start' | 'join';
+  /** Si true, Step by Step pausa tras este paso (checkpoint físico). */
+  sbsPause?: boolean;
+  note?: string;
+}
+
+export interface BackendCycleSnapshot {
+  byte: number;
+  name: string;
+  active: boolean;
+  paused: boolean;
+  materialist: boolean;
+  busy?: boolean;
+  stepByStep: boolean;
+  refillActive?: boolean;
+  refillAwaitingConfirm?: boolean;
+  refillPrompt?: string;
+  step: number;
+  stepName: string;
+  stepLabel: string;
+  parallelGroup?: string;
+  rep: number;
+  piecesDone?: number;
+  totalReps: number;
+  progress: number;
+  elapsedSec?: number;
+  lastPieceSec?: number;
+  avgPieceSec?: number;
+  completed?: boolean;
+  lastOk: boolean;
+  fault: string;
+  recovery?: string;
+  recoveryAfterError?: boolean;
+  recoveryPrompt?: string;
+  recoveryAwaitingConfirm?: boolean;
+  /** Piezas por tray antes de pausar para vaciar (0 = sin tope). */
+  trayPieces?: number;
+  e050FinishPiece?: boolean;
+  e050MaterialistRequested?: boolean;
+  e050MaterialistWait?: boolean;
+  refillSkipCut?: boolean;
+  /** Clave JSON que el backend debe emitir en snapshot.cycle (booleano). */
+  purgeHandsWarning?: boolean;
+  asdaMoveWarning?: boolean;
+  config: BackendCycleConfig;
+  /** Ausente en SSE slim (la UI conserva el último flow). */
+  flow?: BackendFlowStep[];
+}
+
+export interface BackendLink {
+  connected: boolean;
+  host: string;
+  port: number;
+}
+
+export interface BackendMotion {
+  connected: boolean;
+  status: BackendBanner;
+  asdaPositionMm: number | null;
+  enc_r: string;
+  enc_l: string;
+  feedOffsetMmL: number;
+  feedOffsetMmR: number;
+  laserR?: boolean;
+  laserL?: boolean;
+  safetyExhaust?: boolean;
+}
+
+export interface BackendValve {
+  label: string;
+  on: boolean | null;
+  error: boolean | null;
+}
+
+export interface BackendPlc {
+  connected: boolean;
+  status: BackendBanner;
+  last_state_byte: number | null;
+  blowerSec?: number;
+  valves: Record<string, BackendValve>;
+}
+
+export interface BackendPfError {
+  label: string;
+  active: boolean | null;
+}
+
+export interface BackendPfSide {
+  autoState?: string | null;
+  triggerActive?: boolean | null;
+  idleMode?: boolean;
+  refillMaterial?: boolean;
+  refillDereeler?: boolean;
+  refillServo?: boolean;
+  refillFeeder?: boolean;
+  refillPulseS?: number;
+}
+
+export interface BackendPreFeeder {
+  connected: boolean;
+  status: BackendBanner;
+  last_state_byte: number | null;
+  errors: Record<string, BackendPfError>;
+  fault_active?: Record<string, boolean>;
+  /** Buffer Full en lados del ciclo y sin EXXX. */
+  bufferReady?: boolean;
+  /** Iniciar alimentador: preparación en curso. */
+  manualPrepBusy?: boolean;
+  sides?: {
+    L?: BackendPfSide;
+    R?: BackendPfSide;
+  };
+}
+
+export interface BackendErrorItem {
+  code: string;
+  module: string;
+  description: string;
+  ui: string;
+}
+
+export interface BackendErrorLatch {
+  active: boolean;
+  code: string;
+  byte: number;
+  module: string;
+  description: string;
+  ui: string;
+  last?: BackendErrorLatch;
+  /** EXXX activos: el latch va primero; el resto sigue encolado. */
+  queue?: BackendErrorItem[];
+}
+
+export interface BackendSnapshot {
+  models: BackendModel[];
+  selectedModel: number;
+  mm: number;
+  rpm: number;
+  banner: BackendBanner;
+  error?: BackendErrorLatch;
+  progress: number;
+  resumeEnabled: boolean;
+  cycle: BackendCycleSnapshot;
+  motionLink: BackendLink;
+  plcLink: BackendLink;
+  pfLink: BackendLink;
+  andonLink?: BackendLink;
+  appConfig?: {
+    andonBuzzerMute: boolean;
+    maintenanceCycleCount?: number;
+  };
+  checklist?: {
+    required?: boolean;
+    lastCompletedAt?: string | null;
+    currentStepId?: string;
+    session?: Record<string, unknown> | null;
+    workerBusy?: boolean;
+    workerPhase?: string;
+    workerError?: string;
+    stepError?: string;
+    airTestActive?: boolean;
+    pieceTestStarted?: boolean;
+    stepStatus?: Record<string, unknown>;
+  };
+  andon?: {
+    connected: boolean;
+    green: boolean;
+    yellow: boolean;
+    red: boolean;
+    buzzer: boolean;
+    manual: boolean;
+    byte?: number;
+    pressure?: boolean;
+  };
+  motion: BackendMotion;
+  plc: BackendPlc;
+  prefeeder: BackendPreFeeder;
+  logs: {
+    main: string[];
+    motion: string[];
+    plc: string[];
+    prefeeder: string[];
+    andon?: string[];
+  };
+}
