@@ -44,7 +44,6 @@ constexpr uint8_t PF_FAULT_WIRE_BASE = 20;
 constexpr uint8_t PIN_BUF_FULL = 19;   // HIGH = activo (buffer lleno / “home” en peer)
 constexpr uint8_t PIN_BUF_MID = 34;
 constexpr uint8_t PIN_BUF_HIGH = 35;
-constexpr uint8_t PIN_TENSION = 23;
 constexpr uint8_t PIN_BUF_MAX = 21;
 constexpr uint8_t PIN_CYLINDER = 25;
 constexpr uint8_t PIN_HOSE = 27;       // HIGH = manguera/cinta ausente
