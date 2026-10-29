@@ -1004,6 +1004,30 @@ class CycleRunner:
         with self._lock:
             return self._purge_busy_locked()
 
+    def purge_hands_locked(self) -> bool:
+        """True solo en la secuencia automática que avisa no meter las manos."""
+        with self._lock:
+            return bool(self._purge_hands_warning and self._refill_mode and self._active)
+
+    def cancel_unstarted_lot_purge(self) -> None:
+        """Suelta una purga pedida que todavía no entró al cuerpo.
+
+        Reset debe poder restablecer el error aunque la purga no haya arrancado.
+        """
+        with self._lock:
+            if self._refill_mode and self._active:
+                return
+            self._lot_purge_request = None
+
+    def leave_error_state_after_clear(self) -> None:
+        """El latch ya se limpió: salir de ERROR sin cerrar el lote."""
+        with self._lock:
+            still_error = self._state_byte == TX_ERROR
+            active = self._active
+        if not still_error:
+            return
+        self._set_state(TX_PAUSE if active else TX_IDLE)
+
     def is_e050_materialist_wait(self) -> bool:
         with self._lock:
             return bool(self._e050_materialist_wait)
@@ -1578,13 +1602,14 @@ class CycleRunner:
         return {"ok": True}
 
     def retry_refill(self, feed_mm: float | None = None) -> dict[str, Any]:
-        """Alimentar hasta láser ON. Válido solo en await_feed.
+        """Alimentar hasta láser ON.
 
-        feed_mm se ignora (legado API); siempre creep a láser.
+        Vale en la espera inicial y otra vez después de alimentar, por si la
+        manguera buena empuja un sobrante. feed_mm se ignora (legado API).
         """
         if not self._refill_awaiting_confirm:
             return {"ok": False, "error": "Sin refill pendiente de confirmación"}
-        if self._refill_prompt != "await_feed":
+        if self._refill_prompt not in ("await_feed", "after_feed"):
             return {"ok": False, "error": "Alimentar solo en espera de alimentación"}
         _ = feed_mm  # legado API; ignorado
         self._refill_retry.set()
@@ -1949,6 +1974,8 @@ class CycleRunner:
         try:
             while True:
                 if self._should_abort() or self._recovery_reject.is_set():
+                    return "reject"
+                if self._lot_purge_request is not None:
                     return "reject"
                 if self._recovery_confirm.is_set():
                     result = "ok"
@@ -2329,7 +2356,11 @@ class CycleRunner:
             self._release_e050_finish_pause()
             if self._pause.is_set():
                 while self._pause.is_set():
-                    if self._should_abort() or self._restart_piece:
+                    if (
+                        self._should_abort()
+                        or self._restart_piece
+                        or self._lot_purge_request is not None
+                    ):
                         return True
                     time.sleep(0.05)
                 self._leave_pause_andon()
@@ -2674,6 +2705,9 @@ class CycleRunner:
         """UI/lote cerrado; PreFeeder puede seguir hasta buffer+holgura OK."""
         with self._lock:
             self._post_lot_pf_settle = True
+            # Producción terminada: no reportar active=True mientras solo
+            # esperamos settled del PF (evita HMI en PRODUCIENDO con 4/4).
+            self._active = False
             self._rep = self._total_reps
             self._pieces_done = self._total_reps
             self._progress = 100
@@ -3891,7 +3925,7 @@ class CycleRunner:
         """'ok' | 'reject' | 'retry'. Abort/Stop → 'reject'.
 
         prompt: await_feed (Alimentar / Continuar purga)
-              | after_feed (Continuar purga).
+              | after_feed (Alimentar otra vez / Continuar purga).
         """
         with self._lock:
             self._refill_prompt = prompt
@@ -3908,7 +3942,7 @@ class CycleRunner:
             )
         else:
             self._host.cycle_log(
-                "Refill: material en láser — Continuar purga"
+                "Refill: material en láser — Alimentar otra vez o Continuar purga"
             )
         self._host.cycle_notify()
         try:
@@ -3917,7 +3951,10 @@ class CycleRunner:
                     return "reject"
                 if self._refill_confirm.is_set():
                     return "ok"
-                if prompt == "await_feed" and self._refill_retry.is_set():
+                if (
+                    prompt in ("await_feed", "after_feed")
+                    and self._refill_retry.is_set()
+                ):
                     return "retry"
                 time.sleep(0.05)
         finally:
@@ -4036,6 +4073,24 @@ class CycleRunner:
         self._host.cmd_plc_tools_safe()
         self._finish(False, soft_cancel=True)
 
+    def _purge_feed_until_laser(self) -> bool:
+        """Creep hasta láser ON. False = fallo o abort."""
+        sides_txt = "".join(self._feed_side_list())
+        laser_bits = []
+        for side in self._feed_side_list():
+            on = self._host.motion_laser_on(side)
+            laser_bits.append(f"{side}:{'material' if on else 'vacío'}")
+        self._host.cycle_log(
+            f"Refill: alimentar hasta láser ON "
+            f"(timeout {REFILL_LASER_TIMEOUT_S:g} s · lados={sides_txt} · "
+            f"referencia {', '.join(laser_bits)})"
+        )
+        if not self._purge_tfeed_before_motion_feed():
+            return False
+        if not self._run_feed(skip_validate=True, feed_mm=None):
+            return False
+        return not self._should_abort()
+
     def _execute_refill_body(
         self,
         rpm: float,
@@ -4101,34 +4156,30 @@ class CycleRunner:
 
         decision = self._wait_refill_operator_decision("await_feed")
         if decision == "retry":
-            sides_txt = "".join(self._feed_side_list())
-            laser_bits = []
-            for side in self._feed_side_list():
-                on = self._host.motion_laser_on(side)
-                laser_bits.append(
-                    f"{side}:{'material' if on else 'vacío'}"
-                )
-            self._host.cycle_log(
-                f"Refill: alimentar hasta láser ON "
-                f"(timeout {REFILL_LASER_TIMEOUT_S:g} s · lados={sides_txt} · "
-                f"referencia {', '.join(laser_bits)})"
-            )
-            if not self._purge_tfeed_before_motion_feed():
-                return "fail"
-            if not self._run_feed(skip_validate=True, feed_mm=None):
+            if not self._purge_feed_until_laser():
                 return "fail"
             with self._lock:
                 self._progress = 55
-            if self._should_abort():
-                return "fail"
         elif decision == "ok":
             self._host.cycle_log("Refill: Continuar purga sin alimentar")
         else:
             return "cancel"
 
-        decision = self._wait_refill_operator_decision("after_feed")
-        if decision != "ok":
-            return "cancel"
+        while True:
+            decision = self._wait_refill_operator_decision("after_feed")
+            if decision == "retry":
+                self._host.cycle_log(
+                    "Refill: alimentar otra vez "
+                    "(la manguera buena puede empujar un sobrante)"
+                )
+                if not self._purge_feed_until_laser():
+                    return "fail"
+                with self._lock:
+                    self._progress = 55
+                continue
+            if decision != "ok":
+                return "cancel"
+            break
 
         with self._lock:
             self._progress = 70

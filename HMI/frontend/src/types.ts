@@ -99,6 +99,8 @@ export interface MachineState {
   isRunning: boolean;
   isPaused: boolean;
   cycleActive: boolean;
+  /** Tras última pieza OK: hilo espera buffer/holgura PF antes de Idle. */
+  postLotPfSettle?: boolean;
   /** Producción activa: bloquea Iniciar alimentador (no aplica en pausa/refill/settle). */
   pfOperatorStartBlocked?: boolean;
   cycleStep: number;

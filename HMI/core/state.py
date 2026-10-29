@@ -2085,10 +2085,17 @@ class HmiState:
         Home de máquina (control de máquina):
         ASDA → posición 0 + encoders Set0 L/R + All Off neumática.
         No es Buscar HOME (0x01) ni Reset HMI.
-        Siempre accionable salvo purga en curso: con lote vivo pausa y re-arranca la pieza al Resume.
+        Sigue usable con error (lo restablece) y durante la espera de purga.
+        Con lote vivo pausa y re-arranca la pieza al Resume.
         """
-        if self._cycle.is_purge_busy():
-            return {"ok": False, "error": "Purga en curso"}
+        # Posición inicial sigue usable con error y durante la espera de purga.
+        # Solo se niega mientras la secuencia automática avisa que no metas las manos.
+        if self._cycle.purge_hands_locked():
+            return {"ok": False, "error": "Purga en movimiento — no metas las manos"}
+        if self.error_is_latched():
+            cleared = self.clear_latched_error_keep_lot()
+            if not cleared.get("ok"):
+                return cleared
         if self._cycle.is_active():
             # Home no es Stop: el lote queda en Pause y la pieza se re-arranca.
             self._cycle.restart_piece_after_manual_home()
@@ -2143,8 +2150,98 @@ class HmiState:
             }
         return True
 
+    def clear_latched_error_keep_lot(self) -> dict:
+        """Mismo Reset de módulo que el botón Reset, sin preguntar Abortar/Continuar.
+
+        La purga (y la posición inicial) lo usan cuando un EXXX impide mover.
+        Si la falla sigue en el equipo, el latch queda y no se arranca nada.
+        """
+        latch = self._error_policy.latch
+        if not latch.active:
+            return {"ok": True, "cleared": False}
+
+        if self._pf_client.connected:
+            if not self._pf_send_reset():
+                self._notify()
+                return {
+                    "ok": False,
+                    "error": "PreFeeder no aceptó Reset",
+                    "cleared": None,
+                }
+        if self._plc_client.connected:
+            if not self._plc_reset_reflect_off(log_label="Reset PLC"):
+                self._notify()
+                return {
+                    "ok": False,
+                    "error": "PLC no aceptó Reset",
+                    "cleared": None,
+                }
+
+        ui = latch.ui_text or latch.code or "error activo"
+        module = (latch.module or "").lower()
+        source_is_software = "cycle" in module
+        module_reset_ok = True
+        if "motion" in module:
+            module_reset_ok = bool(self._client.cmd_reset_errors())
+        elif "plc" in module:
+            module_reset_ok = bool(self._plc_client.connected)
+        elif "pre" in module or "feeder" in module:
+            module_reset_ok = bool(self._pf_client.connected)
+
+        if not module_reset_ok:
+            self._set_banner(ui, "error")
+            self._broadcast_machine_state(MACH_ERROR)
+            self._notify()
+            return {
+                "ok": False,
+                "error": f"Reset no confirmado para {ui}",
+                "cleared": None,
+            }
+
+        if "motion" in module:
+            try:
+                self._client.cmd_status()
+            except Exception:
+                pass
+            self.refresh_motion_lasers()
+        elif "plc" in module:
+            try:
+                self._plc_client.cmd_status()
+            except Exception:
+                pass
+        elif "pre" in module or "feeder" in module:
+            try:
+                self._pf_client.cmd_status()
+            except Exception:
+                pass
+
+        healthy = True if source_is_software else self._latch_source_is_healthy()
+        if not healthy:
+            self._set_banner(ui, "error")
+            self._broadcast_machine_state(MACH_ERROR)
+            self._notify()
+            return {
+                "ok": False,
+                "error": f"{ui} sigue activo. Restablece el error para poder purgar.",
+                "persisted": True,
+                "cleared": None,
+            }
+
+        old = self._error_policy.clear()
+        self._cycle.clear_fault_mirror()
+        self._cycle.leave_error_state_after_clear()
+        self._banner = {"text": "Error restablecido", "kind": "ok"}
+        _append_log(
+            self._main_log,
+            f"Error restablecido para acción manual · {getattr(old, 'ui_text', '')}",
+        )
+        self._notify()
+        return {"ok": True, "cleared": True}
+
     def cmd_error_reset(self, confirm: bool = False, do_home: bool = False) -> dict:
         """Machine RESET: reset source, validate source, never HOME."""
+        # Una purga pedida que aún no arrancó no debe dejar la máquina trabada.
+        self._cycle.cancel_unstarted_lot_purge()
         latch = self._error_policy.latch
 
         # Reset HMI siempre manda Reset PF (0x2C) si hay enlace — igual que Start manda 0x2A.
@@ -2602,12 +2699,17 @@ class HmiState:
         """Purga/refill material: ASDA park → Alimentar o Continuar purga → secuencia automática.
 
         Siempre accionable (también con latch EXXX o lote vivo), salvo si ya hay purga en curso.
-        Start/Resume/Pause/Home/Materialist bloqueados durante la purga; Stop activo.
+        Si hay EXXX, primero lo restablece (mismo Reset de módulo). Si la falla sigue, no arranca.
+        Start/Resume/Pause/Materialist bloqueados durante la purga; Stop y posición inicial siguen.
         """
         with self._lock:
             rpm = self._rpm
-        if self._cycle.is_refill_active():
+        if self._cycle.is_refill_active() or self._cycle.is_purge_busy():
             return {"ok": False, "error": "Purga ya en curso"}
+        if self.error_is_latched():
+            cleared = self.clear_latched_error_keep_lot()
+            if not cleared.get("ok"):
+                return cleared
         if self._cycle.is_active():
             res = self._cycle.request_lot_purge(feed_mm=feed_mm, asda_mm=asda_mm)
             if res.get("ok"):

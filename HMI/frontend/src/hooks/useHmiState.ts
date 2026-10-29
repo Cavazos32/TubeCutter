@@ -67,6 +67,7 @@ const DEFAULT_MACHINE: MachineState = {
   isRunning: false,
   isPaused: false,
   cycleActive: false,
+  postLotPfSettle: false,
   cycleStep: 0,
   cycleStepLabel: '',
   cycleMaterialist: false,
@@ -355,7 +356,7 @@ export function useHmiState() {
   }, []);
 
   const machineHomeCmd = useCallback(async () => {
-    if (purgeBusyNow()) return;
+    if (snapRef.current?.cycle.purgeHandsWarning) return;
     try {
       const res = await api.machineHome();
       if (res.ok === false && res.error) window.alert(String(res.error));

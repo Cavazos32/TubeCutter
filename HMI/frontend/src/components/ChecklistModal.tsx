@@ -383,6 +383,13 @@ export const ChecklistModal: React.FC<ChecklistModalProps> = ({
         if (status.refillAwaitingConfirm && status.refillPrompt === 'after_feed') {
           return [
             {
+              id: 'purge-feed',
+              label: t('btn_refill_confirm_retry'),
+              disabled: busy,
+              onClick: () =>
+                run(() => checklistCmd('action', { name: 'feed_purge' })),
+            },
+            {
               id: 'purge-continue',
               label: t('btn_refill_confirm_next_cut'),
               primary: true,

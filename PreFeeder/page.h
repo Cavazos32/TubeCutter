@@ -154,7 +154,7 @@ input[type=number]{width:100%;padding:8px 10px;border-radius:6px;border:1px soli
 <div class="col-stack">
 <section class="card">
 <h2>Feeder · holgura y Tfeed</h2>
-<p class="note">GPIO 22 OFF → alimenta hasta flanco ON; asentamiento tras flanco; luego n s de feeder (sin mirar el sensor). Tras alimentar, OFF sostenido &gt; N s → fallo. Tfeed TCP solo si está permitido y holgura ON al pulso.</p>
+<p class="note">GPIO 22 OFF → alimenta hasta flanco ON; asentamiento tras flanco; luego n s de feeder (sin mirar el sensor). Con Auto ON, OFF sostenido &gt; N s → fallo (también esperando in process; no cuenta asentamiento ni los n s tras el flanco). Tfeed TCP solo si está permitido y holgura ON al pulso.</p>
 <div class="f2">
 <div><label>RPM Feeder</label><input id="m2" type="number" min="1" max="600"></div>
 <div><label>Tfeed (s)</label><input id="trig" type="number" min="0.1" max="60" step="0.1"></div>

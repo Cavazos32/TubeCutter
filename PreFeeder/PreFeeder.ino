@@ -300,6 +300,7 @@ static bool holguraLastOn = false;
 static bool holguraSawOn = false;
 static bool holguraPostCycleOffWatch = false;
 static uint32_t holguraOffSinceMs = 0;
+static uint16_t holguraActiveTriggerId = 0;
 static bool pendingTrigger = false;
 static float pendingTriggerSec = 0.0f;
 static uint16_t pendingTriggerId = 0;
@@ -349,6 +350,7 @@ static void resetHolguraFeedState() {
   holguraSawOn = false;
   holguraPostCycleOffWatch = false;
   holguraOffSinceMs = 0;
+  holguraActiveTriggerId = 0;
 }
 
 static void holguraOnRisingEdge(uint32_t nowMs) {
@@ -370,24 +372,28 @@ static void stopFeederDemand() {
 }
 
 static void beginHolguraFeed(uint32_t nowMs) {
+  (void)nowMs;
   if (holguraOkStable()) return;
   holguraPostCycleOffWatch = false;
-  holguraOffSinceMs = 0;
-  feederDemand = false;
+  // No reiniciar holguraOffSinceMs: rearmar el feeder no borra el OFF sostenido.
   feederMode = FEED_HOLGURA;
   holguraSawOn = false;
   holguraSettleEndMs = 0;
   holguraTimedEndMs = 0;
-  holguraLastOn = holguraOkStable();
+  holguraLastOn = false;
   holguraPhase = HOLG_WAIT_ON;
+  feederDemand = true;
 }
 
 // Ciclo holgura terminó: flanco ON → settle → n s de alimentación.
 static void stopHolguraFeedCycle(uint32_t nowMs) {
+  triggerIdRemember(holguraActiveTriggerId);
+  holguraActiveTriggerId = 0;
   feederDemand = false;
   feederMode = FEED_NONE;
   holguraPhase = HOLG_IDLE;
   holguraTimedEndMs = 0;
+  holguraLastOn = holguraOkStable();
   if (holguraSawOn) {
     holguraPostCycleOffWatch = true;
     holguraSawOn = false;
@@ -398,10 +404,23 @@ static void stopHolguraFeedCycle(uint32_t nowMs) {
     holguraOffSinceMs = 0;
 }
 
-// Tras OFF→ON→OFF: en OFF cuenta N s para fallo de holgura insuficiente.
-static void serviceHolguraInsufficiency(uint32_t nowMs) {
-  if (!holguraPostCycleOffWatch || !P) return;
-  if (holguraOkStable()) {
+// Asentamiento, n s tras flanco ON y Tfeed ignoran el sensor a propósito.
+static bool holguraOffFaultPaused() {
+  if (feederMode == FEED_TFEED && feederDemand) return true;
+  if (feederMode == FEED_HOLGURA &&
+      (holguraPhase == HOLG_SETTLE || holguraPhase == HOLG_TIMED_FEED))
+    return true;
+  return false;
+}
+
+// Auto ON (también esperando in process): OFF estable > N s → fallo.
+// Sigue contando en HOLG_WAIT_ON aunque el feeder esté girando.
+static void serviceHolguraOffFault(uint32_t nowMs) {
+  if (!P || fault != FAULT_NONE || !autoOn || idleMode) {
+    holguraOffSinceMs = 0;
+    return;
+  }
+  if (holguraOkStable() || holguraOffFaultPaused()) {
     holguraOffSinceMs = 0;
     return;
   }
@@ -417,7 +436,7 @@ static void serviceHolguraFeed(uint32_t nowMs) {
   holguraLastOn = on;
 
   if (holguraPhase == HOLG_WAIT_ON) {
-    if (rising) holguraOnRisingEdge(nowMs);
+    if (rising || (on && !holguraSawOn)) holguraOnRisingEdge(nowMs);
     // Alimentar solo con holgura OFF hasta flanco ON (GPIO 22).
     feederDemand = !on;
     return;
@@ -436,7 +455,11 @@ static void serviceHolguraFeed(uint32_t nowMs) {
     feederDemand = true;
     if (holguraTimedEndMs && (int32_t)(nowMs - holguraTimedEndMs) >= 0)
       stopHolguraFeedCycle(nowMs);
+    return;
   }
+
+  holguraPhase = HOLG_WAIT_ON;
+  feederDemand = !on;
 }
 
 static void stopAutoOutputs() {
@@ -726,7 +749,6 @@ void machineTick(uint32_t nowMs) {
       holguraPostCycleOffWatch = false;
       holguraOffSinceMs = 0;
     }
-    serviceHolguraInsufficiency(nowMs);
     if (pendingTrigger && !feederDemand) {
       float sec = pendingTriggerSec > 0.05f ? pendingTriggerSec : P->triggerFeedS;
       const uint16_t tid = pendingTriggerId;
@@ -736,7 +758,7 @@ void machineTick(uint32_t nowMs) {
       if (P->hmiTfeedEnabled && holguraOkStable())
         startTfeedDemand(nowMs, sec, tid);
       else if (!holguraOkStable()) {
-        if (tid) triggerIdRemember(tid);
+        holguraActiveTriggerId = tid;
         beginHolguraFeed(nowMs);
       } else if (tid)
         triggerIdRemember(tid);  // holgura ya ON: no arrancar ciclo OFF→ON
@@ -749,6 +771,7 @@ void machineTick(uint32_t nowMs) {
     serviceBufferTimeout(nowMs);  // espera llenado buffer
   }
 
+  serviceHolguraOffFault(nowMs);  // Auto ON + holgura OFF > N s, con o sin in process
   syncOutputs();  // actualiza intención → outputTask mueve hardware
 }
 

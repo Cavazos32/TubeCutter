@@ -128,6 +128,9 @@ export const translations = {
     assist_purge_home: 'Purga / Posición inicial',
     process_assist_title: 'Indicaciones',
     process_assist_idle: 'Todo listo. Puedes iniciar cuando quieras.',
+    post_lot_pf_settle_title: 'Lote completado — preparando alimentador',
+    post_lot_pf_settle_hint:
+      'Esperando buffer lleno y holgura en el PreFeeder. Si tarda mucho, usa Detener o revisa el alimentador.',
     cycle_time_remaining: 'Tiempo restante',
     module_recovery: 'RECUPERACIÓN',
     module_status: 'Estado',
@@ -181,7 +184,7 @@ export const translations = {
     btn_e050_yes_materialist: 'Sí',
     btn_refill_confirm_continue: 'Continuar purga',
     refill_confirm_hint_feed_nocut:
-      'Tras avanzar material: Reintentar o Continuar (vuelve a inicio sin cortar).',
+      'Si la manguera buena empuja un sobrante, pulsa Alimentar otra vez. Si ya está bien, Continuar (vuelve a inicio sin cortar).',
     purge_hands_warning: 'NO METAS LAS MANOS',
     purge_busy_locked: 'Purga en curso. Para parar, usa Detener.',
     plc_manuals_locked:
@@ -258,7 +261,8 @@ export const translations = {
     refill_confirm_hint_await_nocut:
       'Pulsa Alimentar o Continuar (vuelve a inicio sin cortar).',
     refill_confirm_title_feed: 'Material en el láser: ¿está bien la manguera?',
-    refill_confirm_hint_feed: 'Revisa el material y pulsa Continuar purga.',
+    refill_confirm_hint_feed:
+      'Si la manguera buena empuja un sobrante, pulsa Alimentar otra vez. Si ya está bien, Continuar purga.',
     refill_confirm_title_working: 'Purga en curso…',
     refill_confirm_hint_working:
       'El actuador va a posición de espera. Luego pulsa Alimentar o Continuar purga.',

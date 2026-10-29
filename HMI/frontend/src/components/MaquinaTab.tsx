@@ -246,10 +246,13 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
         ? 1 + extraModuleFaults
         : 0;
   const interlockError = !hasFault && machineState.statusKind === 'error';
+  const postLotPfSettle = !!machineState.postLotPfSettle;
   const generalStatus = hasFault
     ? currentFaultUi || t('state_error')
     : interlockError
       ? machineState.statusText || t('err_materialist_start')
+      : postLotPfSettle
+        ? t('state_ready')
       : machineState.isPaused
       ? t('state_paused')
       : machineState.isRunning
@@ -260,6 +263,8 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
 
   const statusSubtitle = hasFault || interlockError
     ? ''
+    : postLotPfSettle
+      ? t('post_lot_pf_settle_title')
     : machineState.isRunning
       ? t('state_producing')
       : machineState.isPaused
@@ -493,6 +498,7 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
   const startDisabled =
     hasFault ||
     machineState.isRunning ||
+    postLotPfSettle ||
     machineState.refillActive ||
     checklistRequired;
   const checklistBlocksResume =
@@ -518,6 +524,7 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
   const hasIndicationsContent =
     checklistCompletedFlash ||
     checklistRequired ||
+    postLotPfSettle ||
     purgeHandsWarning ||
     asdaMoveWarning ||
     showPfCoach ||
@@ -993,6 +1000,22 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
               </div>
             )}
 
+            {postLotPfSettle && (
+              <div
+                className={`${hmiIndicationBanner} border-sky-300 bg-sky-50 dark:border-sky-700 dark:bg-sky-950/50`}
+              >
+                <Info className={`${hmiIndicationIcon} text-sky-600`} />
+                <div className="min-w-0 flex-1 text-center sm:text-left">
+                  <p className={`${hmiIndicationTitle} text-sky-900 dark:text-sky-100`}>
+                    {t('post_lot_pf_settle_title')}
+                  </p>
+                  <p className={`${hmiIndicationHint} text-sky-800/80 dark:text-sky-200/80`}>
+                    {t('post_lot_pf_settle_hint')}
+                  </p>
+                </div>
+              </div>
+            )}
+
             {!hasIndicationsContent && (
               <div className="flex h-full min-h-[7rem] flex-1 flex-col items-center justify-center gap-3 px-4 py-6 text-center">
                 <Info className={hmiIndicationIdleIcon} />
@@ -1035,7 +1058,8 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
                     {recoveryHint}
                   </p>
                 </div>
-                {recoveryStage === 'await_feed' && onRefillRetry && (
+                {(recoveryStage === 'await_feed' || recoveryStage === 'after_feed') &&
+                  onRefillRetry && (
                   <button
                     id="btn-recovery-refill-retry"
                     type="button"
@@ -1190,7 +1214,9 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
                         : t('refill_confirm_hint_feed')}
                   </p>
                 </div>
-                {machineState.refillPrompt === 'await_feed' && onRefillRetry && (
+                {(machineState.refillPrompt === 'await_feed' ||
+                  machineState.refillPrompt === 'after_feed') &&
+                  onRefillRetry && (
                   <button
                     id="btn-refill-confirm-retry"
                     type="button"
@@ -1256,16 +1282,14 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
                     }, wait);
                   });
                 }}
-                disabled={!onMachineHome || machineState.purgeBusy}
+                disabled={!onMachineHome || purgeHandsWarning}
                 title={
-                  machineState.asdaMoveWarning
-                    ? t('asda_move_busy_locked')
-                    : machineState.purgeBusy
-                      ? t('purge_busy_locked')
-                      : t('btn_machine_home_hint')
+                  purgeHandsWarning
+                    ? t('purge_hands_warning')
+                    : t('btn_machine_home_hint')
                 }
                 className={`${btnBase} ${btnText} ${
-                  !onMachineHome || machineState.purgeBusy
+                  !onMachineHome || purgeHandsWarning
                     ? 'border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 text-slate-400 cursor-not-allowed'
                     : btnFlash.home
                       ? btnAuxOn

@@ -548,7 +548,8 @@ export const CycleTab: React.FC<CycleTabProps> = ({
               {recoveryHint}
             </p>
           </div>
-          {recoveryStage === 'await_feed' && onRefillRetry && (
+          {(recoveryStage === 'await_feed' || recoveryStage === 'after_feed') &&
+            onRefillRetry && (
             <button
               id="btn-cycle-recovery-retry"
               type="button"
@@ -698,7 +699,9 @@ export const CycleTab: React.FC<CycleTabProps> = ({
                   : t('refill_confirm_hint_feed')}
             </p>
           </div>
-          {machineState.refillPrompt === 'await_feed' && onRefillRetry && (
+          {(machineState.refillPrompt === 'await_feed' ||
+            machineState.refillPrompt === 'after_feed') &&
+            onRefillRetry && (
             <button
               id="btn-cycle-refill-retry"
               type="button"

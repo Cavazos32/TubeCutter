@@ -186,6 +186,10 @@ export function mapMachineState(
     ? cycle.name || bannerText
     : bannerText;
 
+  const postLotPfSettle = !!cycle.postLotPfSettle;
+  const productiveRunning =
+    cycle.active && !cycle.paused && !postLotPfSettle && !(cycle.completed ?? false);
+
   return {
     model: model?.name ?? '—',
     offsetMm: cycle.config?.cutOffsetMm ?? 0,
@@ -195,9 +199,10 @@ export function mapMachineState(
     statusKind: errorActive ? 'error' : snap.banner.kind,
     machineByte: typeof cycle.byte === 'number' ? cycle.byte : undefined,
     machineName: cycle.name || '',
-    isRunning: cycle.active && !cycle.paused,
+    isRunning: productiveRunning,
     isPaused: cycle.paused,
-    cycleActive: cycle.active,
+    cycleActive: cycle.active && !postLotPfSettle,
+    postLotPfSettle,
     pfOperatorStartBlocked: !!cycle.pfOperatorStartBlocked,
     cycleStep: cycle.step ?? 0,
     cycleStepLabel: cycle.stepLabel ?? '',
@@ -221,8 +226,7 @@ export function mapMachineState(
     purgeBusy: isPurgeBusy(cycle),
     stepByStep: cycle.stepByStep ?? false,
     pauseEnabled:
-      cycle.active &&
-      !cycle.paused &&
+      productiveRunning &&
       !cycle.refillAwaitingConfirm &&
       !cycle.recoveryAwaitingConfirm,
     progress: cycle.completed
