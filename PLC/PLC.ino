@@ -1,23 +1,4 @@
-// PLCA — esclavo I/O TubeCut: sensores de seguridad + válvulas.
-// WiFi STA 10.10.32.51 | TCP servidor :8766 | JSON + newline (PreFeeder / TCM).
-//
-// RESUMEN:
-//   · Lee 6 entradas (pinzas, sujetador, cortador, manguera A/B, bandeja) con debounce.
-//   · Válvulas por impulso (cutter R/L, grippers, holder, encoder):
-//     comando on = un pulso; off = otro pulso. El GPIO no queda enclavado.
-//   · Reset 0x1E: idle GPIO + lógica OFF sin pulsos de válvula; solo pulso Reset
-//     (pulsar válvulas tras reset reactivaría el KEEP neumático).
-//   · Blower: nivel ON durante durationSec del comando (HMI), luego OFF automático.
-//   · Compatible con protocolo sensor_tubecut (snapshot/alert/poll).
-//   · Status extendido para PLCA_Master (válvulas lógicas en JSON type=status).
-//
-// ÍNDICE:
-//   01  Estado global
-//   02  Sensores
-//   03  Válvulas
-//   04  TCP TX
-//   05  TCP RX / WiFi
-//   06  Setup / Loop
+// PLCA — sensores + válvulas por pulso. Ver Config.h (IP, TCP :8766, JSON+newline).
 
 #include <WiFi.h>
 #include <ArduinoOTA.h>
@@ -27,9 +8,7 @@
 WiFiServer tcpServer(PLCA_TCP_PORT);
 WiFiClient tcpClient;
 
-// ============================================================
-// SECCION 01 — Estado global
-// ============================================================
+// --- Estado global ---
 bool wifiReady = false;
 bool tcpServicesUp = false;
 bool tcpWasConnected = false;
@@ -40,7 +19,7 @@ uint8_t rawCandidateMask = 0xFF;
 unsigned long rawCandidateSinceMs = 0;
 unsigned long lastSnapshotTxMs = 0;
 unsigned long lastStatusPushMs = 0;
-// Grace de sensores desde fin de setup() (no desde power-on: WiFi puede > BOOT_GRACE).
+// Grace de sensores desde fin de setup() (WiFi puede tardar > BOOT_GRACE).
 unsigned long bootGraceStartMs = 0;
 uint8_t sequence = 0;
 
@@ -75,9 +54,7 @@ static uint8_t plcTcpLastStateByte = 0;
 static bool plcTcpNeedInit = false;
 static bool plcTcpStopPending = false;
 
-// ============================================================
-// SECCION 02 — Sensores
-// ============================================================
+// --- Sensores ---
 static uint8_t readSensorBitmask()
 {
   uint8_t mask = 0;
@@ -113,28 +90,7 @@ static bool updateDebouncedMask(uint8_t raw, uint8_t& stableOut, unsigned long n
   return stableOut != lastBitmask;
 }
 
-static void logSensorMask(uint8_t mask)
-{
-  Serial.print("SENSORS mask=0x");
-  if (mask < 0x10) Serial.print('0');
-  Serial.print(mask, HEX);
-  Serial.print(" G=");
-  Serial.print((mask & BIT_GRIPPER) ? 1 : 0);
-  Serial.print(" H=");
-  Serial.print((mask & BIT_HOLDER) ? 1 : 0);
-  Serial.print(" C=");
-  Serial.print((mask & BIT_CUTTER) ? 1 : 0);
-  Serial.print(" HA=");
-  Serial.print((mask & BIT_HOSE_A) ? 1 : 0);
-  Serial.print(" HB=");
-  Serial.print((mask & BIT_HOSE_B) ? 1 : 0);
-  Serial.print(" E=");
-  Serial.println((mask & BIT_ENCODER) ? 1 : 0);
-}
-
-// ============================================================
-// SECCION 03 — Válvulas (pulso ON / pulso OFF, sin enclavado)
-// ============================================================
+// --- Válvulas (pulso ON/OFF) ---
 static void blowerStop();
 static void plcDoHardwareReset();
 
@@ -214,9 +170,7 @@ static void syncCuttersFlag()
   stCutters = stCutterR || stCutterL;
 }
 
-// KEEP lógico (Set/Res): pulso solo en transición. Mismo pin = Set o Res
-// según wantOn; el PLC neumático enclava. No pulsar si ya está en el estado
-// pretendido (un pulso de más invertiría un KEEP tipo toggle).
+// KEEP: un pulso por transición.
 static bool valveSetPulse(bool& st, uint8_t pin, bool wantOn)
 {
   if (st == wantOn) return false;
@@ -243,9 +197,6 @@ static void blowerStart(unsigned long durationMs)
   blowerTimedActive = true;
   blowerStartMs = millis();
   blowerHoldMs = durationMs;
-#if PLCA_DEBUG
-  Serial.printf("BLOWER ON %lums (%.1fs)\n", durationMs, durationMs / 1000.0);
-#endif
 }
 
 static bool blowerSet(bool wantOn, unsigned long durationMs)
@@ -259,21 +210,11 @@ static bool blowerSet(bool wantOn, unsigned long durationMs)
   return true;
 }
 
-static void logValveLogical()
-{
-#if PLCA_DEBUG
-  Serial.printf("VALVE(logic) cutterR=%d cutterL=%d grippers=%d holder=%d encoder=%d blower=%d\n",
-                (int)stCutterR, (int)stCutterL, (int)stGrippers, (int)stHolder,
-                (int)stEncoder, (int)stBlower);
-#endif
-}
-
 static bool setPlcOutputByName(const String& outName, bool state)
 {
   String n = outName;
   n.trim();
   n.toUpperCase();
-  bool changed = false;
   if (n == "CUTTER" || n == "CUTTERS") {
     // Un solo pulso de VALVE_PULSE_MS para R+L (antes: 200 ms escalonados).
     const bool needR = (stCutterR != state);
@@ -287,27 +228,23 @@ static bool setPlcOutputByName(const String& outName, bool state)
       if (needR) pins[np++] = PIN_OUT_CUTTER_R;
       if (needL) pins[np++] = PIN_OUT_CUTTER_L;
       valvePulsePins(pins, np);
-      changed = true;
     }
   }
   else if (n == "CUTTER_R" || n == "CUTTERS_R")
-    changed = valveSetPulse(stCutterR, PIN_OUT_CUTTER_R, state);
+    valveSetPulse(stCutterR, PIN_OUT_CUTTER_R, state);
   else if (n == "CUTTER_L" || n == "CUTTERS_L")
-    changed = valveSetPulse(stCutterL, PIN_OUT_CUTTER_L, state);
+    valveSetPulse(stCutterL, PIN_OUT_CUTTER_L, state);
   else if (n == "GRIPPER" || n == "GRIPPERS")
-    changed = valveSetPulse(stGrippers, PIN_OUT_GRIPPERS, state);
+    valveSetPulse(stGrippers, PIN_OUT_GRIPPERS, state);
   else if (n == "HOLDER")
-    changed = valveSetPulse(stHolder, PIN_OUT_HOLDER, state);
+    valveSetPulse(stHolder, PIN_OUT_HOLDER, state);
   else if (n == "FGTRAY" || n == "TRAY" || n == "ENCODER")
-    changed = valveSetPulse(stEncoder, PIN_OUT_ENCODER, state);
+    valveSetPulse(stEncoder, PIN_OUT_ENCODER, state);
   else if (n == "BLOWER")
-    changed = blowerSet(state, BLOWER_DEFAULT_SEC * 1000UL);
-  else if (n == "RESET") {
+    blowerSet(state, BLOWER_DEFAULT_SEC * 1000UL);
+  else if (n == "RESET")
     plcDoHardwareReset();
-    changed = true;
-  }
   else return false;
-  if (changed) logValveLogical();
   return true;
 }
 
@@ -321,11 +258,9 @@ static void plcGoHomePulse()
   blowerStop();
   valveSetPulse(stHolder,   PIN_OUT_HOLDER,   false);
   stReset = false;
-  logValveLogical();
 }
 
-// Reset PLC 0x1E: idle GPIO + lógica OFF; el esclavo deja estados en OFF.
-// HMI/máquina no deben “arreglar” válvulas con All Off antes: Reset PLC es propio.
+// Reset 0x1E: GPIO idle + lógica OFF (no sustituir por All Off del HMI).
 static void plcDoHardwareReset()
 {
   blowerStop();
@@ -338,7 +273,6 @@ static void plcDoHardwareReset()
   stReset = false;
   syncCuttersFlag();
   valvePulsePin(PIN_OUT_RESET);
-  logValveLogical();
 }
 
 static bool parseOnOffVal(const String& val)
@@ -346,9 +280,7 @@ static bool parseOnOffVal(const String& val)
   return val == "1" || val == "true" || val == "on";
 }
 
-// ============================================================
-// SECCION 04 — TCP TX
-// ============================================================
+// --- TCP TX ---
 static bool tcpLinkOk()
 {
   return tcpClient && tcpClient.connected();
@@ -609,10 +541,6 @@ static void replyPollSnapshot()
   sendSnapshot(currentStableMask());
   tcpTx(statusJson("status"));
   lastStatusPushMs = millis();
-#if PLCA_DEBUG
-  Serial.print("POLL -> mask=0x");
-  Serial.println(currentStableMask(), HEX);
-#endif
 }
 
 static void blowerService()
@@ -620,9 +548,6 @@ static void blowerService()
   if (!blowerTimedActive) return;
   if ((millis() - blowerStartMs) < blowerHoldMs) return;
   blowerStop();
-#if PLCA_DEBUG
-  Serial.println("BLOWER OFF (timeout)");
-#endif
   if (tcpLinkOk()) {
     peerTxEvents();
     tcpTx(statusJson("status"));
@@ -631,9 +556,7 @@ static void blowerService()
   }
 }
 
-// ============================================================
-// SECCION 05 — TCP RX / WiFi
-// ============================================================
+// --- TCP RX / WiFi ---
 static int jInt(const char* j, const char* k, int d)
 {
   String n = String("\"") + k + "\":";
@@ -802,12 +725,6 @@ static bool plcTcpDoByte(uint8_t cmdByte, const char* line)
     plcTcpPushStateIfChanged();
   }
 
-#if PLCA_DEBUG
-  Serial.printf("[PLC-CMD] byte=0x%02X on=%d cutterR=%d cutterL=%d grip=%d hold=%d enc=%d blow=%d\n",
-                (unsigned)cmdByte, (int)wantOn,
-                (int)stCutterR, (int)stCutterL, (int)stGrippers,
-                (int)stHolder, (int)stEncoder, (int)stBlower);
-#endif
   return ok;
 }
 
@@ -874,24 +791,10 @@ static void tcpOnLine(const char* line)
     String n = outName;
     n.trim();
     n.toUpperCase();
-#if PLCA_DEBUG
-    Serial.printf("TCP setOut %s -> %s\n", outName.c_str(), wantOn ? "ON" : "OFF");
-#endif
-    bool changed = false;
-    if (n == "BLOWER") {
-      changed = blowerSet(wantOn, wantOn ? blowerParseDurationMs(line) : 0);
-      if (changed) logValveLogical();
-    } else if (!setPlcOutputByName(outName, wantOn)) {
-#if PLCA_DEBUG
-      Serial.printf("TCP setOut RECHAZADO: \"%s\"\n", outName.c_str());
-#endif
+    if (n == "BLOWER")
+      blowerSet(wantOn, wantOn ? blowerParseDurationMs(line) : 0);
+    else if (!setPlcOutputByName(outName, wantOn))
       return;
-    } else {
-      changed = true;
-    }
-    if (!changed && n == "BLOWER") {
-      // ya OFF: igual ack con status
-    }
     peerTxEvents();
     tcpTx(statusJson("status"));
     plcTcpPushStateIfChanged();
@@ -1143,9 +1046,7 @@ static void serviceTcp()
   }
 }
 
-// ============================================================
-// SECCION 06 — Setup / Loop
-// ============================================================
+// --- Setup / Loop ---
 void setup()
 {
   Serial.begin(115200);
@@ -1233,7 +1134,6 @@ void loop()
   // como flanco rising (E050/E047–E049 fantasma al primer sample / HMI connect).
   const bool establishingBaseline = (lastBitmask == 0xFF);
   uint8_t previousMask = establishingBaseline ? 0 : lastBitmask;
-  logSensorMask(stable);
   if (tcpLinkOk())
   {
     sendSnapshot(stable);

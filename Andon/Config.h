@@ -46,6 +46,3 @@ constexpr uint8_t PIN_ETH_INT      = 35;
 #ifndef ANDON_ACTIVE_HIGH
 #define ANDON_ACTIVE_HIGH 1
 #endif
-#ifndef ANDON_DEBUG
-#define ANDON_DEBUG 1
-#endif

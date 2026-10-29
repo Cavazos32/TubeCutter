@@ -20,7 +20,6 @@
 #include "Servo_Feed.h"
 #include "Stage2.h"
 
-// Overview hitos (antes de prototipos auto-generados por Arduino)
 struct OvHit {
   float targetMm;
   float actualMm;
@@ -28,9 +27,7 @@ struct OvHit {
   bool  ok;
 };
 
-// =============================================================================
-// COMUN — Hardware global
-// =============================================================================
+// --- COMUN — Hardware global ---
 HardwareSerial ServoBus(2);
 WebServer server(80);
 Preferences prefs;
@@ -39,9 +36,7 @@ Preferences prefs;
 static const int LRX_LaserR = PIN_LRX_LASER_R;  // Sensor láser lado derecho (R)
 static const int LRX_LaserL = PIN_LRX_LASER_L;  // Sensor láser lado izquierdo (L)
 
-// =============================================================================
-// ASDA — estado runtime
-// =============================================================================
+// --- ASDA — estado runtime ---
 static float cfgMoveRpm       = DEFAULT_MOVE_SPEED_RPM;
 static float cfgStepsPerMm    = FACTORY_STEPS_PER_MM;
 static float cfgOffsetSteps   = 0.0f;
@@ -89,17 +84,6 @@ static uint16_t motionPrepTimeMs = 0;
 static uint32_t motionPrepTimeoutMs = 0;
 static uint32_t motionPrepWaitUntilMs = 0;
 
-#if MOT_LATENCY_DEBUG
-#define LAT_MARK(tag)                                                      \
-  Serial.printf(                                                           \
-      "[LAT-MOT] T%s ms=%lu us=%lu prep=%u step=%u busy=%d job=%d\n",      \
-      tag, (unsigned long)millis(), (unsigned long)micros(),               \
-      (unsigned)motionPrepKind, (unsigned)motionPrepStep, (int)busyMotion, \
-      (int)motionJobActive)
-#else
-#define LAT_MARK(tag) ((void)0)
-#endif
-
 static bool motionPrepActive() { return motionPrepKind != MOT_PREP_NONE; }
 
 static bool motionIsOccupied() {
@@ -114,13 +98,7 @@ static void asdaTcpPollEvents();
 static void motionPrepPollOnce();
 static bool pollMotionOnce();
 
-// ASDA TCP — protocolo maestro (bytes tabla ASDA)
-// COMMUNICATION IMPACT
-// Componente: socket HMI :8767 (asdaTcpServer/Client)
-// Cambio: task FreeRTOS dueña del socket; loop consume mailbox + encola TX
-// Causal: CMD→ACK tardaba porque loop no llegaba a serviceAsdaTcp (Modbus/CAN/HTTP)
-// Riesgo: WiFiClient no thread-safe — solo el task TCP hace print/read/stop
-// Alternativa sin tocar comm: no elimina el retraso de atención del socket
+// ASDA TCP: WiFiClient solo en task; loop encola TX/cmd.
 static WiFiServer asdaTcpServer(MOTION_TCP_PORT);
 static WiFiClient asdaTcpClient;
 static char asdaTcpRxLine[384];
@@ -153,13 +131,10 @@ struct AsdaTcpCmdMsg {
   AsdaTcpCmdKind kind;
   uint8_t cmdByte;
   char line[384];
-  uint32_t rxUs;
 };
 
 struct AsdaTcpTxMsg {
   char line[896];
-  uint8_t isAck;
-  uint32_t queuedUs;
 };
 
 static const UBaseType_t ASDA_TCP_TASK_CORE = 1;
@@ -176,7 +151,6 @@ static QueueHandle_t asdaTcpTxQ = nullptr;
 static bool ioLaserRActive = false;
 static bool ioLaserLActive = false;
 static bool ioSafetyActive = false;
-// Detalle EXXX: slot global (ASDA/exhaust) + slots Feed L/R (sin carrera entre lados)
 static uint8_t motionTcpPendingDetailErr = 0;
 static char motionTcpPendingDetailName[32] = "";
 static uint8_t motionTcpPendingDetailErrL = 0;
@@ -184,9 +158,7 @@ static char motionTcpPendingDetailNameL[32] = "";
 static uint8_t motionTcpPendingDetailErrR = 0;
 static char motionTcpPendingDetailNameR[32] = "";
 
-// =============================================================================
-// ENCODER — estado runtime (dos unidades físicas L / R)
-// =============================================================================
+// --- ENCODER — estado runtime (dos unidades físicas L / R) ---
 struct EncSideState {
   bool installed;
   gpio_num_t pinA;
@@ -243,9 +215,7 @@ static bool encFeedSide(bool& sideROut) {
   return false;
 }
 
-// =============================================================================
-// OVERVIEW (ASDA + ENCODER) — estado
-// =============================================================================
+// --- OVERVIEW (ASDA + ENCODER) — estado ---
 static const float OV_GRIPPER_MM_DEFAULT = 55.0f;
 static const float OV_EXTRA_MM_DEFAULT   = 30.0f;
 static const float OV_TOL_MM_DEFAULT     = 0.8f;
@@ -267,9 +237,7 @@ static OvHit ovOmFeed;
 static OvHit ovOmReset;
 static OvHit ovOmFinal;
 
-// =============================================================================
-// COMUN — HTTP / JSON helpers
-// =============================================================================
+// --- COMUN — HTTP / JSON helpers ---
 void sendJson(int code, const String& body) {
   server.send(code, "application/json", body);
 }
@@ -366,9 +334,7 @@ String errJson(const String& message) {
   return String("{\"ok\":false,\"message\":\"") + jsonEscape(message) + "\"}";
 }
 
-// =============================================================================
-// ASDA — alarmas y limites
-// =============================================================================
+// --- ASDA — alarmas y limites ---
 void clearMotionAlarm() {
   motionAlarm = false;
   motionAlarmMsg = "";
@@ -435,9 +401,7 @@ uint32_t calcTravelTimeoutMs(float distMm, float rpm) {
   return (uint32_t)(ms + 0.5f);
 }
 
-// =============================================================================
-// ASDA — config NVS y conversion mm/PUU
-// =============================================================================
+// --- ASDA — config NVS y conversion mm/PUU ---
 void resetCalFactory() {
   cfgStepsPerMm  = FACTORY_STEPS_PER_MM;
   cfgOffsetSteps = 0.0f;
@@ -511,9 +475,7 @@ String configJson() {
   return j;
 }
 
-// =============================================================================
-// ASDA — Modbus RS-485
-// =============================================================================
+// --- ASDA — Modbus RS-485 ---
 static void clearServoRx() {
   while (ServoBus.available()) ServoBus.read();
 }
@@ -714,9 +676,7 @@ static bool read32(uint16_t address, int32_t& value) {
   return true;
 }
 
-// =============================================================================
-// ASDA — job de movimiento (P5.007)
-// =============================================================================
+// --- ASDA — job de movimiento (P5.007) ---
 enum MotionJobPollPhase : uint8_t {
   MJP_IDLE = 0,
   MJP_WAIT_TRIGGER,
@@ -790,7 +750,6 @@ static bool motionJobFinishAfterPosRead() {
     overviewOnAsdaMoveDone(puuToMm(cachedPosPuu, false));
     asdaTcpReachedPos = cachedPosPuu;
     asdaTcpNotifyReached = true;
-    LAT_MARK("7");
   }
   return true;
 }
@@ -912,7 +871,6 @@ static void motionPrepComplete(uint16_t jobCmd) {
   motionPrepKind = MOT_PREP_NONE;
   motionPrepStep = 0;
   motionJobBegin(jobCmd, motionPrepTimeoutMs);
-  LAT_MARK("6");
 }
 
 static void motionPrepStartModbus(uint8_t nextStep) {
@@ -950,8 +908,6 @@ static void motionPrepPollOnce() {
 
   if (!motionPrepModbusWait && modbusBusy()) return;
 
-  if (motionPrepStep == 0) LAT_MARK("4");
-
   switch (motionPrepKind) {
     case MOT_PREP_MOVE:
       switch (motionPrepStep) {
@@ -982,7 +938,6 @@ static void motionPrepPollOnce() {
           motionPrepStartModbus(3);
           return;
         case 3:
-          LAT_MARK("5");
           if (!modbusBeginWrite16(REG_P5_007, 1)) {
             motionPrepAbort("Fallo Modbus preparando MOVE");
             return;
@@ -1059,7 +1014,6 @@ static void motionPrepPollOnce() {
           motionPrepStartModbus(9);
           return;
         case 9:
-          LAT_MARK("5");
           if (!modbusBeginWrite16(REG_P5_007, 0)) {
             motionPrepAbort("Fallo Modbus preparando HOME", MOT_ERR_ACTUATOR_HOME);
             return;
@@ -1119,9 +1073,7 @@ bool waitPrComplete(uint16_t command,
   return motionWaitUntilIdle(detail, outPos);
 }
 
-// =============================================================================
-// ASDA — comandos servo
-// =============================================================================
+// --- ASDA — comandos servo ---
 bool servoOn() {
   return write16(REG_P2_030, 1);
 }
@@ -1162,9 +1114,7 @@ bool communicationTest(String& detail) {
   return true;
 }
 
-// =============================================================================
-// ASDA — API interna (HTTP + TCP maestro) — opcodes en MotionStates.h
-// =============================================================================
+// --- ASDA — API interna (HTTP + TCP maestro) — opcodes en MotionStates.h ---
 
 static bool asdaStartHome(bool forward, String& err, bool useDefaultPrep = true) {
   if (motionIsOccupied()) {
@@ -1189,7 +1139,6 @@ static bool asdaStartHome(bool forward, String& err, bool useDefaultPrep = true)
   motionPrepModbusWait = false;
   motionPrepKind = MOT_PREP_HOME;
   motionPrepStep = 0;
-  LAT_MARK("3");
   asdaTcpPushStateIfChanged();
   err = "HOME aceptado";
   return true;
@@ -1210,7 +1159,6 @@ static bool asdaStartMove(int32_t position, float speed, String& err) {
   motionPrepModbusWait = false;
   motionPrepKind = MOT_PREP_MOVE;
   motionPrepStep = 0;
-  LAT_MARK("3");
   asdaTcpPushStateIfChanged();
   err = "MOVE aceptado";
   return true;
@@ -1366,9 +1314,7 @@ static String asdaStatusJsonBody() {
   return String(buf);
 }
 
-// =============================================================================
-// ENCODER — PCNT driver (L / R)
-// =============================================================================
+// --- ENCODER — PCNT driver (L / R) ---
 #if ENC_PCNT_IDF5
 static bool IRAM_ATTR onEncPcntReach(pcnt_unit_handle_t unit,
                                      const pcnt_watch_event_data_t *edata,
@@ -1558,12 +1504,7 @@ static float encCountsToMm(int32_t counts) {
   return (float)counts * (100.0f / (float)ENC_COUNTS_PER_100MM);
 }
 
-// Parte decimal OM → 0 / 0.5 / 1 (solo décima .0–.9; se ignora centésima):
-// .0–.2→.0; .3–.7→.5; .8–.9→1.  (mismo criterio que TCM omRoundMm)
-
-// =============================================================================
-// ENCODER — redondeo y valor oficial OM
-// =============================================================================
+// omRoundMm: décima → 0 / 0.5 / 1 (igual TCM).
 static float omRoundMm(float mm) {
   const bool neg = mm < 0.0f;
   float a = fabsf(mm);
@@ -1584,10 +1525,6 @@ static float omRoundMm(float mm) {
   return neg ? -out : out;
 }
 
-// Fuente única de posición: cuentas desde Set0 (zeroRef) → mm.
-// Base (técnico / UI): redondeo 0/0.5/1 sin offset.
-// Procesado (Motion/Feed): base + offset interno (no se re-redondea).
-
 static float omBaseMm(float rawAbsMm) {
   return omRoundMm(rawAbsMm);
 }
@@ -1597,12 +1534,9 @@ static float omProcessedMmSide(float rawAbsMm, bool sideR) {
   return omBaseMm(rawAbsMm) + off;
 }
 
-// Compat Feed: "official" = valor procesado (base + offset).
 static float omOfficialMm(float rawAbsMm) {
   return omProcessedMmSide(rawAbsMm, false);
 }
-
-// Settle procesado para Motion/Feed (o <0 si aún no hay settle).
 
 static float encSettleMmRounded(bool sideR) {
   const uint8_t ix = encIxFromSideR(sideR);
@@ -1614,9 +1548,7 @@ static float encSettleMmRounded(bool sideR) {
   return omProcessedMmSide(encCountsToMm(absC), sideR);
 }
 
-// =============================================================================
-// ENCODER — movimiento y reset
-// =============================================================================
+// --- ENCODER — movimiento y reset ---
 static void overviewOnOmSettle();
 static void overviewOnEncoderReset();
 
@@ -1956,9 +1888,7 @@ bool feedOmIsSettled() {
 
 float feedOmOfficialFromRaw(float mmAbs) { return omOfficialMm(mmAbs); }
 
-// =============================================================================
-// ENCODER — JSON de estado dual L + R
-// =============================================================================
+// --- ENCODER — JSON de estado dual L + R ---
 static int encoderSideJsonInto(char* out, size_t outSz, bool sideR) {
   if (!encSideHwOk(sideR)) {
     return snprintf(out, outSz,
@@ -2047,20 +1977,17 @@ static float encSettleMmRoundedFeed() {
   return encSettleMmRounded(sideR);
 }
 
-// =============================================================================
-// DECISIONES / overview helpers
-// =============================================================================
+// --- DECISIONES / overview helpers ---
 // Tolerancia simetrica |actual - target| <= tol
 static bool decWithinTol(float actual, float target, float tol) {
   return fabsf(actual - target) <= tol;
 }
 
-// Longitud feed / omFeed55: dentro de tol O actual >= target - tol (no penaliza overshoot leve)
+// Feed length OK: |OM-target| ≤ tol o OM ≥ target - tol.
 static bool decFeedLengthMet(float actual, float target, float tol) {
   return decWithinTol(actual, target, tol) || (actual >= (target - tol));
 }
 
-// OM oficial vs target con tol fija de feed (misma regla que feedOmExactTarget en Servo_Feed.cpp)
 static bool decFeedOmAtTarget(float omOfficialMm, float targetMm) {
   return fabsf(omOfficialMm - targetMm) <= FEED_OM_TARGET_TOL_MM + 1e-4f;
 }
@@ -2140,9 +2067,7 @@ static bool ovPieceOkNow() {
   return ok;
 }
 
-// =============================================================================
-// OVERVIEW (ASDA + ENCODER) — comparacion de valores
-// =============================================================================
+// --- OVERVIEW (ASDA + ENCODER) — comparacion de valores ---
 static void ovHitClear(OvHit& h, float target) {
   h.targetMm = target;
   h.actualMm = 0.0f;
@@ -2328,9 +2253,7 @@ static String overviewJson() {
   return String(buf);
 }
 
-// =============================================================================
-// HTTP — comun
-// =============================================================================
+// --- HTTP — comun ---
 void handleRoot() {
   server.send_P(200, "text/html", index_html);
 }
@@ -2339,9 +2262,7 @@ void handleNotFound() {
   sendJson(404, errJson("Ruta no encontrada. Ver GET /"));
 }
 
-// =============================================================================
-// HTTP — ASDA
-// =============================================================================
+// --- HTTP — ASDA ---
 void handleStatus() {
   const String body = asdaStatusJsonBody();
   const bool reportOk = body.indexOf("\"ok\":true") >= 0;
@@ -2626,9 +2547,7 @@ void handleMove() {
   sendJson(done ? 200 : 504, String(buf));
 }
 
-// =============================================================================
-// HTTP — ENCODER
-// =============================================================================
+// --- HTTP — ENCODER ---
 void handleEncoderGet() {
   sendJson(200, encoderStatusJson());
 }
@@ -2683,9 +2602,7 @@ void handleEncoderReset() {
   sendJson(200, encoderStatusJson());
 }
 
-// =============================================================================
-// HTTP — OVERVIEW
-// =============================================================================
+// --- HTTP — OVERVIEW ---
 void handleOverviewGet() {
   sendJson(200, overviewJson());
 }
@@ -2720,9 +2637,7 @@ void handleOverviewMark() {
   sendJson(200, overviewJson());
 }
 
-// =============================================================================
-// ASDA TCP — esclavo maestro (JSON + newline, puerto MOTION_TCP_PORT)
-// =============================================================================
+// --- ASDA TCP — esclavo maestro (JSON + newline, puerto MOTION_TCP_PORT) ---
 static bool asdaTcpLinkOk() {
   return asdaTcpLinked;
 }
@@ -2754,9 +2669,6 @@ static bool asdaTcpQueueTx(const String& m) {
   const unsigned len = m.length();
   if (len >= sizeof(msg.line)) return false;
   memcpy(msg.line, m.c_str(), len + 1);
-  msg.isAck = (strstr(msg.line, "\"type\":\"ack\"") != nullptr) ? 1 : 0;
-  msg.queuedUs = micros();
-  if (msg.isAck) LAT_MARK("8");
   if (xQueueSend(asdaTcpTxQ, &msg, pdMS_TO_TICKS(20)) != pdTRUE)
     return false;
   return true;
@@ -2772,18 +2684,8 @@ static bool asdaTcpTx(const String& m) {
 static void asdaTcpDrainTx() {
   if (!asdaTcpTxQ) return;
   AsdaTcpTxMsg msg;
-  while (xQueueReceive(asdaTcpTxQ, &msg, 0) == pdTRUE) {
-    if (msg.isAck) {
-      LAT_MARK("9");
-#if MOT_LATENCY_DEBUG
-      const uint32_t nowUs = micros();
-      Serial.printf("[LAT-MOT] ACK-TX queuedUs=%lu txUs=%lu dtUs=%lu\n",
-                    (unsigned long)msg.queuedUs, (unsigned long)nowUs,
-                    (unsigned long)(nowUs - msg.queuedUs));
-#endif
-    }
+  while (xQueueReceive(asdaTcpTxQ, &msg, 0) == pdTRUE)
     asdaTcpTxNow(String(msg.line));
-  }
 }
 
 static int asdaTcpJInt(const char* j, const char* k, int d) {
@@ -3174,8 +3076,6 @@ static bool asdaTcpPostCmd(uint8_t kind, uint8_t cmdByte, const char* line) {
   msg.kind = (AsdaTcpCmdKind)kind;
   msg.cmdByte = cmdByte;
   strncpy(msg.line, line, sizeof(msg.line) - 1);
-  msg.rxUs = micros();
-  LAT_MARK("2q");
   if (xQueueSend(asdaTcpCmdQ, &msg, pdMS_TO_TICKS(50)) != pdTRUE) {
     asdaTcpTxNow(String("{\"ver\":") + MOTION_PROTO_VER
                  + ",\"type\":\"ack\",\"ok\":false,"
@@ -3190,7 +3090,6 @@ static void asdaTcpConsumeCmds() {
   AsdaTcpCmdMsg msg;
   uint8_t budget = ASDA_TCP_CMD_BUDGET_PER_LOOP;
   while (budget-- > 0 && xQueueReceive(asdaTcpCmdQ, &msg, 0) == pdTRUE) {
-    LAT_MARK("3c");
     switch (msg.kind) {
       case ASDA_TCP_Q_RESET_ALL:
         motionTcpDoResetAll();
@@ -3216,7 +3115,6 @@ static void asdaTcpConsumeCmds() {
 // Task TCP: clasifica. No ejecuta Modbus/CAN/FSM.
 static void asdaTcpOnLine(const char* line) {
   if (!strstr(line, "\"type\":\"command\"")) return;
-  LAT_MARK("2");
 
   const String cmd = asdaTcpJStr(line, "command");
   if (cmd == "ping") {
@@ -3463,8 +3361,6 @@ static void motionTcpPollFeedEvents() {
   }
 }
 
-// Safety exhaust — Set = detalle EXXX. Láseres LR-X: E004/E005 solo desde
-// Feed Validator (ventana FSP_VALIDATE*), no por edge fuera de validación.
 static void Exhaust() {
   motionTcpOnDetailError(MOT_ERR_EXHAUST, "Exhaust");
 }
@@ -3500,8 +3396,7 @@ void motionPollIoSensors() {
   static uint32_t tLaserR = 0, tLaserL = 0, tSafety = 0;
   const uint32_t now = millis();
 
-  // LR-X: solo actualizar nivel + status push. E004/E005 no se disparan por
-  // cambio de señal fuera de ventana; Feed Validator decide en FSP_VALIDATE*.
+  // LR-X: status push; E004/E005 solo en ventana Feed Validator (FSP_VALIDATE*).
   const bool rLaserR = motionSensorActiveLaser(LRX_LaserR);
   if (rLaserR != rawLaserR) { rawLaserR = rLaserR; tLaserR = now; }
   else if ((now - tLaserR) >= MOT_SENSOR_DEBOUNCE_MS && rLaserR != lastLaserR) {
@@ -3571,7 +3466,6 @@ static void asdaTcpPollEvents() {
   motionTcpPollIoSensorEvents();
 }
 
-// Solo socket. Modbus/FSM/eventos de app: loop (mailbox + asdaTcpPollEvents).
 static void serviceAsdaTcp() {
   if (WiFi.status() != WL_CONNECTED) {
     asdaTcpStopServices();
@@ -3624,9 +3518,7 @@ static void asdaTcpStartTask() {
   Serial.println("[ASDA-TCP] Task core 1 prio 2");
 }
 
-// =============================================================================
-// WIFI — reconexión no bloqueante (millis / estados; sin delay en loop)
-// =============================================================================
+// --- WIFI — reconexión no bloqueante (millis / estados; sin delay en loop) ---
 static bool wifiStaWasConnected = false;
 static uint32_t wifiConnectStartedMs = 0;
 static uint32_t wifiLastKickMs = 0;
@@ -3694,9 +3586,7 @@ static void serviceWifi() {
     wifiKickConnect(/*isRetry=*/true);
 }
 
-// =============================================================================
-// SETUP / LOOP
-// =============================================================================
+// --- SETUP / LOOP ---
 void setup() {
   Serial.begin(115200);
   delay(500);
@@ -3807,9 +3697,7 @@ void loop() {
   stage2Loop();
 }
 
-// =============================================================================
-// Stage2 — puentes ASDA (sin tocar Communication Core)
-// =============================================================================
+// --- Stage2 — puentes ASDA (sin tocar Communication Core) ---
 bool motionHostTcpLinked() {
   return asdaTcpLinkOk();
 }

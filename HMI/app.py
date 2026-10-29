@@ -131,12 +131,6 @@ def ensure_frontend_dist() -> bool:
 def _broadcast_sse() -> None:
     """Empuja el snapshot más reciente. Si la cola está llena, descarta lo viejo
     y conserva el cliente — no cortar el SSE (el ciclo notifica muchas veces/s)."""
-    try:
-        from latency_debug import mark as lat_mark
-
-        lat_mark("10", source="sse")
-    except ImportError:
-        pass
     data = json.dumps(get_state().snapshot(slim=True), separators=(",", ":"))
     for q in list(_sse_queues):
         try:
@@ -177,8 +171,7 @@ def _no_cache_spa_shell(resp: Response):
 
 @app.errorhandler(404)
 def _api_json_404(_err):
-    # static_url_path="" hace que rutas /api desconocidas caigan en 404 HTML de Flask;
-    # el frontend hace res.json() y revienta con Unexpected token '<'.
+    # /api/*: JSON 404 (no HTML de Flask; el frontend usa res.json()).
     if request.path.startswith("/api/"):
         return jsonify({"ok": False, "error": "not_found", "path": request.path}), 404
     # JS/CSS hasheado ausente: no devolver index.html (página en blanco).
@@ -222,7 +215,7 @@ def api_state():
 
 @app.route("/api/events")
 def api_events():
-    # Limitar SSE: cada cliente ocupa un hilo Waitress; demasiados = HMI “congelada”.
+    # SSE: limitar clientes (Waitress = un hilo por conexión).
     while len(_sse_queues) >= _SSE_MAX_CLIENTS:
         old = _sse_queues.pop(0)
         try:
@@ -452,6 +445,15 @@ def api_checklist():
     return jsonify(get_state().cmd_checklist(action, **body))
 
 
+@app.get("/api/checklist/history")
+def api_checklist_history():
+    try:
+        limit = int(request.args.get("limit", 50))
+    except (TypeError, ValueError):
+        limit = 50
+    return jsonify(get_state().get_checklist_history(limit))
+
+
 @app.post("/api/maintenance/cycle-counter/reset")
 def api_maintenance_cycle_counter_reset():
     body = request.get_json(silent=True) or {}
@@ -525,14 +527,12 @@ def api_motion_feed_offset_set():
 
 @app.route("/<path:asset_path>")
 def spa_assets(asset_path: str):
-    # Nunca devolver index.html para /api/*: el frontend hace res.json() y falla con
-    # Unexpected token '<' si recibe HTML (404 SPA).
+    # /api/*: JSON 404, no index.html del SPA.
     if asset_path == "api" or asset_path.startswith("api/"):
         return jsonify({"ok": False, "error": "not_found", "path": f"/{asset_path}"}), 404
     target = DIST_DIR / asset_path
     if target.is_file():
         return send_from_directory(DIST_DIR, asset_path)
-    # JS/CSS hasheado ausente no debe devolver HTML (el navegador queda en blanco).
     if asset_path.startswith("assets/"):
         return jsonify({"error": "asset_not_found", "path": asset_path}), 404
     if DIST_DIR.joinpath("index.html").is_file():
@@ -553,7 +553,6 @@ def main() -> None:
             f"TCM HMI — http://{addr}  (UI no compilada — cd frontend && npm run build)",
             flush=True,
         )
-    # Más hilos + timeout de canal: evita CloseWait eternos que dejan la HMI sin responder.
     serve(app, listen=addr, threads=24, channel_timeout=30)
 
 

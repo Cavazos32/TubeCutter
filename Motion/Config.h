@@ -49,11 +49,6 @@ constexpr uint8_t PIN_SAFETY_EXHAUST = PIN_E_STOP;
 
 constexpr unsigned long MOT_SENSOR_DEBOUNCE_MS = 150;
 
-// Instrumentación de latencia MOVE/TCP/Modbus (Serial). 0 = desactivado.
-#ifndef MOT_LATENCY_DEBUG
-#define MOT_LATENCY_DEBUG 0
-#endif
-
 // --- Interfaz Ethernet (SPI - Bus HSPI sin conflictos) ---
 constexpr uint8_t PIN_ETH_CLK      = 14;  // CLK / SCK (HSPI)
 constexpr uint8_t PIN_ETH_MISO     = 12;  // MISO (HSPI)

@@ -14,8 +14,6 @@ static const uint32_t MODBUS_PRE_TX_GAP_MS = 10;
 static const uint32_t MODBUS_FRAME_GAP_US  = 5000;
 static const uint32_t RESPONSE_TIMEOUT_MS  = 300;
 
-static const bool MODBUS_DEBUG = false;
-
 // ====================== Movimiento / homing ======================
 static const char*    DEFAULT_HOME_DIRECTION  = "F";
 static const uint16_t DEFAULT_HOME_TORQUE_PCT = 10;

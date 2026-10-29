@@ -157,6 +157,23 @@ export function checklistCmd(
   );
 }
 
+export type ChecklistHistoryEntry = {
+  type: 'checklist_complete' | 'maintenance_reset';
+  employeeId: string;
+  startedAt?: string;
+  completedAt?: string;
+  at?: string;
+  completedSteps?: string[];
+  measurements?: { l?: number | null; r?: number | null };
+  maintenanceCycleCount?: number;
+};
+
+export function getChecklistHistory(limit = 20) {
+  return api<{ ok: boolean; entries: ChecklistHistoryEntry[] }>(
+    `/api/checklist/history?limit=${limit}`
+  );
+}
+
 export function resetMaintenanceCycleCounter(employeeId: string, password: string) {
   return fetch('/api/maintenance/cycle-counter/reset', {
     method: 'POST',

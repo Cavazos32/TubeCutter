@@ -1,10 +1,4 @@
-// PF_V2 — Pre-Feeder L/R (sketch único). Librería: ../Ejemplo/libraries/StepperRMT
-//
-// Ciclo principal (loop):
-//   1) vacía cola NC_* (web/TCP) → machineHandleCommand
-//   2) machineTick: lee sensores, lógica feeder/buffer, syncOutputs
-//   3) pfNetworkTick: HTTP, OTA, peer Maestro
-// Motores/servo: tarea outputTask (core 1) aplica la intención cada ~8 ms
+// PF_V2 Pre-Feeder L/R — loop: comandos, machineTick, red; motores en outputTask.
 
 #include "config.h"
 #include "params.h"
@@ -131,7 +125,7 @@ static void servoMotionUs(int16_t extraDelta) {
 static void dereelerDirCw() { digitalWrite(PIN_DEREELER_DIR, DEREELER_CW_LEVEL); }
 static void dereelerDirCcw() { digitalWrite(PIN_DEREELER_DIR, DEREELER_CCW_LEVEL); }
 
-// RPM ya comandado — evita Brake/setSpeed cada 8 ms (arrastre RMT, motores "trabados").
+// RPM en caché: no Brake/setSpeed cada 8 ms.
 static float commandedFeederRpm = 0.0f;
 static float commandedDereelerRpm = 0.0f;
 static bool dereelerCmdReverse = false;
@@ -330,7 +324,7 @@ static bool motionArmed() {
 
 static bool refillActive() { return refillMat || refillDr || refillSv || refillFd; }
 
-// Buffer pide llenar: GPIO19 no estable en “lleno” → DeReeler/servo pueden correr
+// Buffer sin GPIO19 estable: DeReeler/servo pueden correr.
 static bool bufferWantsFill() {
   return motionArmed() && !gSnap.bufFullStable;
 }
@@ -521,7 +515,7 @@ static void serviceFeederDemand(uint32_t nowMs) {
     serviceHolguraFeed(nowMs);
 }
 
-// Flanco mid/high buffer → impulso boost; flanco high → inversión DeReeler hasta mid o falla buffer
+// Buffer mid/high: boost; high → DeReeler inverso hasta mid o fallo.
 static void serviceBoostEdges(uint32_t nowMs) {
   if (!P) return;
   if (!bufferWantsFill()) {
@@ -581,7 +575,7 @@ static void serviceBufferTimeout(uint32_t nowMs) {
     enterFault(FAULT_BUFFER_TIMEOUT);
 }
 
-// Max, manguera, cilindro (en auto; no en Materialista para cilindro/manguera según idle)
+// Max / manguera / cilindro (auto; Materialista excluye según idle).
 static void serviceProtections() {
   if (!motionArmed() && !refillActive()) return;
   if (gSnap.bufMaxRaw) enterFault(FAULT_ENDSTOP);

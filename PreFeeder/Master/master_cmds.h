@@ -3,7 +3,7 @@
 #include <Arduino.h>
 
 // Maestro organiza el bus: comandos globales vs volátiles (por lado).
-// Globales → broadcast L+R vía peerDoCmd() en PF_LR.ino (misma lógica que /api/auto local).
+// Globales → broadcast L+R (peerDoCmd).
 //   enable=1 → start | enable=0 → stop | reset=1 → reset
 //   idle_mode → setIdleMode | in_process → setInProcess
 // Volátiles → un solo esclavo (trigger, settings, etc.) vía side=L|R.

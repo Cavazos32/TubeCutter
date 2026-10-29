@@ -15,5 +15,5 @@ frontend/dist/
 Thumbs.db
 *.log
 
-# Timing de ciclo (generado en runtime)
+# Logs generados en runtime (checklist_history.jsonl, cycle_runs/*.md)
 logs/

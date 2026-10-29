@@ -7,7 +7,12 @@ import {
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import type { BackendSnapshot } from '../api/backendTypes';
-import { checklistCmd, getState } from '../api/hmiApi';
+import {
+  checklistCmd,
+  getChecklistHistory,
+  getState,
+  type ChecklistHistoryEntry,
+} from '../api/hmiApi';
 import { mapChecklistState } from '../api/mappers';
 import type { PlcState } from '../types';
 import type { ChecklistState, ChecklistStepId } from '../types/checklist';
@@ -100,12 +105,28 @@ export const ChecklistModal: React.FC<ChecklistModalProps> = ({
   const [lengthR, setLengthR] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [history, setHistory] = useState<ChecklistHistoryEntry[]>([]);
 
   // El error local es solo del intento en curso: no debe pegarse al
   // cambiar de paso ni al cerrar y reabrir (el fallo real viaja en la sesión).
   useEffect(() => {
     setError('');
   }, [isOpen, checklist.currentStepId]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    let cancelled = false;
+    getChecklistHistory(15)
+      .then((res) => {
+        if (!cancelled && res.ok) setHistory(res.entries ?? []);
+      })
+      .catch(() => {
+        if (!cancelled) setHistory([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, checklist.lastCompletedAt]);
 
   if (!isOpen) return null;
 
@@ -125,6 +146,19 @@ export const ChecklistModal: React.FC<ChecklistModalProps> = ({
   const stepFault = !!(error || checklist.stepError || stepFailed);
   const stepReady =
     !!session && !!stepId && !!status.ready && !stepFault && !checklist.workerBusy;
+
+  const formatHistoryWhen = (entry: ChecklistHistoryEntry) => {
+    const raw = entry.completedAt ?? entry.at ?? entry.startedAt ?? '';
+    if (!raw) return '—';
+    try {
+      return new Date(raw).toLocaleString(undefined, {
+        dateStyle: 'short',
+        timeStyle: 'short',
+      });
+    } catch {
+      return raw;
+    }
+  };
 
   const applyChecklistResponse = async (res: {
     ok: boolean;
@@ -765,6 +799,28 @@ export const ChecklistModal: React.FC<ChecklistModalProps> = ({
                   className={hmiFieldInput}
                   placeholder={t('maintenance_employee_placeholder')}
                 />
+                <div className="mt-4 border-t border-slate-200 pt-3 dark:border-slate-700">
+                  <p className="text-sm font-semibold text-slate-700 dark:text-slate-200">
+                    {t('checklist_history_title')}
+                  </p>
+                  {history.length === 0 ? (
+                    <p className={`mt-1 ${hmiAssistHint}`}>{t('checklist_history_empty')}</p>
+                  ) : (
+                    <ul className="mt-2 max-h-36 space-y-1 overflow-y-auto text-sm text-slate-600 dark:text-slate-300">
+                      {history.map((entry, i) => (
+                        <li key={`${entry.type}-${entry.employeeId}-${entry.completedAt ?? entry.at}-${i}`}>
+                          <span className="font-medium tabular-nums">{entry.employeeId}</span>
+                          {' · '}
+                          {entry.type === 'maintenance_reset'
+                            ? t('checklist_history_maintenance')
+                            : t('checklist_history_checklist')}
+                          {' · '}
+                          {formatHistoryWhen(entry)}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
               </div>
             ) : (
               <>

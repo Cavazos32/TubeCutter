@@ -1,12 +1,4 @@
-# Machine / ciclo TCM — opcodes 0x40–0x49 + errores Cycle/Main (EXXX)
-# Fuente Python; HMI no usa .h de firmware.
-#
-# Flujo de error:
-#   Set (detalle EXXX del esclavo / ciclo) → HMI latchea → UI con EXXX
-#                                         → estado máquina 0x46 a Andon
-#   Reset HMI → valida la condición y libera el latch solo si ya desapareció
-#
-# Estados MACH_* informan estado de máquina. EXXX identifica el fallo real.
+# Machine / ciclo TCM — opcodes 0x40–0x49 + EXXX (HMI; ver MotionStates/PlcStates).
 
 # --- Estados máquina / Andon RX (no EXXX) ---
 # Torre: Green / Red / N/A / Red+Buzzer / seq RGB+Buzzer / Yellow / Yellow+Buzzer

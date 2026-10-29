@@ -15,6 +15,16 @@ from typing import Any, Callable
 HMI_ROOT = Path(__file__).resolve().parent
 
 from checklist import ChecklistManager
+from checklist_history import (
+    append_checklist_history,
+    read_checklist_history,
+    utc_now_iso,
+)
+from cycle_analysis_log import (
+    classify_cycle_log_message,
+    is_lot_active,
+    record_event as analysis_record_event,
+)
 PLC_CONFIG_PATH = HMI_ROOT / "config" / "plc_config.json"
 APP_CONFIG_PATH = HMI_ROOT / "config" / "app_config.json"
 DEFAULT_BLOWER_SEC = 2.0
@@ -150,8 +160,6 @@ from machine_states import (
     STATE_LABELS,
     andon_tower_outputs,
 )
-from latency_debug import mark as lat_mark
-
 MODELS_PATH = HMI_ROOT / "config" / "models.json"
 MAX_LOG_LINES = 400
 # No latchear E065–E067 en microcortes WiFi; solo si el enlace sigue caído.
@@ -449,7 +457,7 @@ class HmiState:
         # JOG refill: gen por (lado, canal) para invalidar timers al cancelar/relanzar.
         self._pf_refill_timer_gen: dict[tuple[str, str], int] = {}
         self._pf_refill_lock = threading.Lock()
-        # Tras OFF anticipado: no reponer ON desde status/Master hasta que el esclavo confirme OFF.
+        # Tras OFF anticipado: no re-ON hasta confirmación del esclavo.
         self._pf_refill_ignore_on_until: dict[str, float] = {}
         self._pf_manual_prep_busy = False
         self._pf_manual_prep_thread: threading.Thread | None = None
@@ -727,6 +735,11 @@ class HmiState:
 
     def cycle_log(self, text: str) -> None:
         """Log de ciclo. No pisa el banner si hay EXXX activo (UI = error.ui)."""
+        if is_lot_active():
+            tagged = classify_cycle_log_message(text)
+            if tagged is not None:
+                kind, detail = tagged
+                analysis_record_event(kind, detail)
         with self._lock:
             _append_log(self._main_log, text)
             if not self._error_policy.latch.active:
@@ -1379,12 +1392,10 @@ class HmiState:
         No espera el ACK lento: no reenvía si hay evidencia de recepción.
         """
         mm = abs(float(mm))
-        lat_mark("0", source="motion", cmd="move_mm", mm=mm)
         with self._lock:
             self._move_target_mm = mm
             self._move_start_mm = self._last_position_mm
             self._last_move_fail_kind = ""
-        lat_mark("1", source="motion", cmd="move_mm")
         return self._cmd_motion_move_with_recovery(mm, rpm)
 
     def last_move_fail_kind(self) -> str:
@@ -1555,12 +1566,10 @@ class HmiState:
         return False
 
     def cmd_motion_move_zero(self, rpm: float | None = None) -> bool:
-        lat_mark("0", source="motion", cmd="move_zero")
         with self._lock:
             self._move_target_mm = 0.0
             self._move_start_mm = self._last_position_mm
             use_rpm = float(rpm) if rpm is not None else self._rpm
-        lat_mark("1", source="motion", cmd="move_zero")
         return self._client.cmd_move_zero(use_rpm)
 
     def cmd_motion_stop(self) -> bool:
@@ -2184,6 +2193,9 @@ class HmiState:
             return True
 
         _append_log(self._main_log, ui)
+        if is_lot_active() and not result.get("duplicate"):
+            src = f" ({source})" if source else ""
+            analysis_record_event("error", f"{ui}{src}")
         if source == "motion":
             _append_log(self._motion_log, ui)
             self._set_motion_status(ui, "error")
@@ -2305,8 +2317,26 @@ class HmiState:
             self._main_log,
             f"Mantenimiento: contador de ciclos reseteado (empleado {emp})",
         )
+        try:
+            append_checklist_history(
+                {
+                    "type": "maintenance_reset",
+                    "employeeId": emp,
+                    "at": utc_now_iso(),
+                    "maintenanceCycleCount": 0,
+                }
+            )
+        except OSError:
+            _append_log(self._main_log, "Mantenimiento: no se pudo escribir historial")
         self._notify()
         return {"ok": True, "maintenanceCycleCount": count}
+
+    def get_checklist_history(self, limit: int = 50) -> dict[str, Any]:
+        try:
+            entries = read_checklist_history(limit)
+        except OSError:
+            entries = []
+        return {"ok": True, "entries": entries}
 
     def cmd_checklist(self, action: str, **kwargs: Any) -> dict[str, Any]:
         if action == "start":
@@ -2984,7 +3014,6 @@ class HmiState:
     # --- TCP callbacks ---
 
     def _enqueue(self, source: str, msg: dict) -> None:
-        lat_mark("8", source=source, mtype=msg.get("type", ""))
         if (
             source == "plc"
             and msg.get("type") == "ack"
@@ -3016,7 +3045,6 @@ class HmiState:
                 if self._handle_motion_message(msg):
                     changed = True
         if changed:
-            lat_mark("9", source="flush")
             self._notify()
 
     def _handle_andon_message(self, msg: dict) -> bool:
@@ -3780,7 +3808,6 @@ class HmiState:
                 return
         elif byte_code == TX_BUSY:
             kind = "info"
-            lat_mark("9", source="motion", state="BUSY")
             if self._move_target_mm is not None and self._progress < 5:
                 self._progress = 5
         self._set_banner(text, kind)

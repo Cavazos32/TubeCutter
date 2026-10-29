@@ -9,6 +9,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from checklist_history import append_checklist_history, read_checklist_history
+
 # Banco / desarrollo: omitir revisión de arranque al reiniciar la HMI.
 # Producción: False, o lanzar con HMI_CHECKLIST_SKIP=0
 CHECKLIST_SKIP_ON_BOOT = True
@@ -97,6 +99,10 @@ class ChecklistManager:
                 "checklistLastCompletedAt": self._last_completed_at,
                 "checklistSession": self._session,
             }
+
+    @staticmethod
+    def history(limit: int = 50) -> list[dict[str, Any]]:
+        return read_checklist_history(limit)
 
     def mark_required_on_boot(self) -> None:
         """Arranque de la HMI (encendido / reinicio del programa): revisión obligada
@@ -393,12 +399,31 @@ class ChecklistManager:
             idx = int(self._session.get("currentStepIndex", 0))
             if idx < len(STEP_IDS):
                 return {"ok": False, "error": "steps_pending"}
-            emp = self._session.get("employeeId", "?")
+            emp = str(self._session.get("employeeId", "?"))
+            completed_at = _utc_now_iso()
+            history_row = {
+                "type": "checklist_complete",
+                "employeeId": emp,
+                "startedAt": self._session.get("startedAt"),
+                "completedAt": completed_at,
+                "completedSteps": list(self._session.get("completedSteps") or []),
+                "measurements": dict(self._session.get("measurements") or {}),
+            }
             self._required = False
-            self._last_completed_at = _utc_now_iso()
+            self._last_completed_at = completed_at
             self._session = None
             self._air_test_active = False
             self._piece_test_started = False
+        try:
+            mc = getattr(host, "_maintenance_cycle_count", None)
+            if mc is not None:
+                history_row["maintenanceCycleCount"] = int(mc)
+        except (TypeError, ValueError):
+            pass
+        try:
+            append_checklist_history(history_row)
+        except OSError:
+            self._log("Checklist: no se pudo escribir historial")
         self._log(f"Checklist: completado (empleado {emp})")
         self.clear_step_error()
         self._notify()

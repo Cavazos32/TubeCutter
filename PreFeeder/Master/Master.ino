@@ -1,6 +1,4 @@
-// PreFeeder Master — orquesta L/R: lee estados, agrega errores, despacha comandos.
-// Globales (control manual) → L+R | Volátiles (trigger, settings) → un lado (side=L|R).
-// HMI TCM: TCP JSON+newline (opcodes en ../protocol.h).
+// PreFeeder Master — L/R + TCP HMI (protocol.h).
 #include <WiFi.h>
 #include <WebServer.h>
 #include "../protocol.h"
@@ -24,7 +22,6 @@ static const uint32_t HEARTBEAT_WARN_MS = 8000;
 static const uint32_t STALE_LINK_MS = 30000;
 static const uint32_t KEEPALIVE_PING_MS = 4000;
 static const uint32_t WIFI_RETRY_MS = 8000;
-static const uint32_t STATUS_LOG_MS = 10000;
 static const uint8_t  HTTP_SERVICE_PASSES = 12;
 static const uint8_t PROTO_VER = PF_MASTER_PROTO_VER;
 
@@ -56,7 +53,6 @@ static uint32_t connectMsR = 0;
 static uint32_t lastKeepaliveMsL = 0;
 static uint32_t lastKeepaliveMsR = 0;
 static uint32_t lastWifiRetryMs = 0;
-static uint32_t lastStatusLogMs = 0;
 static uint8_t failCountL = 0;
 static uint8_t failCountR = 0;
 static bool wifiReconnecting = false;
@@ -589,19 +585,6 @@ static void pfServiceSide(WiFiClient& client, const IPAddress& ip, uint32_t& las
   masterServiceHttp();
 }
 
-static void masterLogStatus()
-{
-  if (millis() - lastStatusLogMs < STATUS_LOG_MS) return;
-  lastStatusLogMs = millis();
-
-  Serial.printf("[MASTER] WiFi=%s L:tcp=%d rx=%lums R:tcp=%d rx=%lums\n",
-                WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "OFF",
-                (int)pfClientL.connected(),
-                pfClientL.connected() && lastRxMsL ? (long)(millis() - lastRxMsL) : -1L,
-                (int)pfClientR.connected(),
-                pfClientR.connected() && lastRxMsR ? (long)(millis() - lastRxMsR) : -1L);
-}
-
 static void jsonAppendStr(String& j, const String& s)
 {
   j += '"';
@@ -903,9 +886,7 @@ void handleApiCmd()
   server.send(200, "application/json", j);
 }
 
-// =============================================================================
-// TCP HMI (TCM) — servidor :8768, JSON + newline (mismo patrón Motion/PLCA)
-// =============================================================================
+// --- TCP HMI :8768 ---
 static bool pfTcpLinkOk()
 {
   return pfTcpClient && pfTcpClient.connected();
@@ -1469,6 +1450,5 @@ void loop()
   pfServiceSide(pfClientR, PF_R_IP, lastReconnectMsR, rxLineR, rxLenR, 'R',
                 connectMsR, lastRxMsR, failCountR, lastKeepaliveMsR);
 
-  masterLogStatus();
   masterServiceHttp();
 }

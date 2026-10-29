@@ -12,7 +12,6 @@ static uint16_t tcpRxLen = 0;
 static bool tcpServicesUp = false;
 static bool tcpWasConnected = false;
 
-// WiFi — reconexión no bloqueante (mismo patrón que Motion).
 static bool wifiStaWasConnected = false;
 static uint32_t wifiConnectStartedMs = 0;
 static uint32_t wifiLastKickMs = 0;
@@ -429,9 +428,6 @@ static void tcpOnClientAccepted()
   tcpRxLen = 0;
   tcpTx(String("{\"ver\":") + ANDON_PROTO_VER + ",\"type\":\"hello\",\"role\":\"andon\"}");
   andonTxStatus();
-#if ANDON_DEBUG
-  Serial.printf("[TCP] On desde %s\n", tcpClient.remoteIP().toString().c_str());
-#endif
   tcpWasConnected = true;
 }
 
@@ -473,10 +469,7 @@ static void tcpStopServices()
   Serial.println("[TCP] Off");
 }
 
-// =============================================================================
-// WIFI — reconexión no bloqueante (millis / estados; sin delay en loop)
-// Patrón: Motion wifiKickConnect / serviceWifi
-// =============================================================================
+// --- WiFi (reconexión no bloqueante) ---
 static void wifiKickConnect(bool isRetry)
 {
   if (isRetry) {

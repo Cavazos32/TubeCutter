@@ -5,11 +5,9 @@ bloques al inicio de este archivo. Estado máquina bytes 0x40–0x49.
 from __future__ import annotations
 
 import json
-import shutil
 import threading
 import time
 from dataclasses import asdict, dataclass, fields
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Protocol
 from machine_states import (
@@ -29,11 +27,18 @@ from machine_states import (
 )
 from error_catalog import format_ui, lookup
 from plc import CMD_ENCODER, CMD_GRIPPER, CMD_HOLDER, CMD_HOLDER_ENCODER
+from cycle_analysis_log import (
+    begin_lot as analysis_begin_lot,
+    begin_piece as analysis_begin_piece,
+    end_lot as analysis_end_lot,
+    end_piece as analysis_end_piece,
+    record_op as analysis_record_op,
+)
 
 HMI_ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = HMI_ROOT / "config" / "cycle_config.json"
 
-# --- Delays de secuencia del ciclo (única fuente; editar aquí) ----------------
+# --- Delays de secuencia ---
 HOLDER_ON_MS = 25
 HOLDER_PRECUT_MS = 20
 HOLDER_OPEN_MS = 20
@@ -65,11 +70,11 @@ def cycle_delay_ms(step_key: str) -> int:
     return int(_CYCLE_STEP_DELAY_MS[step_key])
 
 
-# --- Esperas fijas de rutina (segundos; no ms de válvulas) ---------------------
+# --- Esperas fijas (s) ---
 PURGE_WARNING_LEAD_S = 0.3
 WIP_BLOWER_START_DELAY_S = 0.050
 
-# --- Soplo WIP (duración principal = calculada; estos son límites y umbrales) ---
+# --- Soplo WIP (límites) ---
 WIP_BLOWER_CONTINUOUS = True
 WIP_BLOWER_MIN_TRAVEL_MM = 1.0
 WIP_BLOWER_OFFSET_EPS_MM = 0.5
@@ -77,7 +82,7 @@ WIP_START_CACHE_TOL_MM = 5.0
 WIP_BLOWER_LINEAL_MATCH_MIN_S = 0.2
 WIP_BLOWER_LINEAL_MATCH_MAX_S = 30.0
 
-# --- Timeouts y vigencias de rutina (segundos) ---------------------------------
+# --- Timeouts (s) ---
 MOTION_WAIT_TIMEOUT_S = 25.0
 FEED_WAIT_TIMEOUT_S = 15.0
 PF_READY_TIMEOUT_S = 15.0
@@ -86,40 +91,13 @@ REFILL_LASER_TIMEOUT_S = 10.0
 PLC_ACK_TIMEOUT_S = 2.0
 MOTION_IDLE_NO_TARGET_S = 1.0
 PF_TFEED_DONE_TIMEOUT_S = 30.0
-# Intervalo de log mientras se espera buffer+holgura tras fin de lote (sin tope duro).
+# Log periódico esperando buffer+holgura post-lote.
 PF_SETTLE_BEFORE_IDLE_S = 15.0
 PF_TFEED_CAPTURE_AFTER_PAUSE_S = 0.5
 
-# --- Tolerancias Motion (mm; no son tiempos) -----------------------------------
+# --- Tolerancias Motion (mm) ---
 ASDA_HOME_EPS_MM = 0.5
 MOTION_TARGET_TOL_MM = 3.0
-
-# --- Diagnóstico de tiempos (logs / .md; no afectan la secuencia) ------------
-TIMING_LOG_DIR = HMI_ROOT / "logs" / "cycle_timing"
-TIMING_GAP_REPORT_S = 0.050
-TIMING_DELAY_OVERSHOOT_MS = 15
-TIMING_CMD_SLOW_S = 0.080
-TIMING_ENCODER_OUTLIER_MM = 120.0
-TIMING_SUMMARY_EVERY_PIECES = 100
-TIMING_OP_ORDER = (
-    "pf_trigger",
-    "feed_cmd",
-    "feed",
-    "grippers_on",
-    "holder_off",
-    "lineal_cmd",
-    "lineal",
-    "corte",
-    "depósito_cmd",
-    "depósito",
-    "grippers_off",
-    "despeje_cmd",
-    "despeje",
-    "home_cmd",
-    "home",
-    "feed_next_cmd",
-    "feed_next",
-)
 
 FLOW_STEPS: list[dict[str, Any]] = [
     {"id": 1, "key": "holder_on", "label": "Sujetar tubo (primera pieza)", "kind": "action", "sbsPause": False},
@@ -618,25 +596,22 @@ class CycleRunner:
         self._last_ok = False
         self._abort_needs_ack = False
         self._fault = ""
-        # recovery en lote: completar pieza en curso (hasta post_piece / corte) y pausar.
-        self._recovery = ""  # common lot recovery context | e050_materialist
-        # Tras error: lote vivo → Reset → purga → abort_decide → Resume → pieza → review → purga.
+        self._recovery = ""  # contexto recovery lote | e050_materialist
         self._recovery_after_error = False
-        self._recovery_prompt = ""  # "" | pre_purge_decide | abort_decide | review_piece | verify_piece | continue_cycle | tray_full | e050_materialist
+        self._recovery_prompt = ""  # clave prompt recovery (ver handlers)
         self._recovery_awaiting = False
         self._pending_lot_decision = False
         self._recovery_confirm = threading.Event()
         self._recovery_reject = threading.Event()
-        # E050 + Materialista: terminar pieza en curso si existe, HOME y Materialista.
         self._e050_finish_piece = False
         self._e050_materialist_requested = False
         self._e050_materialist_wait = False
         self._e050_normal_recovery = ""
-        # Start / recovery / recovery: validar láser antes de alimentar (ON → omitir).
         self._restart_piece = False
         self._recovery_skip_feed = False
-        # True tras LengthOK (feed+offset Motion). offL/offR suelen dejar láser OFF;
-        # sin este flag, Resume/Continuar ciclo re-alimentaba y reaplicaba el offset.
+        # Tras lineal OK sin corte: Resume completa corte sin re-feed/re-lineal.
+        self._pending_cut_resume = False
+        # Tras LengthOK: evita re-feed/offset en Resume.
         self._material_feed_done = False
         self._recovery_skip_pf_trigger = False
         self._pf_trigger_sent_this_piece = False
@@ -650,9 +625,7 @@ class CycleRunner:
         self._flow_interrupt = threading.Event()
         # In process OFF por Pause/Error; Resume/Busy rearma. Evita doble OFF/ON.
         self._pf_held_idle = False
-        # Pause: Tfeed abortado por lado → retry parcial al Resume (sec; 0=default PF).
         self._pf_tfeed_resume: dict[str, float] = {}
-        # Resume / Continuar ciclo: misma espera Buffer Full que Start (hilo de ciclo).
         self._resume_need_buffer_full = False
         # Tras última pieza OK: PF sigue rellenando; CT/UI ya cerrados.
         self._post_lot_pf_settle = False
@@ -665,7 +638,6 @@ class CycleRunner:
         # monotonic() del Set/Res de cortador (asiento antes de depósito/despeje).
         self._cutter_set_mono: float | None = None
         self._cutter_res_mono: float | None = None
-        # Reloj de lote (wall, incluye prep) — refill / diagnóstico.
         self._started_at: float | None = None
         # CT productivo: 1ª pieza (holder/feed) → última freeze (antes post_piece).
         # No incluye prep / Finish / settled. Pause no suma.
@@ -678,25 +650,6 @@ class CycleRunner:
         self._pause_t0: float | None = None
         self._pause_excluded_sec: float = 0.0
         self._piece_pause_base: float = 0.0
-        # Timing cmd→fin por operación (excluye Pause; mismos criterios que CT).
-        self._piece_timings: list[dict[str, Any]] = []
-        self._piece_metro: list[dict[str, Any]] = []
-        self._lot_timing_pieces: list[dict[str, Any]] = []
-        self._timing_md_path: Path | None = None
-        self._timing_lot_meta: dict[str, Any] = {}
-        self._timing_last_end: float | None = None
-        self._timing_last_end_pause: float = 0.0
-        # Diagnóstico de lote: eventos (error / stop / pausa) con hora de pared,
-        # agregados por pieza y archivos temporales de índice/detalle (streaming).
-        self._timing_events: list[dict[str, Any]] = []
-        self._timing_agg: dict[str, Any] = {}
-        self._timing_index_path: Path | None = None
-        self._timing_detail_path: Path | None = None
-        self._timing_piece_pause_n = 0
-        self._timing_piece_pause_sec = 0.0
-        self._pause_reason_hint: str = ""
-        self._pause_reason_cur: str = ""
-        self._pause_rep: int | None = None
         self._on_machine_state: Callable[[int], None] | None = None
 
     def set_machine_state_hook(self, cb: Callable[[int], None] | None) -> None:
@@ -921,6 +874,7 @@ class CycleRunner:
         self._clear_recovery_gate()
         self._restart_piece = False
         self._recovery_skip_feed = False
+        self._pending_cut_resume = False
         self._material_feed_done = False
         self._recovery_skip_pf_trigger = False
         self._pf_trigger_sent_this_piece = False
@@ -948,6 +902,16 @@ class CycleRunner:
             self._pieces_per_rep = int(pieces_per_rep)
             self._reset_ct_clocks_locked()
         self._set_state(TX_BUSY)
+        lot_meta = {
+            "length_mm": abs(float(length_mm)),
+            "order_qty": int(order_qty),
+            "cycle_qty": int(cycle_qty),
+            "rpm": float(rpm),
+            "feed_sides": sides,
+            "pieces_per_rep": int(pieces_per_rep),
+            "mode": "lote",
+        }
+        analysis_path = analysis_begin_lot(lot_meta)
         if pieces_per_rep > 1:
             half = cycle_qty
             self._host.cycle_log(
@@ -960,6 +924,9 @@ class CycleRunner:
                 f"Cycle Start (0x040) length={length_mm} mm qty={order_qty} "
                 f"lado={sides}"
             )
+        if analysis_path is not None:
+            rel = analysis_path.relative_to(HMI_ROOT)
+            self._host.cycle_log(f"Análisis ciclo → {rel.as_posix()}")
         args = (float(length_mm), int(cycle_qty), float(rpm))
         self._thread = threading.Thread(
             target=self._run_lot, args=args, daemon=True, name="CycleRunner"
@@ -972,6 +939,7 @@ class CycleRunner:
         self._flow_interrupt.set()
         self._restart_piece = False
         self._recovery_skip_feed = False
+        self._pending_cut_resume = False
         self._material_feed_done = False
         self._recovery_skip_pf_trigger = False
         self._pf_trigger_prearmed_rep = None
@@ -999,7 +967,6 @@ class CycleRunner:
         self._pf_tfeed_resume = {}
         self._resume_need_buffer_full = False
         # Stop no toca PLC (válvulas: All Off / Reset PLC propios).
-        self._timing_note_event("stop", "Stop operador", "0x041")
         self._set_state(TX_STOP, "Stop (0x042)")
         self._host.cycle_log("Cycle Stop (0x041)")
         return {"ok": True}
@@ -1008,7 +975,6 @@ class CycleRunner:
             return {"ok": False, "error": "Purga en curso"}
         if not self.is_active():
             return {"ok": False, "error": "Sin ciclo activo"}
-        self._pause_reason_hint = "operator"
         self._pause.set()
         with self._lock:
             if self._pause_t0 is None:
@@ -1284,7 +1250,6 @@ class CycleRunner:
             self._host.cycle_log("Purga (lote) OK — lote en Pause (Reset → Resume)")
         if self._should_abort():
             return
-        self._pause_reason_hint = "lot_purge"
         self._pause.set()
         with self._lock:
             if self._pause_t0 is None:
@@ -1426,6 +1391,7 @@ class CycleRunner:
         self._clear_recovery_gate()
         self._restart_piece = False
         self._recovery_skip_feed = False
+        self._pending_cut_resume = False
         self._material_feed_done = False
         self._recovery_skip_pf_trigger = False
         self._flow_interrupt.clear()
@@ -1726,7 +1692,6 @@ class CycleRunner:
     # Helpers de espera, pausa y confirmación.
     def _wait_paused_for_resume(self, reason: str) -> bool:
         """Pausa cooperativa hasta Resume/Stop. True = abortar."""
-        self._pause_reason_hint = "hold"
         self._pause.set()
         with self._lock:
             if self._pause_t0 is None:
@@ -2023,7 +1988,6 @@ class CycleRunner:
             if self._host.apply_detail_error(slug_or_code):
                 return
         self._fault = format_ui(slug_or_code, fallback=slug_or_code)
-        self._timing_note_event("error", self._fault, str(slug_or_code))
 
     def apply_error_policy(
         self,
@@ -2035,7 +1999,6 @@ class CycleRunner:
         self._recovery = recovery
         self._recovery_after_error = self.is_active()
         self._resume_need_buffer_full = False
-        self._timing_note_event("error", ui, recovery or "error_state")
         self._pause.set()
         with self._lock:
             if self._pause_t0 is None:
@@ -2076,7 +2039,6 @@ class CycleRunner:
         with self._lock:
             self._recovery_prompt = "e050_materialist"
             self._recovery_awaiting = True
-        self._timing_note_event("error", ui, "e050")
         if self.is_active():
             self._pause.set()
             with self._lock:
@@ -2126,20 +2088,7 @@ class CycleRunner:
         meta = STEP_BY_KEY.get(key, {})
         label = meta.get("label", key)
         self._host.cycle_log(f"Delay · {label}: {ms} ms")
-        op = self._begin_op(f"delay:{key}")
         aborted = self._pausable_delay(ms)
-        sec = self._end_op(op, ok=not aborted, extra={"cfg_ms": ms, "kind": "delay"})
-        if not aborted and ms > 0:
-            overshoot_ms = (sec * 1000.0) - float(ms)
-            if overshoot_ms > TIMING_DELAY_OVERSHOOT_MS:
-                self._host.cycle_log(
-                    f"Delay overshoot · {label}: {self._fmt_op(sec)} "
-                    f"(cfg={ms} ms, +{overshoot_ms:.0f} ms)"
-                )
-            else:
-                self._host.cycle_log(
-                    f"Delay done · {label}: {self._fmt_op(sec)} (cfg={ms} ms)"
-                )
         if aborted:
             return True
         if self._after_step(key):
@@ -2198,7 +2147,6 @@ class CycleRunner:
         if self._step_by_step_should_pause(step_key) and not self._e050_finishing_piece():
             meta = STEP_BY_KEY.get(step_key, {})
             label = meta.get("label", step_key)
-            self._pause_reason_hint = f"paso_a_paso:{step_key}"
             self._pause.set()
             self._host.cycle_log(f"Paso a paso — {label}")
             self._enter_pause_andon()
@@ -2356,6 +2304,7 @@ class CycleRunner:
         if not self._restart_piece:
             return False
         self._restart_piece = False
+        self._pending_cut_resume = False
         self._recovery_skip_pf_trigger = bool(self._pf_trigger_sent_this_piece)
         self._flow_interrupt.clear()
         return True
@@ -2417,90 +2366,11 @@ class CycleRunner:
         if self._pause.is_set():
             if self._pause_t0 is None:
                 self._pause_t0 = now
-            if not self._pause_reason_cur:
-                self._pause_reason_cur = self._pause_reason_derive_locked()
-                self._pause_rep = int(self._rep or 0) or None
             return
         if self._pause_t0 is not None:
             dur = max(0.0, now - self._pause_t0)
             self._pause_excluded_sec += dur
-            self._timing_note_pause_locked(dur)
             self._pause_t0 = None
-            self._pause_reason_cur = ""
-            self._pause_rep = None
-
-    def _pause_reason_derive_locked(self) -> str:
-        """Motivo de la pausa en curso (prompt activo > hint de quien pausó > EXXX)."""
-        hint = self._pause_reason_hint
-        self._pause_reason_hint = ""
-        if self._recovery_awaiting and self._recovery_prompt:
-            return f"recovery:{self._recovery_prompt}"
-        if self._refill_awaiting_confirm and self._refill_prompt:
-            return f"refill:{self._refill_prompt}"
-        if hint:
-            return hint
-        if self._fault:
-            code = str(self._fault).split(":", 1)[0].strip()
-            return f"error:{code}" if code else "error"
-        return "pause"
-
-    # Registro de tiempos del ciclo.
-    def _timing_note_pause_locked(self, dur: float) -> None:
-        """Pausa cerrada → evento cronológico + fila en la pieza (caller con _lock)."""
-        if self._timing_md_path is None or dur < TIMING_GAP_REPORT_S:
-            return
-        reason = self._pause_reason_cur or self._pause_reason_derive_locked()
-        wall_end = datetime.now()
-        wall_start = wall_end - timedelta(seconds=dur)
-        rep = self._pause_rep or (int(self._rep or 0) or None)
-        self._timing_events.append(
-            {
-                "kind": "pause",
-                "t_start": wall_start,
-                "t_end": wall_end,
-                "rep": rep,
-                "code": reason,
-                "note": "",
-                "sec": dur,
-            }
-        )
-        self._timing_piece_pause_n += 1
-        self._timing_piece_pause_sec += dur
-        self._piece_timings.append(
-            {
-                "name": f"wait:pause:{reason}",
-                "sec": dur,
-                "ok": True,
-                "ct_excluded": True,
-                "wall_start": wall_start.strftime("%H:%M:%S"),
-                "wall_end": wall_end.strftime("%H:%M:%S"),
-            }
-        )
-
-    def _timing_note_event(self, kind: str, code: str, note: str = "") -> None:
-        """Error / Stop / fallo de paso con hora de pared (orden cronológico)."""
-        if self._timing_md_path is None:
-            return
-        now = datetime.now()
-        code = str(code or "").strip() or "?"
-        for ev in self._timing_events[-5:]:
-            if (
-                ev.get("kind") == kind
-                and ev.get("code") == code
-                and (now - ev["t_start"]).total_seconds() < 2.0
-            ):
-                return
-        self._timing_events.append(
-            {
-                "kind": str(kind),
-                "t_start": now,
-                "t_end": None,
-                "rep": int(self._rep or 0) or None,
-                "code": code,
-                "note": str(note or ""),
-                "sec": None,
-            }
-        )
 
     def _ct_elapsed_locked(self) -> int:
         """Segundos CT para UI (congelado tras freeze; no infla con Finish)."""
@@ -2520,8 +2390,6 @@ class CycleRunner:
                 self._cycle_t0 = now
             self._piece_t0 = now
             self._piece_pause_base = float(self._pause_excluded_sec)
-            if self._timing_md_path is not None:
-                self._timing_agg.setdefault("first_piece_start", now)
 
     def _piece_elapsed_s(self) -> float | None:
         """CT de la pieza en curso (Pause excluida). None si no hay reloj."""
@@ -2628,7 +2496,7 @@ class CycleRunner:
             self._host.cycle_log(f"{base} · {piece_sec:.1f}s")
         else:
             self._host.cycle_log(base)
-        self._timing_flush_piece(rep, qty, piece_sec)
+        analysis_end_piece(int(rep), int(qty), float(piece_sec))
 
     def _reset_ct_clocks_locked(self) -> None:
         self._cycle_t0 = None
@@ -2640,12 +2508,8 @@ class CycleRunner:
         self._pause_t0 = None
         self._pause_excluded_sec = 0.0
         self._piece_pause_base = 0.0
-        self._pause_reason_cur = ""
-        self._pause_rep = None
         self._last_lineal_sec = 0.0
         self._last_lineal_mm = 0.0
-
-    # --- Timing cmd→fin (log + .md) -------------------------------------------
 
     @staticmethod
     def _fmt_op(sec: float) -> str:
@@ -2706,23 +2570,6 @@ class CycleRunner:
         with self._lock:
             self._sync_pause_exclusion_locked(now)
             pause_base = float(self._pause_excluded_sec)
-        last = self._timing_last_end
-        if last is not None:
-            gap = (now - last) - (pause_base - float(self._timing_last_end_pause))
-            if gap >= TIMING_GAP_REPORT_S:
-                gap_name = f"gap:before:{name}"
-                self._piece_timings.append(
-                    {
-                        "name": gap_name,
-                        "sec": gap,
-                        "ok": True,
-                        "kind": "gap",
-                    }
-                )
-                self._host.cycle_log(
-                    f"Hueco muerto · {name}: {self._fmt_op(gap)} "
-                    f"(>{TIMING_GAP_REPORT_S * 1000.0:.0f} ms; no es delay de proceso)"
-                )
         return {"name": str(name), "t0": now, "pause_base": pause_base}
 
     def _end_op(
@@ -2740,582 +2587,8 @@ class CycleRunner:
             pause_now = float(self._pause_excluded_sec)
             excluded = pause_now - float(op["pause_base"])
         sec = max(0.0, now - float(op["t0"]) - excluded)
-        row: dict[str, Any] = {
-            "name": str(op["name"]),
-            "sec": sec,
-            "ok": bool(ok),
-        }
-        if extra:
-            row.update(extra)
-        self._piece_timings.append(row)
-        if not ok:
-            self._timing_note_event("step_fail", str(op["name"]), "paso fallido")
-        self._timing_last_end = now
-        self._timing_last_end_pause = pause_now
+        analysis_record_op(str(op["name"]), sec, ok=ok)
         return sec
-
-    def _timing_reset_piece(self) -> None:
-        self._piece_timings = []
-        self._piece_metro = []
-        self._timing_last_end = None
-        self._timing_last_end_pause = 0.0
-
-    @staticmethod
-    def _fmt_mm(v: float | None, *, signed: bool = False) -> str:
-        if v is None:
-            return "—"
-        return f"{float(v):+.2f}" if signed else f"{float(v):.2f}"
-
-    def _metro_snap(self, tag: str, *, target_mm: float | None = None) -> None:
-        """Caché TCP ASDA/OM. No HTTP ni comando nuevo."""
-        asda = None
-        om_l = None
-        om_r = None
-        try:
-            asda = self._host.asda_position_mm()
-        except Exception:
-            asda = None
-        om_fn = getattr(self._host, "om_official_mm", None)
-        if callable(om_fn):
-            try:
-                om_l = om_fn("L")
-                om_r = om_fn("R")
-            except Exception:
-                om_l = None
-                om_r = None
-        tgt = abs(float(target_mm)) if target_mm is not None else None
-        delta = None
-        if asda is not None and tgt is not None:
-            delta = float(asda) - tgt
-        self._piece_metro.append(
-            {
-                "tag": str(tag),
-                "asda": None if asda is None else float(asda),
-                "om_l": None if om_l is None else float(om_l),
-                "om_r": None if om_r is None else float(om_r),
-                "target": tgt,
-                "delta": delta,
-            }
-        )
-
-    def _timing_open_session(
-        self, *, length_mm: float, qty: int, rpm: float
-    ) -> None:
-        """Abre .md de diagnóstico del lote (índice/detalle van a temporales)."""
-        self._lot_timing_pieces = []
-        self._piece_timings = []
-        self._piece_metro = []
-        self._timing_last_end = None
-        self._timing_last_end_pause = 0.0
-        self._timing_md_path = None
-        self._timing_index_path = None
-        self._timing_detail_path = None
-        self._timing_events = []
-        with self._lock:
-            self._timing_piece_pause_n = 0
-            self._timing_piece_pause_sec = 0.0
-        now_mono = time.monotonic()
-        self._timing_agg = {
-            "pieces": 0,
-            "ct": [0, 0.0, None, None],
-            "real": [0, 0.0, None, None],
-            "unreg_sum": 0.0,
-            "pause_sum": 0.0,
-            "ops": {},
-            "metro_out": [],
-            "metro_out_n": 0,
-        }
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        sides = CycleConfig.normalize_feed_sides(self.get_config().feed_sides)
-        self._timing_lot_meta = {
-            "started": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "length_mm": float(length_mm),
-            "qty": int(qty),
-            "rpm": float(rpm),
-            "stamp": stamp,
-            "sides": sides,
-            "lot_t0": float(self._started_at)
-            if self._started_at is not None
-            else now_mono,
-        }
-        try:
-            TIMING_LOG_DIR.mkdir(parents=True, exist_ok=True)
-            path = TIMING_LOG_DIR / f"cycle_{stamp}.md"
-            index_path = TIMING_LOG_DIR / f"cycle_{stamp}.index.tmp"
-            detail_path = TIMING_LOG_DIR / f"cycle_{stamp}.detail.tmp"
-            index_path.write_text("", encoding="utf-8")
-            detail_path.write_text("", encoding="utf-8")
-            self._timing_md_path = path
-            self._timing_index_path = index_path
-            self._timing_detail_path = detail_path
-            self._timing_write_summary(final=False)
-            self._host.cycle_log(f"Timing: análisis → {path}")
-        except Exception as exc:
-            self._timing_md_path = None
-            self._timing_index_path = None
-            self._timing_detail_path = None
-            self._host.cycle_log(f"Timing: no se pudo crear .md ({exc})")
-
-    @staticmethod
-    def _fmt_hms(sec: float) -> str:
-        s = max(0, int(round(float(sec))))
-        h, rem = divmod(s, 3600)
-        m, sec_i = divmod(rem, 60)
-        if h > 0:
-            return f"{h}h {m:02d}m {sec_i:02d}s"
-        if m > 0:
-            return f"{m}m {sec_i:02d}s"
-        return f"{sec_i}s"
-
-    @staticmethod
-    def _stat_add(stat: list[Any], v: float) -> None:
-        """stat = [n, sum, min, max]."""
-        stat[0] += 1
-        stat[1] += v
-        stat[2] = v if stat[2] is None else min(stat[2], v)
-        stat[3] = v if stat[3] is None else max(stat[3], v)
-
-    @staticmethod
-    def _stat_txt(stat: list[Any]) -> str:
-        n = int(stat[0])
-        if n <= 0:
-            return "*(n/d)*"
-        return (
-            f"avg **{stat[1] / n:.3f}s** (min {float(stat[2]):.3f} · "
-            f"max {float(stat[3]):.3f} · n={n})"
-        )
-
-    def _timing_append_file(self, path: Path | None, text: str) -> None:
-        if path is None:
-            return
-        try:
-            with path.open("a", encoding="utf-8") as fh:
-                fh.write(text)
-                if not text.endswith("\n"):
-                    fh.write("\n")
-        except Exception as exc:
-            self._host.cycle_log(f"Timing: error escribiendo {path.name} ({exc})")
-
-    def _timing_flush_piece(
-        self, rep: int, qty: int, piece_sec: float
-    ) -> None:
-        """Log compacto de la pieza + registro en el .md del lote."""
-        samples = list(self._piece_timings)
-        metro = list(self._piece_metro)
-        self._piece_timings = []
-        self._piece_metro = []
-        if self._timing_md_path is not None:
-            self._timing_record_piece(rep, qty, piece_sec, samples, metro)
-        if not samples and piece_sec <= 0:
-            return
-        self._timing_log_piece(rep, qty, samples)
-
-    def _timing_record_piece(
-        self,
-        rep: int,
-        qty: int,
-        piece_sec: float,
-        samples: list[dict[str, Any]],
-        metro: list[dict[str, Any]],
-    ) -> None:
-        """Agregados en memoria + índice/detalle a disco (streaming)."""
-        now = time.monotonic()
-        agg = self._timing_agg
-        prev = agg.get("last_piece_end") or agg.get("first_piece_start") or now
-        real = max(0.0, now - float(prev))
-        agg["last_piece_end"] = now
-        with self._lock:
-            n_pause = int(self._timing_piece_pause_n)
-            pause_sec = float(self._timing_piece_pause_sec)
-            self._timing_piece_pause_n = 0
-            self._timing_piece_pause_sec = 0.0
-        steps_sec = sum(
-            float(s["sec"])
-            for s in samples
-            if not s.get("ct_excluded") and not str(s["name"]).startswith("gap:")
-        )
-        n_fail = sum(1 for s in samples if not s.get("ok", True))
-        unreg = max(0.0, real - steps_sec - pause_sec)
-        clock = datetime.now().strftime("%H:%M:%S")
-
-        agg["pieces"] = int(agg.get("pieces") or 0) + 1
-        if piece_sec > 0:
-            self._stat_add(agg["ct"], float(piece_sec))
-        self._stat_add(agg["real"], real)
-        agg["unreg_sum"] = float(agg.get("unreg_sum") or 0.0) + unreg
-        agg["pause_sum"] = float(agg.get("pause_sum") or 0.0) + pause_sec
-        ops: dict[str, list[Any]] = agg["ops"]
-        for s in samples:
-            name = str(s["name"])
-            if s.get("ct_excluded") or name.startswith("gap:") or not s.get("ok", True):
-                continue
-            self._stat_add(ops.setdefault(name, [0, 0.0, None, None]), float(s["sec"]))
-        r = self._metro_log_readings(metro)
-        if any(
-            r.get(k) is not None and abs(float(r[k])) >= TIMING_ENCODER_OUTLIER_MM
-            for k in ("om_l", "om_r")
-        ):
-            agg["metro_out_n"] = int(agg.get("metro_out_n") or 0) + 1
-            if len(agg["metro_out"]) < 1000:
-                agg["metro_out"].append((int(rep), r))
-
-        self._timing_append_file(
-            self._timing_index_path,
-            f"| {rep} | {piece_sec:.3f} | {real:.3f} | {steps_sec:.3f} | "
-            f"{unreg:.3f} | {n_pause} | {pause_sec:.3f} | {n_fail} | `{clock}` |",
-        )
-        block = [
-            f"### Pieza {rep}/{qty} · CT **{piece_sec:.3f}s** · "
-            f"Real **{real:.3f}s** · `{clock}`",
-            "",
-            "| Paso | Duración | OK |",
-            "|------|---------:|:--:|",
-        ]
-        for s in samples:
-            name = str(s["name"])
-            sec = float(s["sec"])
-            if s.get("ct_excluded"):
-                mark = "pausa"
-            else:
-                mark = "✓" if s.get("ok", True) else "✗"
-            when = ""
-            if s.get("wall_start"):
-                when = f" · {s['wall_start']}→{s.get('wall_end') or ''}"
-            block.append(f"| `{name}` | {sec:.3f}s{when} | {mark} |")
-        block.append("")
-        block.append(
-            f"- Pasos {steps_sec:.3f}s · Pausas {pause_sec:.3f}s ({n_pause}) · "
-            f"Sin registrar {unreg:.3f}s · Metro: corte={self._fmt_mm(r.get('corte'))} "
-            f"en0={self._fmt_mm(r.get('en0'))} encL={self._fmt_mm(r.get('om_l'))} "
-            f"encR={self._fmt_mm(r.get('om_r'))}"
-        )
-        anomalies = self._timing_anomaly_lines(samples)
-        if anomalies:
-            block.extend(anomalies)
-        block.extend(["", ""])
-        self._timing_append_file(self._timing_detail_path, "\n".join(block))
-        if agg["pieces"] % TIMING_SUMMARY_EVERY_PIECES == 0:
-            self._timing_write_summary(final=False)
-
-    def _timing_log_piece(
-        self, rep: int, qty: int, samples: list[dict[str, Any]]
-    ) -> None:
-        """Resumen compacto en log de ciclo (ops físicas + delays)."""
-        highlight = (
-            "pf_trigger",
-            "feed_cmd",
-            "feed",
-            "lineal_cmd",
-            "lineal",
-            "corte",
-            "depósito_cmd",
-            "depósito",
-            "despeje_cmd",
-            "despeje",
-            "home_cmd",
-            "home",
-            "feed_next",
-        )
-        parts: list[str] = []
-        delay_sum = 0.0
-        by_name: dict[str, float] = {}
-        for s in samples:
-            name = str(s["name"])
-            sec = float(s["sec"])
-            by_name[name] = by_name.get(name, 0.0) + sec
-            if name.startswith("delay:"):
-                delay_sum += sec
-        for key in highlight:
-            if key in by_name:
-                parts.append(f"{key}={self._fmt_op(by_name[key])}")
-        for name, sec in by_name.items():
-            if name.startswith("wait_ack:"):
-                parts.append(f"{name}={self._fmt_op(sec)}")
-        for s in samples:
-            name = str(s["name"])
-            if name.startswith("gap:"):
-                parts.append(f"{name}={self._fmt_op(float(s['sec']))}")
-        if delay_sum > 0:
-            parts.append(f"delays={self._fmt_op(delay_sum)}")
-        if parts:
-            self._host.cycle_log(
-                f"Timing pieza {rep}/{qty}: " + " · ".join(parts)
-            )
-
-    @staticmethod
-    def _metro_pick(metro: list[dict[str, Any]], *tags: str) -> dict[str, Any] | None:
-        by_tag = {str(s.get("tag") or ""): s for s in metro}
-        for tag in tags:
-            if tag in by_tag:
-                return by_tag[tag]
-        return None
-
-    def _metro_log_readings(self, metro: list[dict[str, Any]]) -> dict[str, Any]:
-        """Corte, llegada a 0 y encoder de la pieza. Sin depósito ni delta."""
-        feed = self._metro_pick(
-            metro, "post-feed", "handoff", "c2-skip-feed", "start-skip-feed"
-        )
-        lin = self._metro_pick(metro, "post-lineal")
-        home = self._metro_pick(metro, "post-home")
-        enc = feed or lin
-        return {
-            "corte": None if lin is None else lin.get("asda"),
-            "en0": None if home is None else home.get("asda"),
-            "om_l": None if enc is None else enc.get("om_l"),
-            "om_r": None if enc is None else enc.get("om_r"),
-        }
-
-    @staticmethod
-    def _timing_anomaly_lines(samples: list[dict[str, Any]]) -> list[str]:
-        """Huecos muertos y delays que se pasaron de cfg. El resto no se lista."""
-        lines: list[str] = []
-        for s in samples:
-            name = str(s["name"])
-            sec = float(s["sec"])
-            if str(s.get("kind") or "") == "gap" or name.startswith("gap:"):
-                lines.append(f"- `{name}`: **{sec:.3f}s** ({CycleRunner._fmt_op(sec)})")
-                continue
-            if not name.startswith("delay:"):
-                continue
-            cfg_ms = s.get("cfg_ms")
-            if cfg_ms is None:
-                continue
-            overshoot_ms = (sec * 1000.0) - float(cfg_ms)
-            if overshoot_ms > TIMING_DELAY_OVERSHOOT_MS:
-                lines.append(
-                    f"- `{name}`: **{sec:.3f}s** "
-                    f"(cfg={int(cfg_ms)} ms, +{overshoot_ms:.0f} ms)"
-                )
-        return lines
-
-    def _timing_real_breakdown(self) -> dict[str, float]:
-        """Tiempo de pared del lote: total, prep (Start→pieza 1), piezas, cierre."""
-        meta = self._timing_lot_meta or {}
-        agg = self._timing_agg or {}
-        now = time.monotonic()
-        lot_t0 = float(meta.get("lot_t0") or now)
-        total = max(0.0, now - lot_t0)
-        first = agg.get("first_piece_start")
-        prep = max(0.0, float(first) - lot_t0) if first is not None else total
-        pieces_real = float(agg["real"][1]) if agg.get("real") else 0.0
-        tail = max(0.0, total - prep - pieces_real)
-        return {"total": total, "prep": prep, "pieces": pieces_real, "tail": tail}
-
-    def _timing_summary_lines(self, *, final: bool, ok: bool, ct_sec: float) -> list[str]:
-        meta = self._timing_lot_meta or {}
-        agg = self._timing_agg or {}
-        qty = int(meta.get("qty") or 0)
-        n = int(agg.get("pieces") or 0)
-        rb = self._timing_real_breakdown()
-        if not final:
-            ct_sec = float(agg["ct"][1]) if agg.get("ct") else 0.0
-        diff = max(0.0, rb["total"] - ct_sec)
-        events = list(self._timing_events)
-        pauses = [e for e in events if e.get("kind") == "pause"]
-        errors = [e for e in events if e.get("kind") != "pause"]
-        pause_sum = sum(float(e.get("sec") or 0.0) for e in pauses)
-        per_hour = (n / (rb["total"] / 3600.0)) if rb["total"] > 0 else 0.0
-        now_txt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        status = ("OK" if ok else "NO OK") if final else "EN CURSO"
-
-        lines = [
-            f"# Cycle timing — {meta.get('started', '')}",
-            "",
-            "## Resumen",
-            "",
-            f"- Resultado: **{status}**",
-            f"- Piezas: **{n}**" + (f" / {qty}" if qty > 0 else ""),
-            f"- Inicio: `{meta.get('started', '')}` · "
-            + (f"Fin: `{now_txt}`" if final else f"Actualizado: `{now_txt}`"),
-            f"- **Tiempo REAL** (reloj, Start → fin): **{rb['total']:.1f}s** "
-            f"({self._fmt_hms(rb['total'])})",
-            f"- **CT productivo** (sin pausas): **{ct_sec:.1f}s** "
-            f"({self._fmt_hms(ct_sec)})",
-            f"- Diferencia REAL − CT: **{diff:.1f}s** ({self._fmt_hms(diff)})",
-            f"  - Prep (Start → inicio pieza 1): {rb['prep']:.1f}s "
-            f"({self._fmt_hms(rb['prep'])})",
-            f"  - Pausas: {pause_sum:.1f}s ({self._fmt_hms(pause_sum)})",
-            f"  - Sin registrar entre pasos (comunicación / huecos / esperas no "
-            f"medidas): {float(agg.get('unreg_sum') or 0.0):.1f}s "
-            f"({self._fmt_hms(float(agg.get('unreg_sum') or 0.0))})",
-            f"  - Cierre (última pieza → fin): {rb['tail']:.1f}s",
-            f"- Piezas/hora (real): **{per_hour:.1f}**",
-            f"- CT pieza: {self._stat_txt(agg.get('ct') or [0, 0.0, None, None])}",
-            f"- Real pieza: {self._stat_txt(agg.get('real') or [0, 0.0, None, None])}",
-            f"- Pausas: **{len(pauses)}** · Errores/eventos: **{len(errors)}**",
-            f"- Longitud `{float(meta.get('length_mm') or 0):.1f}` mm · "
-            f"Cantidad `{qty}` · RPM `{float(meta.get('rpm') or 0):g}` · "
-            f"Lados `{meta.get('sides') or '—'}`",
-            "",
-            "CT = suma de tiempos de proceso sin pausas. REAL = reloj de pared: "
-            "incluye pausas, esperas, recovery y tiempo entre pasos no medido.",
-            "",
-            "## Errores y eventos (cronológico)",
-            "",
-        ]
-        if not errors:
-            lines += ["_Ninguno._", ""]
-        else:
-            lines += [
-                "| # | Hora | Pieza | Tipo | Código | Detalle |",
-                "|--:|:-----|------:|:-----|:-------|:--------|",
-            ]
-            for i, e in enumerate(errors, 1):
-                lines.append(
-                    f"| {i} | `{e['t_start'].strftime('%H:%M:%S')}` | "
-                    f"{e.get('rep') or '—'} | {e.get('kind')} | "
-                    f"{e.get('code') or '—'} | {e.get('note') or '—'} |"
-                )
-            lines.append("")
-            by_code: dict[str, int] = {}
-            for e in errors:
-                key = f"{e.get('kind')} · {e.get('code')}"
-                by_code[key] = by_code.get(key, 0) + 1
-            lines += ["### Conteo por tipo", ""]
-            for key, cnt in sorted(by_code.items(), key=lambda kv: (-kv[1], kv[0])):
-                lines.append(f"- {key}: **{cnt}**")
-            lines.append("")
-
-        lines += ["## Pausas (cronológico)", ""]
-        if not pauses:
-            lines += ["_Ninguna._", ""]
-        else:
-            lines += [
-                "| # | Inicio | Fin | Pieza | Motivo | Duración |",
-                "|--:|:-------|:----|------:|:-------|---------:|",
-            ]
-            for i, e in enumerate(pauses, 1):
-                sec = float(e.get("sec") or 0.0)
-                lines.append(
-                    f"| {i} | `{e['t_start'].strftime('%H:%M:%S')}` | "
-                    f"`{e['t_end'].strftime('%H:%M:%S')}` | {e.get('rep') or '—'} | "
-                    f"`{e.get('code')}` | {sec:.1f}s ({self._fmt_hms(sec)}) |"
-                )
-            lines.append("")
-            by_reason: dict[str, list[float]] = {}
-            for e in pauses:
-                by_reason.setdefault(str(e.get("code")), []).append(
-                    float(e.get("sec") or 0.0)
-                )
-            lines += ["### Pausas por motivo", ""]
-            for reason, vals in sorted(by_reason.items(), key=lambda kv: -sum(kv[1])):
-                lines.append(
-                    f"- `{reason}`: n={len(vals)} · total **{sum(vals):.1f}s** "
-                    f"({self._fmt_hms(sum(vals))}) · max {max(vals):.1f}s"
-                )
-            lines.append("")
-
-        metro_out = list(agg.get("metro_out") or [])
-        if metro_out:
-            lines += [
-                f"## Anomalías encoder (|valor| ≥ {TIMING_ENCODER_OUTLIER_MM:.0f} mm) "
-                f"— {int(agg.get('metro_out_n') or 0)}",
-                "",
-                "| Pieza | Corte | En 0 | Encoder L | Encoder R |",
-                "|------:|------:|-----:|----------:|----------:|",
-            ]
-            for rep, r in metro_out:
-                lines.append(
-                    f"| {rep} | {self._fmt_mm(r.get('corte'))} | "
-                    f"{self._fmt_mm(r.get('en0'))} | {self._fmt_mm(r.get('om_l'))} | "
-                    f"{self._fmt_mm(r.get('om_r'))} |"
-                )
-            lines.append("")
-
-        ops: dict[str, list[Any]] = agg.get("ops") or {}
-        if ops:
-            order = [k for k in TIMING_OP_ORDER if k in ops]
-            order += sorted(k for k in ops if k not in order)
-            lines += [
-                "## Tiempo por paso (lote)",
-                "",
-                "| Paso | avg | min | max | n |",
-                "|------|----:|----:|----:|--:|",
-            ]
-            for k in order:
-                st = ops[k]
-                cnt = int(st[0])
-                if cnt <= 0:
-                    continue
-                lines.append(
-                    f"| `{k}` | {st[1] / cnt:.3f} | {float(st[2]):.3f} | "
-                    f"{float(st[3]):.3f} | {cnt} |"
-                )
-            lines.append("")
-        return lines
-
-    def _timing_write_summary(self, *, final: bool, ok: bool = False, ct_sec: float = 0.0) -> None:
-        """Durante el lote: .md = solo resumen (índice/detalle en .tmp)."""
-        path = self._timing_md_path
-        if path is None:
-            return
-        try:
-            lines = self._timing_summary_lines(final=final, ok=ok, ct_sec=ct_sec)
-            lines += [
-                "_Lote en curso: el índice por pieza y el detalle de pasos se agregan "
-                "a este archivo al cerrar el lote._",
-                "",
-            ]
-            path.write_text("\n".join(lines), encoding="utf-8")
-        except Exception as exc:
-            self._host.cycle_log(f"Timing: error escribiendo resumen ({exc})")
-
-    def _timing_close_session(self, *, ok: bool, ct_sec: float) -> None:
-        """Escribe .md final: resumen + índice por pieza + detalle de pasos."""
-        path = self._timing_md_path
-        if path is None:
-            return
-        with self._lock:
-            self._sync_pause_exclusion_locked(time.monotonic())
-        if self._piece_timings:
-            self._timing_flush_piece(
-                max(1, int(self._rep or 1)),
-                max(1, int(self._total_reps or 1)),
-                0.0,
-            )
-        index_path = self._timing_index_path
-        detail_path = self._timing_detail_path
-        rb = self._timing_real_breakdown()
-        try:
-            lines = self._timing_summary_lines(final=True, ok=ok, ct_sec=ct_sec)
-            with path.open("w", encoding="utf-8") as out:
-                out.write("\n".join(lines) + "\n")
-                out.write(
-                    "## Índice por pieza\n\n"
-                    "Real = reloj entre fin de pieza anterior y fin de esta "
-                    "(incluye pausas). Sin registrar = Real − Pasos − Pausas.\n\n"
-                    "| Pieza | CT | Real | Pasos | Sin registrar | Pausas | "
-                    "T. pausa | Fallos | Hora fin |\n"
-                    "|------:|---:|-----:|------:|--------------:|-------:|"
-                    "---------:|-------:|:---------|\n"
-                )
-                if index_path is not None and index_path.exists():
-                    with index_path.open("r", encoding="utf-8") as src:
-                        shutil.copyfileobj(src, out)
-                out.write("\n## Detalle por pieza (pasos)\n\n")
-                if detail_path is not None and detail_path.exists():
-                    with detail_path.open("r", encoding="utf-8") as src:
-                        shutil.copyfileobj(src, out)
-                out.write(
-                    f"\n_Generado: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}_\n"
-                )
-            for tmp in (index_path, detail_path):
-                if tmp is not None:
-                    try:
-                        tmp.unlink()
-                    except OSError:
-                        pass
-            self._host.cycle_log(
-                f"Timing: guardado {path} · CT={ct_sec:.1f}s · "
-                f"Real={rb['total']:.1f}s ({self._fmt_hms(rb['total'])})"
-            )
-        except Exception as exc:
-            self._host.cycle_log(f"Timing: error cerrando .md ({exc})")
-        self._timing_md_path = None
-        self._timing_index_path = None
-        self._timing_detail_path = None
-        self._lot_timing_pieces = []
-        self._piece_timings = []
 
     # Acciones auxiliares: Motion, PLC, PreFeeder y depósito.
     def _validate_wip_start_mm(self, start_mm: float) -> bool:
@@ -3421,7 +2694,6 @@ class CycleRunner:
                 start_mm, rpm, prefetch_running=prefetch_running
             )
         sec = self._end_op(op, ok=ok)
-        self._metro_snap("post-home", target_mm=0.0)
         if ok:
             self._host.cycle_log(f"HOME/WIP total · {self._fmt_op(sec)}")
         return ok
@@ -4016,11 +3288,6 @@ class CycleRunner:
         cmd_op = self._begin_op("lineal_cmd")
         sent = self._host.cmd_motion_move_mm(abs_mm, self._lot_rpm)
         cmd_sec = self._end_op(cmd_op, ok=sent)
-        if cmd_sec >= TIMING_CMD_SLOW_S:
-            self._host.cycle_log(
-                f"Lineal MOVE TCP: ACK/cmd lento {self._fmt_op(cmd_sec)} "
-                f"(ciclo bloqueado esperando respuesta, no el avance)"
-            )
         if not sent:
             if not self._should_abort() and not self._fault:
                 kind = ""
@@ -4036,7 +3303,6 @@ class CycleRunner:
         # daría una pieza de largo incorrecto → la pieza se re-arranca.
         if not self._wait_motion(target_mm=abs_mm):
             self._end_op(op, ok=False)
-            self._metro_snap("post-lineal", target_mm=abs_mm)
             self._last_lineal_sec = 0.0
             self._last_lineal_mm = 0.0
             return False
@@ -4045,7 +3311,6 @@ class CycleRunner:
         sec = self._end_op(op, ok=True)
         self._last_lineal_sec = sec
         self._last_lineal_mm = abs_mm
-        self._metro_snap("post-lineal", target_mm=abs_mm)
         self._host.cycle_log(
             f"Lineal MOVE TCP OK targetAbsMm={abs_mm:.1f} rpm={self._lot_rpm:g}"
             f" · move={self._fmt_op(sec)} cmd={self._fmt_op(cmd_sec)}"
@@ -4220,7 +3485,6 @@ class CycleRunner:
         op = self._start_feed_operation(
             apply_piece_watch=False,
             timing_tag="feed_next",
-            metro_tag="post-feed-next",
             clear_motion_wait_flags=False,
             defer_wait_timing=True,
         )
@@ -4434,7 +3698,7 @@ class CycleRunner:
                 return False
             self._pf_trigger_prearmed_rep = next_rep
         return self._run_feed(
-            apply_piece_watch=False, timing_tag="feed_next", metro_tag="post-feed-next"
+            apply_piece_watch=False, timing_tag="feed_next"
         )
 
     def _run_feed(
@@ -4444,7 +3708,6 @@ class CycleRunner:
         feed_mm: float | None = None,
         apply_piece_watch: bool = True,
         timing_tag: str = "feed",
-        metro_tag: str = "post-feed",
         wait_timeout_s: float | None = None,
     ) -> bool:
         operation = self._start_feed_operation(
@@ -4452,7 +3715,6 @@ class CycleRunner:
             feed_mm=feed_mm,
             apply_piece_watch=apply_piece_watch,
             timing_tag=timing_tag,
-            metro_tag=metro_tag,
             wait_timeout_s=wait_timeout_s,
         )
         return operation is not None and self._finish_feed_operation(operation)
@@ -4464,7 +3726,6 @@ class CycleRunner:
         feed_mm: float | None = None,
         apply_piece_watch: bool = True,
         timing_tag: str = "feed",
-        metro_tag: str = "post-feed",
         wait_timeout_s: float | None = None,
         clear_motion_wait_flags: bool = True,
         defer_wait_timing: bool = False,
@@ -4496,11 +3757,6 @@ class CycleRunner:
             else ""
         )
         self._host.cycle_log(f"Feed start lados={''.join(sides)}{note}")
-        if cmd_sec >= TIMING_CMD_SLOW_S:
-            self._host.cycle_log(
-                f"Feed: cmd TCP lento {self._fmt_op(cmd_sec)} "
-                f"(ciclo bloqueado en send, no en el servo)"
-            )
         if failed:
             self._host.cycle_log(f"Feed: start falló lados={''.join(failed)}")
             self._raise_fault("feed_cmd")
@@ -4513,7 +3769,6 @@ class CycleRunner:
             "skip_validate": skip_validate,
             "apply_piece_watch": apply_piece_watch,
             "timing_tag": timing_tag,
-            "metro_tag": metro_tag,
             "wait_timeout_s": wait_timeout_s,
         }
 
@@ -4524,7 +3779,6 @@ class CycleRunner:
         sides = list(operation["sides"])
         skip_validate = bool(operation["skip_validate"])
         apply_piece_watch = bool(operation["apply_piece_watch"])
-        metro_tag = str(operation["metro_tag"])
         use_timeout = operation["wait_timeout_s"]
         if use_timeout is None and skip_validate:
             use_timeout = REFILL_LASER_TIMEOUT_S + 2.0
@@ -4534,10 +3788,8 @@ class CycleRunner:
             timeout_s=use_timeout,
         ):
             self._end_op(op, ok=False)
-            self._metro_snap(metro_tag)
             return False
         sec = self._end_op(op, ok=True)
-        self._metro_snap(metro_tag)
         if not skip_validate:
             # LengthOK incluye el relativo offL/offR en Motion (láser puede quedar OFF).
             self._material_feed_done = True
@@ -4801,6 +4053,19 @@ class CycleRunner:
             self._progress = 0
             self._step = 0
             self._parallel_group = ""
+        analysis_begin_lot(
+            {
+                "length_mm": 0,
+                "order_qty": 0,
+                "cycle_qty": 1,
+                "rpm": float(rpm),
+                "feed_sides": "—",
+                "pieces_per_rep": 1,
+                "mode": "refill",
+                "note": f"Refill material feed={float(feed_mm):g} mm "
+                f"ASDA={float(asda_mm):g} mm",
+            }
+        )
         self._host.cycle_notify()
         try:
             status = self._execute_refill_body(rpm, feed_mm, asda_mm)
@@ -4855,17 +4120,15 @@ class CycleRunner:
 
     def _mark_cutter_res(self) -> None:
         self._cutter_res_mono = time.monotonic()
+        self._pending_cut_resume = False
 
-    def _wait_ms_op(self, ms: int, op_name: str, log_txt: str) -> bool:
-        """Delay interno con timing. True = abort."""
+    def _wait_ms_op(self, ms: int, log_txt: str) -> bool:
+        """Delay interno. True = abort."""
         wait = max(0, int(ms))
         if wait <= 0:
             return self._should_abort()
         self._host.cycle_log(log_txt)
-        op = self._begin_op(op_name)
-        aborted = self._pausable_delay(wait)
-        self._end_op(op, ok=not aborted)
-        return aborted
+        return self._pausable_delay(wait)
 
     def _ensure_cutter_settled_before_travel(self) -> bool:
         """True = abort. El caller ya mandó OFF; aquí solo se completa el asiento."""
@@ -4883,7 +4146,6 @@ class CycleRunner:
         if remain > 0:
             return self._wait_ms_op(
                 remain,
-                "cutter_settle",
                 f"Asentamiento cortador: espera restante {remain} ms "
                 f"(mínimo {need_from_set_ms} ms desde Set)",
             )
@@ -4994,9 +4256,6 @@ class CycleRunner:
             "barrera ASDA=0 en feed_after_home"
         )
         try:
-            self._timing_open_session(
-                length_mm=length_mm, qty=qty, rpm=rpm
-            )
             if not self._prepare_before_cut():
                 self._finish(False)
                 return
@@ -5101,16 +4360,26 @@ class CycleRunner:
                             materialist_only = True
                             early_exit = True
                             break
-                        self._set_progress(rep, 0, qty)
-                        self._last_lineal_sec = 0.0
-                        self._last_lineal_mm = 0.0
-                        self._mark_piece_clock_start()
-                        self._timing_reset_piece()
-                        self._cutter_set_mono = None
-                        self._cutter_res_mono = None
-                        # Activa Holder y Encoder al iniciar o recuperar
+                        finish_cut_only = bool(
+                            self._recovery_skip_feed and self._pending_cut_resume
+                        )
                         recovery_restart = self._recovery_skip_feed
-                        if rep == 1 or recovery_restart:
+                        if not finish_cut_only:
+                            self._set_progress(rep, 0, qty)
+                            self._last_lineal_sec = 0.0
+                            self._last_lineal_mm = 0.0
+                            analysis_begin_piece(int(rep), int(qty))
+                            self._mark_piece_clock_start()
+                            self._cutter_set_mono = None
+                            self._cutter_res_mono = None
+                        else:
+                            self._host.cycle_log(
+                                "Recovery: completar corte (sin feed/lineal)"
+                            )
+                            target_mm = self._live_cut_target_mm()
+                            self._recovery_skip_feed = False
+                        # Activa Holder y Encoder al iniciar o recuperar
+                        if not finish_cut_only and (rep == 1 or recovery_restart):
                             if self._enter(rep, qty, "holder_on"):
                                 break
                             hold_op = self._begin_op("holder_on")
@@ -5154,185 +4423,206 @@ class CycleRunner:
                                 self._raise_fault("E066")
                                 break
                         # Verifica HOME antes de alimentar tras recovery
-                        if recovery_restart and not self._ensure_asda_at_zero(
-                            reason="recovery"
+                        if (
+                            not finish_cut_only
+                            and recovery_restart
+                            and not self._ensure_asda_at_zero(reason="recovery")
                         ):
                             break
-                        # Prepara PreFeeder
-                        if self._enter(rep, qty, "pf_trigger"):
-                            break
-                        will_run_feed = False
-                        if handoff_ready:
-                            pass
-                        elif self._material_feed_done and (
-                            self._recovery_skip_feed or self._recovery_after_error
-                        ):
-                            pass
-                        elif (
-                            (
-                                rep == 1
-                                or self._recovery_skip_feed
-                                or self._recovery_after_error
-                            )
-                            and self._feed_reference_visible()
-                        ):
-                            pass
-                        else:
-                            will_run_feed = True
-                        if self._pf_trigger_sent_this_piece:
-                            self._host.cycle_log(
-                                "trigger PreFeeder: omitido "
-                                "(ya mandado pre-feed / handoff)"
-                            )
-                        elif will_run_feed:
-                            if not self._do_pf_trigger(rep):
+                        if finish_cut_only:
+                            if self._enter(rep, qty, "grippers_on"):
                                 break
-                        else:
-                            self._host.cycle_log(
-                                "trigger PreFeeder: omitido "
-                                "(sin alimentación Motion en este paso)"
-                            )
-                        if self._after_step("pf_trigger"):
-                            break
-                        # Mueve feeder
-                        if self._enter(rep, qty, "feed"):
-                            break
-                        if handoff_ready:
-                            handoff_ready = False
-                            self._recovery_skip_feed = False
-                            self._material_feed_done = True
-                            self._metro_snap("handoff")
-                            self._host.cycle_log(
-                                "Feed: handoff (ya alimentado post-HOME, ASDA=0)"
-                            )
-                        elif self._material_feed_done and (
-                            self._recovery_skip_feed or self._recovery_after_error
-                        ):
-                            self._recovery_skip_feed = False
-                            sides_txt = "".join(self._feed_side_list())
-                            self._metro_snap("feed-done-skip")
-                            self._host.cycle_log(
-                                f"Feed omitido (ya alimentado+offset) lados={sides_txt}"
-                            )
-                        elif (
-                            (
-                                rep == 1
-                                or self._recovery_skip_feed
-                                or self._recovery_after_error
-                            )
-                            and self._feed_reference_visible()
-                        ):
-                            c2_or_rec = (
+                            grip_op = self._begin_op("grippers_on")
+                            grip_ok = self._host.cmd_plc_gripper(True)
+                            self._end_op(grip_op, ok=grip_ok)
+                            if not grip_ok:
+                                self._host.cycle_log("Pinzas ON: envío al PLC falló")
+                                self._raise_fault("E066")
+                                break
+                            self._host.cycle_log("Pinzas ON (recovery corte)")
+                            if self._after_step("grippers_on"):
+                                break
+                            if self._cycle_delay(rep, qty, "wait_grippers_on"):
+                                break
+                        if not finish_cut_only:
+                            # Prepara PreFeeder
+                            if self._enter(rep, qty, "pf_trigger"):
+                                break
+                            will_run_feed = False
+                            if handoff_ready:
+                                pass
+                            elif self._material_feed_done and (
                                 self._recovery_skip_feed or self._recovery_after_error
-                            )
-                            self._recovery_skip_feed = False
-                            self._material_feed_done = True
-                            sides_txt = "".join(self._feed_side_list())
-                            if c2_or_rec:
-                                self._metro_snap("c2-skip-feed")
-                                self._host.cycle_log(
-                                    f"Feed omitido (recovery/recovery): láser ya ON "
-                                    f"lados={sides_txt}"
+                            ):
+                                pass
+                            elif (
+                                (
+                                    rep == 1
+                                    or self._recovery_skip_feed
+                                    or self._recovery_after_error
                                 )
+                                and self._feed_reference_visible()
+                            ):
+                                pass
                             else:
-                                self._metro_snap("start-skip-feed")
+                                will_run_feed = True
+                            if self._pf_trigger_sent_this_piece:
                                 self._host.cycle_log(
-                                    f"Feed omitido (referencia láser visible) "
-                                    f"lados={sides_txt}"
+                                    "trigger PreFeeder: omitido "
+                                    "(ya mandado pre-feed / handoff)"
                                 )
-                        else:
-                            self._recovery_skip_feed = False
-                            if not self._run_feed():
+                            elif will_run_feed:
+                                if not self._do_pf_trigger(rep):
+                                    break
+                            else:
+                                self._host.cycle_log(
+                                    "trigger PreFeeder: omitido "
+                                    "(sin alimentación Motion en este paso)"
+                                )
+                            if self._after_step("pf_trigger"):
                                 break
-                        if self._after_step("feed"):
-                            break
-                        # Offset
-                        if self._enter(rep, qty, "offset"):
-                            break
-                        if self._after_step("offset"):
-                            break
-                        # Cierra pinzas
-                        if self._enter(rep, qty, "grippers_on"):
-                            break
-                        grip_op = self._begin_op("grippers_on")
-                        grip_ok = self._host.cmd_plc_gripper(True)
-                        self._end_op(grip_op, ok=grip_ok)
-                        if not grip_ok:
-                            self._host.cycle_log("Pinzas ON: envío al PLC falló")
-                            self._raise_fault("E066")
-                            break
-                        self._host.cycle_log("Pinzas ON (cierran)")
-                        if self._after_step("grippers_on"):
-                            break
-                        if self._cycle_delay(rep, qty, "wait_grippers_on"):
-                            break
-                        if self._enter(rep, qty, "enc_set0"):
-                            break
-                        self._host.cycle_log("enc_set0: omitido (lineal TCP no usa OM)")
-                        if self._after_step("enc_set0"):
-                            break
-                        # Abre Holder y Encoder para avanzar el material
-                        if self._enter(rep, qty, "holder_off"):
-                            break
-                        hold_off_op = self._begin_op("holder_off")
-                        need_holder_ack = (
-                            self._host.plc_valve_is_on(CMD_HOLDER) is not False
-                        )
-                        need_encoder_ack = (
-                            self._host.plc_valve_is_on(CMD_ENCODER) is not False
-                        )
-                        ack_seq = self._host.plc_ack_seq()
-                        open_ok = self._open_holder_encoder()
-                        self._end_op(hold_off_op, ok=open_ok)
-                        if not open_ok:
+                            # Mueve feeder
+                            if self._enter(rep, qty, "feed"):
+                                break
+                            if handoff_ready:
+                                handoff_ready = False
+                                self._recovery_skip_feed = False
+                                self._material_feed_done = True
+                                self._host.cycle_log(
+                                    "Feed: handoff (ya alimentado post-HOME, ASDA=0)"
+                                )
+                            elif self._material_feed_done and (
+                                self._recovery_skip_feed or self._recovery_after_error
+                            ):
+                                self._recovery_skip_feed = False
+                                sides_txt = "".join(self._feed_side_list())
+                                self._host.cycle_log(
+                                    f"Feed omitido (ya alimentado+offset) lados={sides_txt}"
+                                )
+                            elif (
+                                (
+                                    rep == 1
+                                    or self._recovery_skip_feed
+                                    or self._recovery_after_error
+                                )
+                                and self._feed_reference_visible()
+                            ):
+                                c2_or_rec = (
+                                    self._recovery_skip_feed or self._recovery_after_error
+                                )
+                                self._recovery_skip_feed = False
+                                self._material_feed_done = True
+                                sides_txt = "".join(self._feed_side_list())
+                                if c2_or_rec:
+                                    self._host.cycle_log(
+                                        f"Feed omitido (recovery/recovery): láser ya ON "
+                                        f"lados={sides_txt}"
+                                    )
+                                else:
+                                    self._host.cycle_log(
+                                        f"Feed omitido (referencia láser visible) "
+                                        f"lados={sides_txt}"
+                                    )
+                            else:
+                                self._recovery_skip_feed = False
+                                if not self._run_feed():
+                                    break
+                            if self._after_step("feed"):
+                                break
+                            # Offset
+                            if self._enter(rep, qty, "offset"):
+                                break
+                            if self._after_step("offset"):
+                                break
+                            # Cierra pinzas
+                            if self._enter(rep, qty, "grippers_on"):
+                                break
+                            grip_op = self._begin_op("grippers_on")
+                            grip_ok = self._host.cmd_plc_gripper(True)
+                            self._end_op(grip_op, ok=grip_ok)
+                            if not grip_ok:
+                                self._host.cycle_log("Pinzas ON: envío al PLC falló")
+                                self._raise_fault("E066")
+                                break
+                            self._host.cycle_log("Pinzas ON (cierran)")
+                            if self._after_step("grippers_on"):
+                                break
+                            if self._cycle_delay(rep, qty, "wait_grippers_on"):
+                                break
+                            if self._enter(rep, qty, "enc_set0"):
+                                break
                             self._host.cycle_log(
-                                "Holder+Encoder OFF: envío al PLC falló"
+                                "enc_set0: omitido (lineal TCP no usa OM)"
                             )
-                            self._raise_fault("E066")
-                            break
-                        self._host.cycle_log(
-                            "Holder+Encoder OFF (abren para lineal)"
-                        )
-                        if self._after_step("holder_off"):
-                            break
-                        if self._cycle_delay(rep, qty, "wait_holder_open"):
-                            break
-                        ack_bytes = self._plc_ack_bytes_for_holder_encoder(
-                            need_holder_ack, need_encoder_ack
-                        )
-                        if ack_bytes and (
-                            self._wait_plc_acks_timed(
-                                "holder_encoder_open_before_lineal",
-                                ack_bytes,
-                                ack_seq,
-                                PLC_ACK_TIMEOUT_S,
+                            if self._after_step("enc_set0"):
+                                break
+                            # Abre Holder y Encoder para avanzar el material
+                            if self._enter(rep, qty, "holder_off"):
+                                break
+                            hold_off_op = self._begin_op("holder_off")
+                            need_holder_ack = (
+                                self._host.plc_valve_is_on(CMD_HOLDER) is not False
                             )
-                            is not True
-                        ):
+                            need_encoder_ack = (
+                                self._host.plc_valve_is_on(CMD_ENCODER) is not False
+                            )
+                            ack_seq = self._host.plc_ack_seq()
+                            open_ok = self._open_holder_encoder()
+                            self._end_op(hold_off_op, ok=open_ok)
+                            if not open_ok:
+                                self._host.cycle_log(
+                                    "Holder+Encoder OFF: envío al PLC falló"
+                                )
+                                self._raise_fault("E066")
+                                break
                             self._host.cycle_log(
-                                "Lineal sin Holder/Encoder abierto: el PLC no confirmó"
+                                "Holder+Encoder OFF (abren para lineal)"
                             )
-                            self._raise_fault("E066")
-                            break
+                            if self._after_step("holder_off"):
+                                break
+                            if self._cycle_delay(rep, qty, "wait_holder_open"):
+                                break
+                            ack_bytes = self._plc_ack_bytes_for_holder_encoder(
+                                need_holder_ack, need_encoder_ack
+                            )
+                            if ack_bytes and (
+                                self._wait_plc_acks_timed(
+                                    "holder_encoder_open_before_lineal",
+                                    ack_bytes,
+                                    ack_seq,
+                                    PLC_ACK_TIMEOUT_S,
+                                )
+                                is not True
+                            ):
+                                self._host.cycle_log(
+                                    "Lineal sin Holder/Encoder abierto: el PLC no confirmó"
+                                )
+                                self._raise_fault("E066")
+                                break
 
-                        if self._enter(rep, qty, "lineal_fwd"):
-                            break
-                        # Avanza material a la posición de corte
-                        target_mm = self._live_cut_target_mm()
-                        abs_target_mm = abs(float(target_mm))
-                        cut_off = abs_target_mm - abs(float(self._lot_length_mm))
-                        sides = CycleConfig.normalize_feed_sides(self.get_config().feed_sides)
-                        self._host.cycle_log(
-                            f"Lineal MOVE TCP modelMm={length_mm:.1f} "
-                            f"cutOffset={cut_off:.1f}→targetAbsMm={abs_target_mm:.1f} "
-                            f"sides={sides} rpm={self._lot_rpm:g}"
-                        )
-                        if not self._run_lineal_abs(abs_target_mm):
-                            break
-                        if self._after_step("lineal_fwd"):
-                            break
-                        if self._cycle_delay(rep, qty, "wait_linear_done"):
-                            break
+                            if self._enter(rep, qty, "lineal_fwd"):
+                                break
+                            # Avanza material a la posición de corte
+                            target_mm = self._live_cut_target_mm()
+                            abs_target_mm = abs(float(target_mm))
+                            cut_off = abs_target_mm - abs(
+                                float(self._lot_length_mm)
+                            )
+                            sides = CycleConfig.normalize_feed_sides(
+                                self.get_config().feed_sides
+                            )
+                            self._host.cycle_log(
+                                f"Lineal MOVE TCP modelMm={length_mm:.1f} "
+                                f"cutOffset={cut_off:.1f}→targetAbsMm={abs_target_mm:.1f} "
+                                f"sides={sides} rpm={self._lot_rpm:g}"
+                            )
+                            if not self._run_lineal_abs(abs_target_mm):
+                                break
+                            if self._after_step("lineal_fwd"):
+                                break
+                            if self._cycle_delay(rep, qty, "wait_linear_done"):
+                                break
+                            self._pending_cut_resume = True
                         # Cierra Holder y Encoder antes del corte
                         if self._enter(rep, qty, "holder_precut"):
                             break
@@ -5464,10 +4754,6 @@ class CycleRunner:
                             dep_cmd = self._begin_op("depósito_cmd")
                             dep_sent = self._host.cmd_motion_move_mm(deposit_target, rpm)
                             dep_cmd_sec = self._end_op(dep_cmd, ok=dep_sent)
-                            if dep_cmd_sec >= TIMING_CMD_SLOW_S:
-                                self._host.cycle_log(
-                                    f"Depósito MOVE: ACK/cmd lento {self._fmt_op(dep_cmd_sec)}"
-                                )
                             if not dep_sent:
                                 if not self._should_abort() and not self._fault:
                                     kind = ""
@@ -5486,14 +4772,10 @@ class CycleRunner:
                                 ),
                             ):
                                 self._end_op(dep_op, ok=False)
-                                self._metro_snap(
-                                    "post-depósito", target_mm=deposit_target
-                                )
                                 break
                             wip_pos_signed = float(deposit_target)
                             wip_start_mm = abs(wip_pos_signed)
                             dep_sec = self._end_op(dep_op, ok=True)
-                            self._metro_snap("post-depósito", target_mm=deposit_target)
                             self._host.cycle_log(
                                 f"Depósito MOVE ok → {deposit_target:.1f} mm "
                                 f"(WIP start ref {wip_start_mm:.1f})"
@@ -5556,10 +4838,6 @@ class CycleRunner:
                             clr_cmd = self._begin_op("despeje_cmd")
                             clr_sent = self._host.cmd_motion_move_mm(clearance_target, rpm)
                             clr_cmd_sec = self._end_op(clr_cmd, ok=clr_sent)
-                            if clr_cmd_sec >= TIMING_CMD_SLOW_S:
-                                self._host.cycle_log(
-                                    f"Despeje MOVE: ACK/cmd lento {self._fmt_op(clr_cmd_sec)}"
-                                )
                             if not clr_sent:
                                 if not self._should_abort() and not self._fault:
                                     kind = ""
@@ -5718,6 +4996,7 @@ class CycleRunner:
         self._lot_purge_request = None
         self._suspend_piece_watch = False
         self._recovery_skip_feed = False
+        self._pending_cut_resume = False
         self._material_feed_done = False
         self._recovery_skip_pf_trigger = False
         self._pf_tfeed_resume = {}
@@ -5769,6 +5048,9 @@ class CycleRunner:
             if not (self._aborted or self._stop.is_set()) and self._use_prefeeder():
                 self._pf_idle_for_hold("fin de lote" if ok else "post-error")
         elapsed = 0.0
+        pieces_done = 0
+        cycle_qty = 0
+        lot_fault = ""
         with self._lock:
             # CT productivo: congelado en última Pieza OK. Si abort mid-pieza, corta ya.
             if self._cycle_t0 is not None:
@@ -5785,6 +5067,9 @@ class CycleRunner:
                 self._piece_t0 = None
             else:
                 elapsed = float(self._finished_elapsed)
+            pieces_done = int(self._pieces_done)
+            cycle_qty = int(self._total_reps)
+            lot_fault = str(self._fault or "")
             self._started_at = None
             self._active = False
             self._refill_mode = False
@@ -5801,11 +5086,13 @@ class CycleRunner:
                     self._progress,
                     int(min(100, round(100.0 * self._pieces_done / total))),
                 )
-        # Cierra .md de timing (lote productivo; refill no abre sesión).
-        real_sec = 0.0
-        if not refill and self._timing_md_path is not None:
-            real_sec = self._timing_real_breakdown()["total"]
-            self._timing_close_session(ok=ok, ct_sec=elapsed)
+        analysis_end_lot(
+            ok=ok and not soft_cancel,
+            ct_sec=elapsed,
+            pieces_done=pieces_done,
+            cycle_qty=max(1, cycle_qty),
+            fault=lot_fault,
+        )
         if self._aborted or self._stop.is_set():
             self._set_state(TX_STOP, self._fault or "aborted")
         elif soft_cancel:
@@ -5823,11 +5110,6 @@ class CycleRunner:
                 )
             else:
                 ct_txt = f" · CT={elapsed:.1f}s" if elapsed > 0 else ""
-                real_txt = (
-                    f" · Real={real_sec:.1f}s ({self._fmt_hms(real_sec)})"
-                    if real_sec > 0
-                    else ""
-                )
                 self._host.cycle_log(
                     (
                         f"Lote completado — "
@@ -5837,7 +5119,6 @@ class CycleRunner:
                         else f"Lote completado — {self._total_reps}/{self._total_reps} piezas"
                     )
                     + ct_txt
-                    + real_txt
                 )
             # Tras FinishParts: Idle máquina (PF ya Idle por In process OFF).
             self._set_state(TX_IDLE)
