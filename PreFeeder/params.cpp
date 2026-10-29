@@ -7,17 +7,14 @@ static void clampF(float& v, float lo, float hi) {
 
 void paramsValidate(Params& p) {
   clampF(p.dereelerRpm, RPM_MIN, RPM_MAX);
-  clampF(p.reverseSec, 0.1f, 60.0f);
   clampF(p.feederRpm, RPM_MIN, RPM_MAX);
   clampF(p.triggerFeedS, 0.1f, 60.0f);
-  clampF(p.tensionReverseRpm, RPM_MIN, RPM_MAX);
-  clampF(p.tensionCooldownS, 0.0f, 60.0f);
-  clampF(p.tensionFaultS, 1.0f, 60.0f);
   clampF(p.bufferFillTimeoutS, 1.0f, 120.0f);
   clampF(p.midBoostRpm, RPM_MIN, RPM_MAX);
   clampF(p.midBoostSec, 0.1f, 60.0f);
   clampF(p.highBoostRpm, RPM_MIN, RPM_MAX);
   clampF(p.highBoostSec, 0.1f, 60.0f);
+  clampF(p.highReverseSec, 0.1f, 60.0f);
   clampF(p.holguraOnFeedSec, 0.1f, 120.0f);
   clampF(p.holguraOffFaultSec, 0.5f, 300.0f);
   if (p.holguraSettleMs < HOLGURA_SETTLE_MS_MIN) p.holguraSettleMs = HOLGURA_SETTLE_MS_MIN;
@@ -36,12 +33,8 @@ void paramsLoad(Params& p) {
   Preferences prefs;
   if (!prefs.begin(PREFS_NS, true)) return;
   p.dereelerRpm = prefs.getFloat("dr_rpm", 60.0f);
-  p.reverseSec = prefs.getFloat("auto_rev", 2.0f);
   p.feederRpm = prefs.getFloat("fd_rpm", 60.0f);
   p.triggerFeedS = prefs.getFloat("trig_s", 2.0f);
-  p.tensionReverseRpm = prefs.getFloat("t_rev", 30.0f);
-  p.tensionCooldownS = prefs.getFloat("t_cd", 0.0f);
-  p.tensionFaultS = prefs.getFloat("t_fault", 10.0f);
   p.bufferFillTimeoutS = prefs.getFloat("buf_to", 10.0f);
   p.servoActiveUs = (uint16_t)prefs.getUInt("servo_us", PF_SERVO_ACTIVE_US);
   p.refillPulseMs = prefs.getUInt("refill_ms", 1000);
@@ -50,6 +43,7 @@ void paramsLoad(Params& p) {
   p.midServoDeltaUs = (int16_t)prefs.getInt("mid_dus", (int)(PF_SERVO_SPEED_SIGN * 100));
   p.highBoostRpm = prefs.getFloat("hi_rpm", 180.0f);
   p.highBoostSec = prefs.getFloat("hi_s", 5.0f);
+  p.highReverseSec = prefs.getFloat("hi_rev_s", 3.0f);
   p.highServoDeltaUs = (int16_t)prefs.getInt("hi_dus", (int)(PF_SERVO_SPEED_SIGN * 200));
   p.holguraSettleMs = (uint16_t)prefs.getUInt("holg_set_ms", HOLGURA_SETTLE_MS_DEFAULT);
   p.holguraOnFeedSec = prefs.getFloat("holg_on_s", 2.0f);
@@ -65,12 +59,8 @@ void paramsSave(const Params& p) {
   Preferences prefs;
   if (!prefs.begin(PREFS_NS, false)) return;
   prefs.putFloat("dr_rpm", copy.dereelerRpm);
-  prefs.putFloat("auto_rev", copy.reverseSec);
   prefs.putFloat("fd_rpm", copy.feederRpm);
   prefs.putFloat("trig_s", copy.triggerFeedS);
-  prefs.putFloat("t_rev", copy.tensionReverseRpm);
-  prefs.putFloat("t_cd", copy.tensionCooldownS);
-  prefs.putFloat("t_fault", copy.tensionFaultS);
   prefs.putFloat("buf_to", copy.bufferFillTimeoutS);
   prefs.putUInt("servo_us", copy.servoActiveUs);
   prefs.putUInt("refill_ms", copy.refillPulseMs);
@@ -79,6 +69,7 @@ void paramsSave(const Params& p) {
   prefs.putInt("mid_dus", copy.midServoDeltaUs);
   prefs.putFloat("hi_rpm", copy.highBoostRpm);
   prefs.putFloat("hi_s", copy.highBoostSec);
+  prefs.putFloat("hi_rev_s", copy.highReverseSec);
   prefs.putInt("hi_dus", copy.highServoDeltaUs);
   prefs.putUInt("holg_set_ms", copy.holguraSettleMs);
   prefs.putFloat("holg_on_s", copy.holguraOnFeedSec);
@@ -104,10 +95,6 @@ bool paramsApplyFromQuery(const String& query, Params& p, bool saveIfTouched) {
     p.dereelerRpm = v.toFloat();
     touched = true;
   }
-  if (hasArg(query, "reverse", v)) {
-    p.reverseSec = v.toFloat();
-    touched = true;
-  }
   if (hasArg(query, "m2_rpm", v)) {
     p.feederRpm = v.toFloat();
     touched = true;
@@ -117,21 +104,6 @@ bool paramsApplyFromQuery(const String& query, Params& p, bool saveIfTouched) {
   }
   if (hasArg(query, "trigger_feed_s", v)) {
     p.triggerFeedS = v.toFloat();
-    touched = true;
-  }
-  if (hasArg(query, "tension_reverse_rpm", v)) {
-    p.tensionReverseRpm = v.toFloat();
-    touched = true;
-  }
-  if (hasArg(query, "tension_cooldown", v)) {
-    p.tensionCooldownS = v.toFloat();
-    touched = true;
-  }
-  if (hasArg(query, "tension_fault_s", v)) {
-    p.tensionFaultS = v.toFloat();
-    touched = true;
-  } else if (hasArg(query, "tension_fault", v)) {
-    p.tensionFaultS = v.toFloat();
     touched = true;
   }
   if (hasArg(query, "buffer_refill_fault_s", v)) {
@@ -163,6 +135,10 @@ bool paramsApplyFromQuery(const String& query, Params& p, bool saveIfTouched) {
   }
   if (hasArg(query, "high_boost_s", v)) {
     p.highBoostSec = v.toFloat();
+    touched = true;
+  }
+  if (hasArg(query, "high_reverse_s", v)) {
+    p.highReverseSec = v.toFloat();
     touched = true;
   }
   if (hasArg(query, "high_servo_delta_us", v)) {

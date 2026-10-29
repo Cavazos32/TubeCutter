@@ -64,7 +64,6 @@ static void sensorsInitPins() {
   pinMode(PIN_BUF_MID, INPUT);
   pinMode(PIN_BUF_HIGH, INPUT);
   pinMode(PIN_BUF_MAX, INPUT_PULLUP);
-  pinMode(PIN_TENSION, INPUT_PULLUP);
   pinMode(PIN_CYLINDER, INPUT_PULLDOWN);
   pinMode(PIN_HOSE, INPUT_PULLUP);
   pinMode(PIN_HOLGURA, INPUT_PULLUP);
@@ -76,7 +75,7 @@ static bool holguraSensorRawOn() {
 
 static bool holguraOkStable() { return holguraStableOn; }
 
-// Lee GPIO de buffer, tensión, cilindro, manguera; filtra estabilidad GPIO19 (full)
+// Lee GPIO de buffer, cilindro, manguera; filtra estabilidad GPIO19 (full)
 static void sensorsUpdate(uint32_t nowMs) {
   static uint32_t lastMs = 0;
   uint32_t dt = lastMs ? (nowMs - lastMs) : 0;
@@ -86,7 +85,6 @@ static void sensorsUpdate(uint32_t nowMs) {
   gSnap.bufMidRaw = digitalRead(PIN_BUF_MID) == HIGH;
   gSnap.bufHighRaw = digitalRead(PIN_BUF_HIGH) == HIGH;
   gSnap.bufMaxRaw = digitalRead(PIN_BUF_MAX) == HIGH;
-  gSnap.tensionRaw = digitalRead(PIN_TENSION) == HIGH;
   gSnap.cylinderOpen = digitalRead(PIN_CYLINDER) == HIGH;
   gSnap.hoseAbsent = digitalRead(PIN_HOSE) == HIGH;
 
@@ -161,7 +159,7 @@ static void motorBrakeIfRunning(StepperRMT* m, float& commanded) {
 static bool outputIntentEqual(const OutputIntent& a, const OutputIntent& b) {
   return a.mode == b.mode && fabsf(a.feederRpm - b.feederRpm) <= 0.25f
          && fabsf(a.dereelerRpm - b.dereelerRpm) <= 0.25f
-         && a.tensionReverse == b.tensionReverse && a.servoRun == b.servoRun
+         && a.dereelerReverse == b.dereelerReverse && a.servoRun == b.servoRun
          && a.servoExtraUs == b.servoExtraUs;
 }
 
@@ -214,7 +212,7 @@ static void applyIntent(const OutputIntent& in) {
     case OUT_AUTO: {
       motorFeederTarget(in.feederRpm);
       if (in.dereelerRpm > 0.5f)
-        motorDereelerTarget(in.dereelerRpm, in.tensionReverse);
+        motorDereelerTarget(in.dereelerRpm, in.dereelerReverse);
       else
         motorDereelerTarget(0.0f, false);
       if (in.servoRun) servoMotionUs(in.servoExtraUs);
@@ -315,15 +313,14 @@ static uint16_t doneTriggerIds[8] = {};
 static uint8_t doneTriggerCount = 0;
 
 static uint32_t bufferEmptySinceMs = 0;
-static uint32_t tensionHighSinceMs = 0;
-static uint32_t tensionReverseUntilMs = 0;
-static bool tensionReverseActive = false;
 
 static bool refillMat = false, refillDr = false, refillSv = false, refillFd = false;
 static uint32_t refillPulseUntil[4] = {};
 static uint32_t midBoostUntil = 0, highBoostUntil = 0;
 static bool lastMid = false, lastHigh = false;
 static bool highReverseActive = false;
+static uint32_t highReverseUntilMs = 0;
+static bool highReverseCanArm = true;
 static bool midPassedBeforeHigh = false;
 
 static bool triggerIdDone(uint16_t id) {
@@ -452,10 +449,10 @@ static void stopAutoOutputs() {
   stopFeederDemand();
   midBoostUntil = highBoostUntil = 0;
   highReverseActive = false;
+  highReverseUntilMs = 0;
+  highReverseCanArm = true;
   midPassedBeforeHigh = false;
   bufferEmptySinceMs = 0;
-  tensionReverseActive = false;
-  tensionHighSinceMs = 0;
   OutputIntent o;
   outputsSetIntent(o);
   motorOutputsAllStop();
@@ -502,10 +499,8 @@ static void syncOutputs() {
 
   const bool bufOn = bufferWantsFill();
   if (bufOn) {  // mueve DeReeler + servo mientras buffer no lleno estable
-    const bool reverse = tensionReverseActive || highReverseActive;
-    float rpm = tensionReverseActive ? P->tensionReverseRpm : boostDereelerRpm(P->dereelerRpm);
-    o.dereelerRpm = rpm;
-    o.tensionReverse = reverse;
+    o.dereelerRpm = boostDereelerRpm(P->dereelerRpm);
+    o.dereelerReverse = highReverseActive;
     o.servoRun = true;
     o.servoExtraUs = boostServoDelta();
   } else {  // buffer lleno estable → para DeReeler y servo
@@ -539,62 +534,44 @@ static void serviceFeederDemand(uint32_t nowMs) {
     serviceHolguraFeed(nowMs);
 }
 
-// Secuencia física: paso por MID (flanco), luego más tarde HIGH (flanco); no exigen ambos ON a la vez.
-// Latch midPassedBeforeHigh en flanco MID; HIGH↑ invierte solo si hubo MID↑ antes en este relleno.
-// Apaga inversión: MID ON y HIGH OFF (bajando desde alta hacia banda media).
+// Secuencia física: MID↑ luego HIGH↑ → DeReeler CCW durante high_reverse_s o hasta buffer full estable.
+// No rearmar otro pulso invertido hasta que HIGH haya estado OFF.
 static void serviceBoostEdges(uint32_t nowMs) {
   if (!P) return;
   if (!bufferWantsFill()) {
     highReverseActive = false;
+    highReverseUntilMs = 0;
+    highReverseCanArm = true;
     midPassedBeforeHigh = false;
     lastMid = gSnap.bufMidRaw;
     lastHigh = gSnap.bufHighRaw;
     return;
   }
+  if (!gSnap.bufHighRaw)
+    highReverseCanArm = true;
   if (gSnap.bufHighRaw && !lastHigh) {
     highBoostUntil = nowMs + (uint32_t)(P->highBoostSec * 1000.0f);
-    if (midPassedBeforeHigh) {
+    if (midPassedBeforeHigh && highReverseCanArm && !highReverseActive) {
       highReverseActive = true;
+      highReverseUntilMs = nowMs + (uint32_t)(P->highReverseSec * 1000.0f);
       midPassedBeforeHigh = false;
+      highReverseCanArm = false;
     }
   }
   if (gSnap.bufMidRaw && !lastMid) {
     midBoostUntil = nowMs + (uint32_t)(P->midBoostSec * 1000.0f);
     midPassedBeforeHigh = true;
   }
-  // Nivel por debajo de alta con media activa → fin inversión por alta
-  if (highReverseActive && gSnap.bufMidRaw && !gSnap.bufHighRaw)
-    highReverseActive = false;
+  if (highReverseActive) {
+    const bool timerDone = highReverseUntilMs
+                           && (int32_t)(nowMs - highReverseUntilMs) >= 0;
+    if (gSnap.bufFullStable || timerDone) {
+      highReverseActive = false;
+      highReverseUntilMs = 0;
+    }
+  }
   lastMid = gSnap.bufMidRaw;
   lastHigh = gSnap.bufHighRaw;
-}
-
-// GPIO tensión: invierte DeReeler reverse_sec; falla si tensión > tension_fault_s
-static void serviceTension(uint32_t nowMs) {
-  if (!bufferWantsFill()) {
-    tensionReverseActive = false;
-    tensionHighSinceMs = 0;
-    return;
-  }
-  if (gSnap.tensionRaw) {
-    if (!tensionHighSinceMs) tensionHighSinceMs = nowMs;
-    const uint32_t held = nowMs - tensionHighSinceMs;
-    if (held >= (uint32_t)(P->tensionFaultS * 1000.0f)) {
-      enterFault(FAULT_TENSION);
-      return;
-    }
-    if (held >= 50 && !tensionReverseActive) {
-      tensionReverseActive = true;  // mueve DeReeler en CCW durante reverse_s
-      tensionReverseUntilMs = nowMs + (uint32_t)(P->reverseSec * 1000.0f);
-    }
-  } else {
-    tensionHighSinceMs = 0;
-  }
-  if (tensionReverseActive && tensionReverseUntilMs
-      && (int32_t)(nowMs - tensionReverseUntilMs) >= 0) {
-    tensionReverseActive = false;
-    tensionReverseUntilMs = 0;
-  }
 }
 
 // Espera buffer_refill_fault_s sin ver GPIO19 estable lleno → falla timeout
@@ -771,8 +748,7 @@ void machineTick(uint32_t nowMs) {
     } else if (!feederDemand && !holguraOkStable() && !holguraPostCycleOffWatch)
       beginHolguraFeed(nowMs);
     serviceFeederDemand(nowMs);
-    serviceBoostEdges(nowMs);     // impulsos mid/high
-    serviceTension(nowMs);        // inversión / falla tensión
+    serviceBoostEdges(nowMs);     // impulsos mid/high + inversión temporizada
     serviceBufferTimeout(nowMs);  // espera llenado buffer
   }
 
@@ -915,8 +891,6 @@ static String buildPeerStatus(const MachineStatus& c, const SensorSnapshot& s) {
   j += s.bufHighRaw ? "true" : "false";
   j += ",\"endstop\":";
   j += s.bufMaxRaw ? "true" : "false";
-  j += ",\"tension\":";
-  j += s.tensionRaw ? "true" : "false";
   j += ",\"cylinderOpen\":";
   j += s.cylinderOpen ? "true" : "false";
   j += ",\"hoseAbsent\":";
@@ -993,16 +967,8 @@ static void sendStatusJson(bool paramsSaved = false) {
   json += c.autoEnabled ? "true" : "false";
   json += ",\"rpm\":";
   appendJsonFloat(json, P->dereelerRpm);
-  json += ",\"reverse_s\":";
-  appendJsonFloat(json, P->reverseSec);
   json += ",\"servo_pwm_us\":";
   json += String(P->servoActiveUs);
-  json += ",\"tension_reverse_rpm\":";
-  appendJsonFloat(json, P->tensionReverseRpm);
-  json += ",\"tension_cooldown_s\":";
-  appendJsonFloat(json, P->tensionCooldownS);
-  json += ",\"tension_fault_s\":";
-  appendJsonFloat(json, P->tensionFaultS);
   json += ",\"buffer_refill_fault_s\":";
   appendJsonFloat(json, P->bufferFillTimeoutS);
   json += ",\"mid_boost_rpm\":";
@@ -1015,6 +981,8 @@ static void sendStatusJson(bool paramsSaved = false) {
   appendJsonFloat(json, P->highBoostRpm);
   json += ",\"high_boost_s\":";
   appendJsonFloat(json, P->highBoostSec);
+  json += ",\"high_reverse_s\":";
+  appendJsonFloat(json, P->highReverseSec);
   json += ",\"high_servo_delta_us\":";
   json += String((int)P->highServoDeltaUs);
   json += "},\"trigger2\":{\"trigger_feed_s\":";
@@ -1048,8 +1016,6 @@ static void sendStatusJson(bool paramsSaved = false) {
   json += s.bufHighRaw ? "true" : "false";
   json += ",\"max\":";
   json += s.bufMaxRaw ? "true" : "false";
-  json += ",\"tension\":";
-  json += s.tensionRaw ? "true" : "false";
   json += ",\"cylinder\":";
   json += s.cylinderOpen ? "true" : "false";
   json += ",\"hose\":";

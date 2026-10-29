@@ -126,7 +126,6 @@ input[type=number]{width:100%;padding:8px 10px;border-radius:6px;border:1px soli
 <div class="srow"><div class="led" id="led-mid"></div><span class="stitle">GPIO 34 · Media altura</span><span class="badge" id="bdg-mid">OFF</span></div>
 <div class="srow"><div class="led" id="led-high"></div><span class="stitle">GPIO 35 · Alta</span><span class="badge" id="bdg-high">OFF</span></div>
 <div class="srow"><div class="led err" id="led-max"></div><span class="stitle">GPIO 21 · Buffer max</span><span class="badge" id="bdg-max">OFF</span></div>
-<div class="srow"><div class="led warn" id="led-tension"></div><span class="stitle">GPIO 23 · Tensión</span><span class="badge" id="bdg-tension">OFF</span></div>
 <div class="srow"><div class="led err" id="led-cyl"></div><span class="stitle">GPIO 25 · Cilindro</span><span class="badge" id="bdg-cyl">OFF</span></div>
 <div class="srow"><div class="led err" id="led-hose"></div><span class="stitle">GPIO 27 · Manguera</span><span class="badge" id="bdg-hose">OFF</span></div>
 <div class="srow"><div class="led" id="led-holg"></div><span class="stitle">GPIO 22 · Holgura</span><span class="badge" id="bdg-holg">OFF</span></div>
@@ -142,6 +141,9 @@ input[type=number]{width:100%;padding:8px 10px;border-radius:6px;border:1px soli
 <h3>Impulso alta (GPIO 35)</h3>
 <div class="f2"><div><label>RPM boost</label><input id="hi_rpm" type="number"></div><div><label>Duración (s)</label><input id="hi_s" type="number" step="0.1"></div></div>
 <label>Servo Δµs</label><input id="hi_dus" type="number" step="10">
+<h3>Inversión desatorar (MID↑ luego HIGH↑)</h3>
+<p class="note">DeReeler en CCW durante este tiempo o hasta buffer full estable; no repite hasta que HIGH quede OFF.</p>
+<label>Duración inversión (s)</label><input id="hi_rev" type="number" min="0.1" max="60" step="0.1">
 <button type="button" class="btn-save" id="saveDer">Guardar DeReeler</button>
 </section>
 </div>
@@ -174,24 +176,12 @@ input[type=number]{width:100%;padding:8px 10px;border-radius:6px;border:1px soli
 <p class="note">Durante relleno de buffer el servo queda en marcha continua (mismo PWM + delta de boost).</p>
 <button type="button" class="btn-save" id="saveServo">Guardar Servo</button>
 </section>
-<section class="card">
-<h2>Inversión por tensión</h2>
-<div class="f2">
-<div><label>Duración inversión (s)</label><input id="reverse" type="number" min="0.1" max="60" step="0.1"></div>
-<div><label>RPM inversión</label><input id="t_rev" type="number" min="1" max="600" step="1"></div>
-</div>
-<div class="f2">
-<div><label>Cooldown (s)</label><input id="t_cd" type="number" min="0" max="60" step="0.1"></div>
-<div><label>Fallo tensión (s)</label><input id="t_fault" type="number" min="1" max="60" step="0.1"></div>
-</div>
-<button type="button" class="btn-save" id="saveTension">Guardar tensión</button>
-</section>
 </div>
 </div>
 </div>
 <script>
 function q(id){return document.getElementById(id)}
-var FAULTS={0:"",1:"Buffer max",2:"Tensión",3:"Cilindro",4:"Manguera",5:"Timeout buffer",6:"Holgura",7:"Operador"};
+var FAULTS={0:"",1:"Buffer max",2:"(legacy)",3:"Cilindro",4:"Manguera",5:"Timeout buffer",6:"Holgura",7:"Operador"};
 function setLed(el,bdg,on,warn,err){
   el.className="led"+(warn?" warn":"")+(err?" err":"")+(on?" on":"");
   bdg.className="badge"+(warn?" warn":"")+(err?" err":"")+(on?" on":"");
@@ -239,11 +229,11 @@ function sync(j,opt){
   var a=j.auto||{},t=j.trigger2||{},r=j.refill||{},s=j.sensors||{},h=j.home||{},act=j.actuators||{};
   q('side-tag').textContent=j.side||"—";
   if(force){
-    setInp('rpm',a.rpm);setInp('reverse',a.reverse_s);setInp('buf_to',a.buffer_refill_fault_s);
-    setInp('t_rev',a.tension_reverse_rpm);setInp('t_cd',a.tension_cooldown_s);setInp('t_fault',a.tension_fault_s);
+    setInp('rpm',a.rpm);setInp('buf_to',a.buffer_refill_fault_s);
     setInp('servo',a.servo_pwm_us);
     setInp('mid_rpm',a.mid_boost_rpm);setInp('mid_s',a.mid_boost_s);setInp('mid_dus',a.mid_servo_delta_us);
     setInp('hi_rpm',a.high_boost_rpm);setInp('hi_s',a.high_boost_s);setInp('hi_dus',a.high_servo_delta_us);
+    setInp('hi_rev',a.high_reverse_s);
     setInp('m2',t.m2_rpm);setInp('trig',t.trigger_feed_s);
     setInp('holg_set',t.holgura_settle_ms);setInp('holg_on',t.holgura_on_s);setInp('holg_off',t.holgura_off_fault_s);
     setChk('tfeed_en',t.hmi_tfeed_enabled!==false);
@@ -257,7 +247,6 @@ function sync(j,opt){
   setLed(q('led-mid'),q('bdg-mid'),!!s.mid);
   setLed(q('led-high'),q('bdg-high'),!!s.high);
   setLed(q('led-max'),q('bdg-max'),!!s.max,false,true);
-  setLed(q('led-tension'),q('bdg-tension'),!!s.tension,true);
   setLed(q('led-cyl'),q('bdg-cyl'),!!s.cylinder,false,true);
   setLed(q('led-hose'),q('bdg-hose'),!!s.hose,false,true);
   setLed(q('led-holg'),q('bdg-holg'),!!s.holgura);
@@ -293,9 +282,8 @@ function cfg(u,btn){
     .catch(function(){btnSaveFeedback(btn,false);});
 }
 function pull(){fetch('/api/status',{cache:'no-store'}).then(function(r){if(!r.ok)throw new Error('http');return r.json()}).then(function(j){sync(j,_formReady?{}:{forceForm:true});_formReady=true;}).catch(function(){if(Date.now()>=_bannerFlashUntil)setStatusBanner('Sin conexión con el equipo','err');})}
-q('saveDer').onclick=function(){cfg('/api/config?rpm='+enc(q('rpm').value)+'&mid_boost_rpm='+enc(q('mid_rpm').value)+'&mid_boost_s='+enc(q('mid_s').value)+'&mid_servo_delta_us='+enc(q('mid_dus').value)+'&high_boost_rpm='+enc(q('hi_rpm').value)+'&high_boost_s='+enc(q('hi_s').value)+'&high_servo_delta_us='+enc(q('hi_dus').value),this)};
+q('saveDer').onclick=function(){cfg('/api/config?rpm='+enc(q('rpm').value)+'&mid_boost_rpm='+enc(q('mid_rpm').value)+'&mid_boost_s='+enc(q('mid_s').value)+'&mid_servo_delta_us='+enc(q('mid_dus').value)+'&high_boost_rpm='+enc(q('hi_rpm').value)+'&high_boost_s='+enc(q('hi_s').value)+'&high_servo_delta_us='+enc(q('hi_dus').value)+'&high_reverse_s='+enc(q('hi_rev').value),this)};
 q('saveServo').onclick=function(){cfg('/api/config?servo_pwm_us='+enc(q('servo').value),this)};
-q('saveTension').onclick=function(){cfg('/api/config?reverse='+enc(q('reverse').value)+'&tension_reverse_rpm='+enc(q('t_rev').value)+'&tension_cooldown='+enc(q('t_cd').value)+'&tension_fault_s='+enc(q('t_fault').value),this)};
 q('saveSys').onclick=function(){cfg('/api/config?buffer_refill_fault_s='+enc(q('buf_to').value),this)};
 q('saveFeed').onclick=function(){
   cfg('/api/config?m2_rpm='+enc(q('m2').value)+'&trigger_feed_s='+enc(q('trig').value)+'&holgura_settle_ms='+enc(q('holg_set').value)+'&holgura_on_s='+enc(q('holg_on').value)+'&holgura_off_fault_s='+enc(q('holg_off').value)+'&hmi_tfeed_enabled='+(q('tfeed_en').checked?'1':'0'),this);
