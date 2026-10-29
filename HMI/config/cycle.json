@@ -1,7 +1,7 @@
 {
   "andonBuzzerMute": true,
   "debugPassword": "tcm2026",
-  "maintenanceCycleCount": 1091,
+  "maintenanceCycleCount": 1550,
   "checklistRequired": false,
   "checklistLastCompletedAt": "2026-10-27T16:54:51Z",
   "checklistSession": null,
@@ -19,7 +19,7 @@
   "dwellAtDestMs": 20,
   "feedSides": "LR",
   "feedWaitTimeoutS": 15.0,
-  "gripperClearanceMm": 10.0,
+  "gripperClearanceMm": 20.0,
   "gripperReleaseMs": 20,
   "grippersOnMs": 20,
   "holderOnMs": 25,
