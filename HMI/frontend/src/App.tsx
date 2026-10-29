@@ -375,6 +375,7 @@ function AppMain() {
             onSetZeroL={hmi.encSetZeroL}
             onTestCanL={hmi.feedL}
             onTestCanR={hmi.feedR}
+            onFeedCanInit={hmi.feedCanInit}
             onSaveFeedOffset={(l, r) => hmi.saveFeedOffset(l, r)}
             onReloadFeedOffset={() => {
               void hmi.reloadFeedOffset();

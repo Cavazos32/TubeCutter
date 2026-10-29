@@ -14,7 +14,7 @@ from pathlib import Path
 from flask import Flask, Response, jsonify, request, send_from_directory
 from waitress import serve
 
-from state import get_state
+from core.state import get_state
 
 HMI_ROOT = Path(__file__).resolve().parent
 FRONTEND_DIR = HMI_ROOT / "frontend"

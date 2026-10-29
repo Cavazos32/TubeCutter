@@ -50,6 +50,7 @@ interface MotionTabProps {
   onSetZeroL: () => void;
   onTestCanL: () => void;
   onTestCanR: () => void;
+  onFeedCanInit: () => void;
   onSaveFeedOffset: (l: number, r: number) => void;
   onReloadFeedOffset: () => void;
   showLogs?: boolean;
@@ -74,6 +75,7 @@ export const MotionTab: React.FC<MotionTabProps> = ({
   onSetZeroL,
   onTestCanL,
   onTestCanR,
+  onFeedCanInit,
   onSaveFeedOffset,
   onReloadFeedOffset,
   showLogs = true,
@@ -201,6 +203,19 @@ export const MotionTab: React.FC<MotionTabProps> = ({
       : motionState.isMoving
         ? 'moving'
         : 'ready';
+
+  const canInitActive =
+    motionState.canInitPending || motionState.canInitBusy;
+  const canStatusLabel = canInitActive
+    ? t('can_servo_init')
+    : motionState.servoCanReady
+      ? t('can_servo_ready')
+      : t('can_servo_off');
+  const canStatusClass = canInitActive
+    ? 'border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-100'
+    : motionState.servoCanReady
+      ? 'border-emerald-300 bg-emerald-50 text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-100'
+      : 'border-slate-300 bg-slate-50 text-slate-700 dark:border-slate-700 dark:bg-slate-800/60 dark:text-slate-300';
 
   return (
     <div className="space-y-4">
@@ -516,6 +531,26 @@ export const MotionTab: React.FC<MotionTabProps> = ({
                   />
                 </div>
               </div>
+            </div>
+
+            <div className={`${hmiModuleBtnGroup} mt-3 !gap-2`}>
+              <button
+                type="button"
+                id="btn-can-init-motion"
+                onClick={onFeedCanInit}
+                disabled={canInitActive || motionState.isMoving}
+                className={hmiModuleBtnSecondary}
+                title={t('btn_can_init_hint')}
+              >
+                <span>{t('btn_can_init')}</span>
+              </button>
+              <span
+                className={`inline-flex items-center rounded-md border px-2.5 py-2 text-xs font-semibold uppercase tracking-wide ${canStatusClass} ${
+                  canInitActive ? 'animate-pulse' : ''
+                }`}
+              >
+                {canStatusLabel}
+              </span>
             </div>
 
             <div className={`${hmiModuleBtnGroup} mt-3 !gap-2`}>

@@ -21,16 +21,8 @@ const AppContext = createContext<AppContextType | undefined>(undefined);
 const DEBUG_MODE_KEY = 'tcm_hmi_debug_mode';
 
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [isDarkMode, setIsDarkModeState] = useState<boolean>(() => {
-    try {
-      const saved = localStorage.getItem('tcm_hmi_theme');
-      if (saved === 'dark') return true;
-      if (saved === 'light') return false;
-      return window.matchMedia('(prefers-color-scheme: dark)').matches;
-    } catch {
-      return false;
-    }
-  });
+  // HMI de planta: siempre tema claro (no seguir Windows ni preferencia guardada).
+  const [isDarkMode, setIsDarkModeState] = useState<boolean>(false);
 
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
 

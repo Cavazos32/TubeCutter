@@ -424,6 +424,14 @@ class ChecklistManager:
             append_checklist_history(history_row)
         except OSError:
             self._log("Checklist: no se pudo escribir historial")
+        total = len(STEP_IDS)
+        if hasattr(host, "append_checklist_register"):
+            host.append_checklist_register(
+                str(emp),
+                self._last_completed_at or _utc_now_iso(),
+                total,
+                total,
+            )
         self._log(f"Checklist: completado (empleado {emp})")
         self.clear_step_error()
         self._notify()

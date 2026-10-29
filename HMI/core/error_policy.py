@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from error_catalog import format_ui, lookup
+from .error_catalog import format_ui, lookup
 
 
 @dataclass

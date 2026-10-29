@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
-from tcp_link import ModuleTcpClient
+from core.tcp_link import ModuleTcpClient
 
 # --- Comandos maestro → PreFeeder Master (0x2A–0x2C, 0x3F, 0x4C, 0x51) ---
 CMD_START = 0x2A
@@ -58,7 +58,7 @@ TX_PF_ERROR = 0x3C
 TX_PF_STOP = 0x3D
 TX_PF_RETURN = 0x3E
 
-from error_catalog import ERROR_LABELS  # EXXX: Module, Descripción (E052–E063, E069)
+from core.error_catalog import ERROR_LABELS  # EXXX: Module, Descripción (E052–E063, E069)
 
 STATE_LABELS = {
     TX_PF_INIT: "Init (0x039)",
@@ -88,7 +88,8 @@ class PreFeederClient(ModuleTcpClient):
         super().__init__(DEFAULT_HOST, DEFAULT_PORT, on_message, on_connection)
 
     def _send_probe(self) -> bool:
-        return self.cmd_byte(TX_PF_IDLE)
+        # Keepalive de enlace (igual Motion/PLC); no mandar byte de estado cada 5 s.
+        return self.send_command(command="ping")
 
     def cmd_byte(self, byte_code: int, **extra: Any) -> bool:
         return self.send_command(byte=byte_code, **extra)

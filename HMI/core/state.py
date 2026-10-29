@@ -12,9 +12,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-HMI_ROOT = Path(__file__).resolve().parent
+HMI_ROOT = Path(__file__).resolve().parent.parent
 
-from checklist import ChecklistManager
+from clients.checklist import ChecklistManager
 from checklist_history import (
     append_checklist_history,
     read_checklist_history,
@@ -25,9 +25,9 @@ from cycle_analysis_log import (
     is_lot_active,
     record_event as analysis_record_event,
 )
-PLC_CONFIG_PATH = HMI_ROOT / "config" / "plc_config.json"
-APP_CONFIG_PATH = HMI_ROOT / "config" / "app_config.json"
-DEFAULT_BLOWER_SEC = 2.0
+MODEL_PATH = HMI_ROOT / "config" / "model.json"
+REGISTER_PATH = HMI_ROOT / "config" / "register.json"
+DEFAULT_BLOWER_SEC = 0.2
 
 
 DEFAULT_ANDON_BUZZER_MUTE = False
@@ -52,8 +52,15 @@ class _PendingAsdaAck:
     ok: bool | None = None
     message: str = ""
 
-from cycle import CycleConfig, CycleRunner, PROGRESS_STEPS
-from motion import (
+from cycle import (
+    CONFIG_PATH,
+    CycleConfig,
+    CycleRunner,
+    PROGRESS_STEPS,
+    read_app_config_section,
+    save_app_config_section,
+)
+from clients.motion import (
     CMD_ENC_MEASURE_L,
     CMD_ENC_MEASURE_R,
     CMD_ENC_SET0_L,
@@ -96,7 +103,7 @@ from motion import (
     motion_http_get_feed_offset,
     motion_http_set_feed_offset,
 )
-from plc import (
+from clients.plc import (
     CMD_BLOWER,
     CMD_CUTTER_L,
     CMD_CUTTER_R,
@@ -122,8 +129,8 @@ from plc import (
     TX_PLC_RETURN,
     TX_PLC_STOP,
 )
-from tcp_link import CONNECT_TIMEOUT, VERIFY_TIMEOUT_SEC, ModuleTcpClient
-from prefeeder import (
+from .tcp_link import CONNECT_TIMEOUT, VERIFY_TIMEOUT_SEC, ModuleTcpClient
+from clients.prefeeder import (
     CMD_MATERIALIST,
     CMD_RESET as PF_CMD_RESET,
     CMD_START as PF_CMD_START,
@@ -148,9 +155,9 @@ from prefeeder import (
     TX_PF_RETURN,
     TX_PF_STOP,
 )
-from error_catalog import format_ui, lookup
-from error_policy import ErrorPolicy
-from andon import AndonClient, DEFAULT_HOST as ANDON_HOST, DEFAULT_PORT as ANDON_PORT
+from .error_catalog import format_ui, lookup
+from .error_policy import ErrorPolicy
+from clients.andon import AndonClient, DEFAULT_HOST as ANDON_HOST, DEFAULT_PORT as ANDON_PORT
 from machine_states import (
     MACH_BUSY,
     MACH_ERROR,
@@ -160,10 +167,11 @@ from machine_states import (
     STATE_LABELS,
     andon_tower_outputs,
 )
-MODELS_PATH = HMI_ROOT / "config" / "models.json"
 MAX_LOG_LINES = 400
 # No latchear E065–E067 en microcortes WiFi; solo si el enlace sigue caído.
 LINK_DOWN_CONFIRM_SEC = 8.0
+# UI: no apagar LED de enlace en microcortes TCP/handshake (ms).
+LINK_UI_HOLD_SEC = 3.0
 # Error latch is cleared only by explicit RESET after source validation.
 # Arranque ASDA: el MCU puede estar arriba antes que la fuente del drive.
 # Sonda = ack del propio Servo ON (0x04): si el ASDA no está alimentado, el
@@ -311,6 +319,9 @@ class HmiState:
             "enc_l": "—",
             "feedOffsetMmL": 0.0,
             "feedOffsetMmR": 0.0,
+            "servoCanReady": False,
+            "canInitPending": False,
+            "canInitBusy": False,
             "laserR": False,
             "laserL": False,
             "safetyExhaust": False,
@@ -341,6 +352,8 @@ class HmiState:
             log_fn=lambda msg: _append_log(self._main_log, msg),
             notify_fn=self._on_checklist_changed,
         )
+        self._register_entries: list[dict[str, Any]] = []
+        self._load_register()
         self._load_app_config()
         self._andon = {
             "connected": False,
@@ -465,8 +478,15 @@ class HmiState:
         self._error_policy = ErrorPolicy()
         self._cycle = CycleRunner(self)
         self._cycle.set_machine_state_hook(self._broadcast_machine_state)
+        self.sync_plc_blower_from_cycle()
         # Histéresis enlace: gen+1 cancela timer pendiente al recuperar.
         self._link_down_gen = {"motion": 0, "plc": 0, "prefeeder": 0}
+        self._link_last_ok_mono: dict[str, float] = {
+            "motion": 0.0,
+            "plc": 0.0,
+            "prefeeder": 0.0,
+            "andon": 0.0,
+        }
         # Prep ASDA tras Motion Init/Idle: Servo ON → Home (una vez por enlace TCP).
         self._motion_boot_prep_done = False
         self._motion_boot_prep_gen = 0
@@ -488,9 +508,17 @@ class HmiState:
         self._notify_thread.start()
         self._client.start_background()
         self._plc_client.start_background()
-        self._pf_client.start_background()
+        # Escalonar PreFeeder: evita pico WiFi al arrancar con Motion/PLC a la vez.
+        self._pf_start_timer = threading.Timer(2.0, self._pf_client.start_background)
+        self._pf_start_timer.daemon = True
+        self._pf_start_timer.start()
+        self._andon_start_timer: threading.Timer | None = None
         if os.environ.get("ANDON_ENABLE", "1") == "1":
-            self._andon_client.start_background()
+            self._andon_start_timer = threading.Timer(
+                3.0, self._andon_client.start_background
+            )
+            self._andon_start_timer.daemon = True
+            self._andon_start_timer.start()
         self._cycle.mark_init_done()
 
     def stop(self) -> None:
@@ -499,6 +527,12 @@ class HmiState:
         self._notify_event.set()
         if self._cycle.is_active():
             self._cycle.request_stop()
+        t = getattr(self, "_pf_start_timer", None)
+        if t is not None:
+            t.cancel()
+        t = getattr(self, "_andon_start_timer", None)
+        if t is not None:
+            t.cancel()
         self._client.stop_background()
         self._plc_client.stop_background()
         self._pf_client.stop_background()
@@ -599,22 +633,33 @@ class HmiState:
                 "resumeEnabled": resume,
                 "cycle": cycle_snap,
                 "motionLink": {
-                    "connected": self.motion_connected(),
+                    "connected": self._link_ui_connected(
+                        "motion", self.motion_connected()
+                    ),
                     "host": DEFAULT_HOST,
                     "port": DEFAULT_PORT,
                 },
                 "plcLink": {
-                    "connected": self.plc_connected(),
+                    "connected": self._link_ui_connected(
+                        "plc", self.plc_connected()
+                    ),
                     "host": PLC_HOST,
                     "port": PLC_PORT,
                 },
                 "pfLink": {
-                    "connected": self.pf_connected(),
+                    "connected": self._link_ui_connected(
+                        "prefeeder", self.pf_connected()
+                    ),
                     "host": PF_HOST,
                     "port": PF_PORT,
                 },
                 "andonLink": {
-                    "connected": self._andon["connected"],
+                    "connected": self._link_ui_connected(
+                        "andon",
+                        self._andon_client.connected
+                        if os.environ.get("ANDON_ENABLE", "1") == "1"
+                        else False,
+                    ),
                     "host": ANDON_HOST,
                     "port": ANDON_PORT,
                 },
@@ -661,15 +706,78 @@ class HmiState:
 
     def _load_models(self) -> None:
         self._models = []
-        if MODELS_PATH.exists():
+        if MODEL_PATH.is_file():
             try:
-                data = json.loads(MODELS_PATH.read_text(encoding="utf-8"))
+                data = json.loads(MODEL_PATH.read_text(encoding="utf-8"))
                 self._models = list(data.get("models", []))
             except (json.JSONDecodeError, OSError) as exc:
-                _append_log(self._main_log, f"models.json: {exc}")
+                _append_log(self._main_log, f"model.json: {exc}")
         if not self._models:
             self._models = [{"name": "Default", "mm": -45.0, "rpm": 1200.0}]
         self._apply_model(0)
+
+    def _load_register(self) -> None:
+        self._register_entries = []
+        if not REGISTER_PATH.is_file():
+            return
+        try:
+            data = json.loads(REGISTER_PATH.read_text(encoding="utf-8"))
+            raw = data.get("entries") if isinstance(data, dict) else data
+            if isinstance(raw, list):
+                self._register_entries = [
+                    dict(e) for e in raw if isinstance(e, dict)
+                ]
+        except (json.JSONDecodeError, OSError, TypeError, ValueError):
+            pass
+
+    def _save_register(self) -> None:
+        try:
+            REGISTER_PATH.parent.mkdir(parents=True, exist_ok=True)
+            REGISTER_PATH.write_text(
+                json.dumps(
+                    {"entries": self._register_entries},
+                    indent=2,
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    def append_checklist_register(
+        self,
+        employee_id: str,
+        completed_at: str,
+        steps_ok: int,
+        steps_total: int,
+    ) -> None:
+        total = max(1, int(steps_total))
+        ok = max(0, min(int(steps_ok), total))
+        entry = {
+            "employeeId": str(employee_id).strip(),
+            "date": str(completed_at),
+            "stepsOk": ok,
+            "stepsTotal": total,
+            "score": f"{ok}/{total}",
+        }
+        with self._lock:
+            self._register_entries.append(entry)
+        self._save_register()
+        _append_log(
+            self._main_log,
+            f"Registro checklist: {entry['employeeId']} {entry['date']} {entry['score']}",
+        )
+
+    def sync_plc_blower_from_cycle(self) -> None:
+        try:
+            sec = float(self._cycle.get_config().plc_blower_sec)
+        except (AttributeError, TypeError, ValueError):
+            sec = DEFAULT_BLOWER_SEC
+        sec = max(0.2, min(300.0, sec))
+        with self._lock:
+            self._plc["blowerSec"] = sec
+        self._notify()
 
     def _apply_model(self, idx: int) -> None:
         if not self._models:
@@ -751,6 +859,17 @@ class HmiState:
 
     def motion_connected(self) -> bool:
         return self._client.connected
+
+    def _link_ui_connected(self, key: str, tcp_ok: bool) -> bool:
+        """Histéresis para LEDs de enlace (handshake/reconnect no parpadean)."""
+        now = time.monotonic()
+        if tcp_ok:
+            self._link_last_ok_mono[key] = now
+            return True
+        last = self._link_last_ok_mono.get(key, 0.0)
+        if last and (now - last) < LINK_UI_HOLD_SEC:
+            return True
+        return False
 
     def plc_connected(self) -> bool:
         return self._plc_client.connected
@@ -1059,7 +1178,7 @@ class HmiState:
         """Iniciar alimentador (Máquina): Start + en proceso hasta Buffer Full."""
         if not self.pf_connected():
             return {"ok": False, "error": "Sin enlace PreFeeder"}
-        if self._cycle.is_active():
+        if self._cycle.operator_pf_start_blocked():
             return {
                 "ok": False,
                 "error": "Hay un lote en curso — usa Iniciar de proceso",
@@ -1495,6 +1614,9 @@ class HmiState:
             self._motion_idle_or_reached.clear()
             sent = self._client.cmd_move_mm(mm, rpm)
             if not sent:
+                time.sleep(0.08)
+                sent = self._client.cmd_move_mm(mm, rpm)
+            if not sent:
                 self.cycle_log(
                     f"CMD_MOVE: fallo de transporte send "
                     f"(intento {attempt}/{MOTION_MOVE_TX_ATTEMPTS}) — recuperando…"
@@ -1828,11 +1950,13 @@ class HmiState:
 
     def set_cycle_config(self, data: dict) -> dict:
         cfg = self._cycle.update_config(data)
+        self.sync_plc_blower_from_cycle()
         self._notify()
         return cfg.to_dict()
 
     def reload_cycle_config(self) -> dict:
         cfg = self._cycle.reload_config()
+        self.sync_plc_blower_from_cycle()
         with self._lock:
             _append_log(self._main_log, "Cycle config recargada")
         self._notify()
@@ -2228,9 +2352,9 @@ class HmiState:
 
     def _load_app_config(self) -> None:
         try:
-            if not APP_CONFIG_PATH.is_file():
+            data = read_app_config_section(CONFIG_PATH)
+            if not data:
                 return
-            data = json.loads(APP_CONFIG_PATH.read_text(encoding="utf-8"))
             if "andonBuzzerMute" in data:
                 self._andon_buzzer_mute = bool(data["andonBuzzerMute"])
             if "debugPassword" in data and str(data["debugPassword"]).strip():
@@ -2248,22 +2372,16 @@ class HmiState:
 
     def _save_app_config(self) -> None:
         try:
-            APP_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
             merged = {
                 "andonBuzzerMute": self._andon_buzzer_mute,
                 "debugPassword": self._debug_password,
                 "maintenanceCycleCount": self._maintenance_cycle_count,
             }
             merged.update(self._checklist.export_to_config())
-            APP_CONFIG_PATH.write_text(
-                json.dumps(
-                    merged,
-                    indent=2,
-                    ensure_ascii=False,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
+            cycle_dict: dict[str, Any] | None = None
+            if getattr(self, "_cycle", None) is not None:
+                cycle_dict = self._cycle.get_config().to_dict()
+            save_app_config_section(merged, cycle_dict, CONFIG_PATH)
         except Exception:
             pass
 
@@ -2517,6 +2635,7 @@ class HmiState:
             "enc_set0_l": lambda: self._client.cmd_enc_set0_l(),
             "feed_l": lambda: self.cmd_motion_feed_l(),
             "feed_r": lambda: self.cmd_motion_feed_r(),
+            "feed_can_init": lambda: self.cmd_motion_feed_can_init(),
             "motion_reset": lambda: self._client.cmd_reset_errors(),
         }
         fn = handlers.get(action)
@@ -2564,33 +2683,37 @@ class HmiState:
                 _append_log(self._motion_log, pending)
                 self._set_motion_status(pending, "info")
             self._notify()
+        if action == "feed_can_init":
+            if ok:
+                with self._lock:
+                    _append_log(self._motion_log, "Init CAN encolado…")
+                    self._set_motion_status("Init CAN encolado…", "info")
+                    self._motion["canInitPending"] = True
+                self._notify()
+                threading.Thread(
+                    target=self._feed_can_init_watch,
+                    daemon=True,
+                    name="feed-can-init-watch",
+                ).start()
+            else:
+                with self._lock:
+                    err = (
+                        str(self._stage2_fault or "").strip()
+                        or "Init CAN rechazado (máquina ocupada o ya en curso)"
+                    )
+                    _append_log(self._motion_log, err)
+                    self._set_motion_status(err, "error")
+                self._notify()
         return {"ok": ok}
 
     def _load_plc_config(self) -> None:
-        try:
-            if not PLC_CONFIG_PATH.is_file():
-                return
-            data = json.loads(PLC_CONFIG_PATH.read_text(encoding="utf-8"))
-            sec = float(data.get("blowerSec", DEFAULT_BLOWER_SEC))
-            self._plc["blowerSec"] = max(0.2, min(300.0, sec))
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            self._plc["blowerSec"] = DEFAULT_BLOWER_SEC
-
-    def _save_plc_config(self) -> None:
-        try:
-            PLC_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            PLC_CONFIG_PATH.write_text(
-                json.dumps({"blowerSec": self._plc["blowerSec"]}, indent=2) + "\n",
-                encoding="utf-8",
-            )
-        except OSError:
-            pass
+        """Duración soplo PLC por defecto: DEFAULT_BLOWER_SEC en state.py."""
+        self._plc["blowerSec"] = DEFAULT_BLOWER_SEC
 
     def set_blower_sec(self, sec: float) -> float:
         sec = max(0.2, min(300.0, float(sec)))
         with self._lock:
             self._plc["blowerSec"] = sec
-            self._save_plc_config()
         self._notify()
         return sec
 
@@ -2916,7 +3039,7 @@ class HmiState:
                 pass
         if "pressure" in msg:
             self._andon["pressure"] = bool(msg.get("pressure"))
-        # Mute: preferencia HMI (app_config). No pisar con status Andon
+        # Mute: preferencia HMI (cycle.json). No pisar con status Andon
         # (RAM volatile; race al conectar dejaba UI en mute y buzzer sonando).
         if "mute" in msg and bool(msg.get("mute")) != bool(self._andon_buzzer_mute):
             self._andon_mute_resync = True
@@ -3075,6 +3198,59 @@ class HmiState:
     def _apply_feed_offset_values(self, offset_l: float, offset_r: float) -> None:
         self._motion["feedOffsetMmL"] = clamp_feed_offset_mm(offset_l)
         self._motion["feedOffsetMmR"] = clamp_feed_offset_mm(offset_r)
+
+    def refresh_feed_can_status(self) -> None:
+        """Lee /api/feed/status en Motion (bus CAN alimentador)."""
+        with self._lock:
+            connected = bool(self._motion.get("connected"))
+        if not connected:
+            return
+        host = getattr(self._client, "_host", DEFAULT_HOST)
+        try:
+            st = motion_http_feed_status(host=str(host))
+        except Exception:  # noqa: BLE001 — Motion ocupado o HTTP caído
+            return
+        with self._lock:
+            self._motion["servoCanReady"] = bool(st.get("servoCanReady"))
+            self._motion["canInitPending"] = bool(st.get("canInitPending"))
+            self._motion["canInitBusy"] = bool(st.get("canInitBusy"))
+        self._notify()
+
+    def _feed_can_init_watch(self) -> None:
+        """Tras encolar Init CAN desde la HMI, espera resultado y actualiza UI."""
+        outcome: list[str] = []
+
+        def waiter() -> None:
+            outcome.append(self.wait_feed_can_ready(90.0))
+
+        t = threading.Thread(
+            target=waiter, daemon=True, name="feed-can-init-wait"
+        )
+        t.start()
+        while t.is_alive():
+            self.refresh_feed_can_status()
+            time.sleep(0.35)
+        t.join(timeout=0.5)
+        result = outcome[0] if outcome else "timeout"
+        self.refresh_feed_can_status()
+        with self._lock:
+            if result == "ok":
+                msg = "Init CAN: servo listo"
+                kind = "ok"
+            elif result == "ng":
+                msg = (
+                    str(self._stage2_fault or "").strip()
+                    or "Init CAN: el servo no quedó listo"
+                )
+                kind = "error"
+            elif result == "timeout":
+                msg = "Init CAN: tiempo agotado"
+                kind = "error"
+            else:
+                return
+            _append_log(self._motion_log, msg)
+            self._set_motion_status(msg, kind)
+        self._notify()
 
     def refresh_feed_offset(self) -> dict[str, Any]:
         try:
@@ -3439,6 +3615,9 @@ class HmiState:
             threading.Thread(
                 target=self.refresh_feed_offset, daemon=True
             ).start()
+            threading.Thread(
+                target=self.refresh_feed_can_status, daemon=True
+            ).start()
 
     def _motion_boot_try_launch(self) -> None:
         """Si Motion ya reportó Init/Idle y la prep está armada, lanza Servo ON/Home."""
@@ -3643,9 +3822,8 @@ class HmiState:
         self._notify()
 
     def reconnect_all_modules(self) -> dict[str, bool]:
-        """Fuerza reconexión TCP a Motion, PLC, PreFeeder y Andon (en paralelo)."""
+        """Fuerza reconexión TCP a Motion, PLC, PreFeeder y Andon (escalonada)."""
         results: dict[str, bool] = {}
-        lock = threading.Lock()
         clients: list[tuple[str, ModuleTcpClient]] = [
             ("motion", self._client),
             ("plc", self._plc_client),
@@ -3654,19 +3832,10 @@ class HmiState:
         if os.environ.get("ANDON_ENABLE", "1") == "1":
             clients.append(("andon", self._andon_client))
 
-        def worker(name: str, client: ModuleTcpClient) -> None:
-            ok = client.reconnect(silent=True)
-            with lock:
-                results[name] = ok
-
-        threads = [
-            threading.Thread(target=worker, args=(name, client), daemon=True)
-            for name, client in clients
-        ]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=CONNECT_TIMEOUT + VERIFY_TIMEOUT_SEC + 1.0)
+        for i, (name, client) in enumerate(clients):
+            if i:
+                time.sleep(0.75)
+            results[name] = client.reconnect(silent=True)
 
         _append_log(
             self._main_log,

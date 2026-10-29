@@ -12,7 +12,6 @@ import {
   ChevronRight,
   Footprints,
   X,
-  Droplets,
   Check,
 } from 'lucide-react';
 import { CycleConfig, CycleStep, MachineState } from '../types';
@@ -61,7 +60,6 @@ export const DEFAULT_CYCLE_CONFIG: CycleConfig = {
   depositMaxTravelMm: 1500,
   gripperClearanceMm: 10,
   cutOffsetMm: 0,
-  wipBlowerInicioOffsetMm: 8,
   feedSides: 'LR',
   pfTriggerEnabled: true,
   refillMm: 55,
@@ -1003,38 +1001,6 @@ export const CycleTab: React.FC<CycleTabProps> = ({
       <div className={`${hmiPanelCls} space-y-3 p-3 sm:p-4`}>
         <div>
           <div className="mb-1.5 flex items-center gap-1.5">
-            <Droplets className="h-3.5 w-3.5 text-sky-600 dark:text-sky-400" />
-            <h3 className={hmiSectionTitleMb}>
-              {t('refill_helpers_title')}
-            </h3>
-          </div>
-          <div className={hmiCfgGrid}>
-            <label className="min-w-0">
-              <span className={cfgLabel}>{t('cfg_refill_mm')}</span>
-              <input
-                type="number"
-                min={1}
-                step={0.5}
-                value={config.refillMm ?? 55}
-                onChange={(e) => updateConfigField('refillMm', Number(e.target.value))}
-                className={hmiModuleCompactFieldInput}
-              />
-            </label>
-            <label className="min-w-0">
-              <span className={cfgLabel}>{t('cfg_refill_asda')}</span>
-              <input
-                type="number"
-                step={1}
-                value={config.refillAsdaMm ?? -300}
-                onChange={(e) => updateConfigField('refillAsdaMm', Number(e.target.value))}
-                className={hmiModuleCompactFieldInput}
-              />
-            </label>
-          </div>
-        </div>
-
-        <div className="border-t border-slate-100 dark:border-slate-800 pt-2.5">
-          <div className="mb-1.5 flex items-center gap-1.5">
             <Boxes className="h-3.5 w-3.5 text-teal-600 dark:text-teal-400" />
             <h3 className={hmiSectionTitleMb}>
               {t('material_handling_title')}
@@ -1078,44 +1044,12 @@ export const CycleTab: React.FC<CycleTabProps> = ({
               </div>
             </div>
             <label className="min-w-0">
-              <span className={cfgLabel}>{t('cfg_deposito_batch_size')}</span>
-              <input
-                type="number"
-                min={1}
-                value={config.depositBatchSize}
-                onChange={(e) => updateConfigField('depositBatchSize', Number(e.target.value))}
-                className={hmiModuleCompactFieldInput}
-              />
-            </label>
-            <label className="min-w-0">
               <span className={cfgLabel}>{t('cfg_deposito_extra')}</span>
               <input
                 type="number"
                 step={0.1}
                 value={config.depositExtraMm}
                 onChange={(e) => updateConfigField('depositExtraMm', Number(e.target.value))}
-                className={hmiModuleCompactFieldInput}
-              />
-            </label>
-            <label className="min-w-0">
-              <span className={cfgLabel}>{t('cfg_deposito_stack_gap')}</span>
-              <input
-                type="number"
-                step={0.1}
-                min={0}
-                value={config.depositStackGapMm ?? 20}
-                onChange={(e) => updateConfigField('depositStackGapMm', Number(e.target.value))}
-                className={hmiModuleCompactFieldInput}
-              />
-            </label>
-            <label className="min-w-0">
-              <span className={cfgLabel}>{t('cfg_deposito_max_travel')}</span>
-              <input
-                type="number"
-                step={1}
-                min={1}
-                value={config.depositMaxTravelMm ?? 1500}
-                onChange={(e) => updateConfigField('depositMaxTravelMm', Number(e.target.value))}
                 className={hmiModuleCompactFieldInput}
               />
             </label>
@@ -1127,28 +1061,6 @@ export const CycleTab: React.FC<CycleTabProps> = ({
                 min={0}
                 value={config.gripperClearanceMm ?? 0}
                 onChange={(e) => updateConfigField('gripperClearanceMm', Number(e.target.value))}
-                className={hmiModuleCompactFieldInput}
-              />
-            </label>
-            <label className="min-w-0">
-              <span className={cfgLabel}>{t('cfg_cut_offset')}</span>
-              <input
-                type="number"
-                step={0.1}
-                value={config.cutOffsetMm ?? 0}
-                onChange={(e) => updateConfigField('cutOffsetMm', Number(e.target.value))}
-                className={hmiModuleCompactFieldInput}
-              />
-            </label>
-            <label className="min-w-0">
-              <span className={cfgLabel}>{t('cfg_wip_blower_inicio_offset')}</span>
-              <input
-                type="number"
-                step={0.1}
-                value={config.wipBlowerInicioOffsetMm ?? 0}
-                onChange={(e) =>
-                  updateConfigField('wipBlowerInicioOffsetMm', Number(e.target.value))
-                }
                 className={hmiModuleCompactFieldInput}
               />
             </label>

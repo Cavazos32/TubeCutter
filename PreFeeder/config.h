@@ -3,7 +3,7 @@
 #include <Arduino.h> 
 
 // Lado: comentar la línea siguiente para L, descomentar para R (misma base de firmware).
-#define PF_SIDE_RIGHT
+//#define PF_SIDE_RIGHT
 //.102 Lado R
 //.101 Lado L
 #ifndef PF_CONFIG_SIDE
@@ -95,6 +95,8 @@ constexpr float RPM_MAX = 600.0f;
 // Filtros sensores
 constexpr uint32_t BUF_FULL_ON_MS = 50;
 constexpr uint32_t BUF_FULL_OFF_MS = 100;
+constexpr uint32_t HOLGURA_ON_STABLE_MS = 50;
+constexpr uint32_t HOLGURA_OFF_STABLE_MS = 100;
 
 // Firmware
 #define FW_VERSION "2.0.0"

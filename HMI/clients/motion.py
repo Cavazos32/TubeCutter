@@ -8,7 +8,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Optional
 
-from tcp_link import ModuleTcpClient
+from core.tcp_link import ModuleTcpClient
 
 # --- ASDA (bytes 0x01–0x08, maestro → esclavo / eventos) ---
 CMD_HOME = 0x01

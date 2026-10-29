@@ -1236,6 +1236,10 @@ static void pfTcpOnLine(const char* line)
     pfTcpTxAck(0, ok, ok ? "" : "setHmiTfeedEnabled sin enlace L/R");
     return;
   }
+  if (cmdName == "ping") {
+    pfTcpTx(String("{\"ver\":") + PF_MASTER_PROTO_VER + ",\"type\":\"pong\"}");
+    return;
+  }
 
   const uint8_t cmdByte = pfTcpResolveCmdByte(line);
   if (!cmdByte) {

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
-from tcp_link import ModuleTcpClient
+from core.tcp_link import ModuleTcpClient
 
 # --- Protocolo PLC (bytes 0x19–0x23, exclusivos de PLCA) ---
 CMD_CUTTER_R = 0x19
@@ -28,7 +28,7 @@ TX_PLC_ERROR = 0x27
 TX_PLC_STOP = 0x28
 TX_PLC_RETURN = 0x29
 
-from error_catalog import ERROR_LABELS  # EXXX: Module, Descripción (E047–E050)
+from core.error_catalog import ERROR_LABELS  # EXXX: Module, Descripción (E047–E050)
 
 STATE_LABELS = {
     TX_PLC_INIT: "Init (0x024)",

@@ -50,6 +50,8 @@ static bool commandsPush(const NetCommand& cmd) {
 static SensorSnapshot gSnap;
 static uint32_t fullHighMs = 0, fullLowMs = 0;
 static bool fullStable = false;
+static uint32_t holgHighMs = 0, holgLowMs = 0;
+static bool holguraStableOn = false;
 
 static void sensorsInitPins() {
   pinMode(PIN_BUF_FULL, INPUT_PULLUP);
@@ -62,9 +64,11 @@ static void sensorsInitPins() {
   pinMode(PIN_HOLGURA, INPUT_PULLUP);
 }
 
-static bool holguraSensorOn() {
+static bool holguraSensorRawOn() {
   return digitalRead(PIN_HOLGURA) == HOLGURA_ON_LEVEL;
 }
+
+static bool holguraOkStable() { return holguraStableOn; }
 
 // Lee GPIO de buffer, tensión, cilindro, manguera; filtra estabilidad GPIO19 (full)
 static void sensorsUpdate(uint32_t nowMs) {
@@ -79,7 +83,17 @@ static void sensorsUpdate(uint32_t nowMs) {
   gSnap.tensionRaw = digitalRead(PIN_TENSION) == HIGH;
   gSnap.cylinderOpen = digitalRead(PIN_CYLINDER) == HIGH;
   gSnap.hoseAbsent = digitalRead(PIN_HOSE) == HIGH;
-  gSnap.holguraOn = holguraSensorOn();
+
+  if (holguraSensorRawOn()) {
+    holgHighMs += dt;
+    holgLowMs = 0;
+    if (holgHighMs >= HOLGURA_ON_STABLE_MS) holguraStableOn = true;
+  } else {
+    holgLowMs += dt;
+    holgHighMs = 0;
+    if (holgLowMs >= HOLGURA_OFF_STABLE_MS) holguraStableOn = false;
+  }
+  gSnap.holguraOn = holguraStableOn;
 
   if (gSnap.bufFullRaw) {
     fullHighMs += dt;
@@ -304,6 +318,7 @@ static uint32_t refillPulseUntil[4] = {};
 static uint32_t midBoostUntil = 0, highBoostUntil = 0;
 static bool lastMid = false, lastHigh = false;
 static bool highReverseActive = false;
+static bool midPassedBeforeHigh = false;
 
 static bool triggerIdDone(uint16_t id) {
   if (!id) return false;
@@ -358,14 +373,15 @@ static void stopFeederDemand() {
 }
 
 static void beginHolguraFeed(uint32_t nowMs) {
+  if (holguraOkStable()) return;
   holguraPostCycleOffWatch = false;
   holguraOffSinceMs = 0;
-  feederDemand = true;
+  feederDemand = false;
   feederMode = FEED_HOLGURA;
   holguraSawOn = false;
   holguraSettleEndMs = 0;
   holguraTimedEndMs = 0;
-  holguraLastOn = holguraSensorOn();
+  holguraLastOn = holguraOkStable();
   holguraPhase = HOLG_WAIT_ON;
 }
 
@@ -379,7 +395,7 @@ static void stopHolguraFeedCycle(uint32_t nowMs) {
     holguraPostCycleOffWatch = true;
     holguraSawOn = false;
   }
-  if (!holguraSensorOn())
+  if (!holguraOkStable())
     holguraOffSinceMs = nowMs;
   else
     holguraOffSinceMs = 0;
@@ -388,7 +404,7 @@ static void stopHolguraFeedCycle(uint32_t nowMs) {
 // Tras OFF→ON→OFF: en OFF cuenta N s para fallo de holgura insuficiente.
 static void serviceHolguraInsufficiency(uint32_t nowMs) {
   if (!holguraPostCycleOffWatch || !P) return;
-  if (holguraSensorOn()) {
+  if (holguraOkStable()) {
     holguraOffSinceMs = 0;
     return;
   }
@@ -399,13 +415,14 @@ static void serviceHolguraInsufficiency(uint32_t nowMs) {
 
 static void serviceHolguraFeed(uint32_t nowMs) {
   if (feederMode != FEED_HOLGURA || !P) return;
-  const bool on = holguraSensorOn();
+  const bool on = holguraOkStable();
   const bool rising = on && !holguraLastOn;
   holguraLastOn = on;
 
   if (holguraPhase == HOLG_WAIT_ON) {
     if (rising) holguraOnRisingEdge(nowMs);
-    feederDemand = true;
+    // Alimentar solo con holgura OFF hasta flanco ON (GPIO 22).
+    feederDemand = !on;
     return;
   }
 
@@ -429,6 +446,7 @@ static void stopAutoOutputs() {
   stopFeederDemand();
   midBoostUntil = highBoostUntil = 0;
   highReverseActive = false;
+  midPassedBeforeHigh = false;
   bufferEmptySinceMs = 0;
   tensionReverseActive = false;
   tensionHighSinceMs = 0;
@@ -515,19 +533,28 @@ static void serviceFeederDemand(uint32_t nowMs) {
     serviceHolguraFeed(nowMs);
 }
 
-// Buffer mid/high: boost; high → DeReeler inverso hasta mid o fallo.
+// Buffer mid/high: boost en flanco. High invierte DeReeler solo si hubo MID antes.
+// Secuencia: flanco MID (latch midPassedBeforeHigh), luego flanco HIGH invierte.
+// Apaga inversión: MID ON y HIGH OFF (bajando desde alta hacia banda media).
 static void serviceBoostEdges(uint32_t nowMs) {
   if (!P) return;
   if (!bufferWantsFill()) {
     highReverseActive = false;
+    midPassedBeforeHigh = false;
     lastMid = gSnap.bufMidRaw;
     lastHigh = gSnap.bufHighRaw;
     return;
   }
-  if (gSnap.bufMidRaw && !lastMid) midBoostUntil = nowMs + (uint32_t)(P->midBoostSec * 1000.0f);
   if (gSnap.bufHighRaw && !lastHigh) {
     highBoostUntil = nowMs + (uint32_t)(P->highBoostSec * 1000.0f);
-    highReverseActive = true;
+    if (midPassedBeforeHigh) {
+      highReverseActive = true;
+      midPassedBeforeHigh = false;
+    }
+  }
+  if (gSnap.bufMidRaw && !lastMid) {
+    midBoostUntil = nowMs + (uint32_t)(P->midBoostSec * 1000.0f);
+    midPassedBeforeHigh = true;
   }
   // Nivel por debajo de alta con media activa → fin inversión por alta
   if (highReverseActive && gSnap.bufMidRaw && !gSnap.bufHighRaw)
@@ -717,7 +744,7 @@ void machineTick(uint32_t nowMs) {
   serviceProtections();
 
   if (fault == FAULT_NONE && motionArmed()) {
-    if (holguraPostCycleOffWatch && holguraSensorOn()) {
+    if (holguraPostCycleOffWatch && holguraOkStable()) {
       holguraPostCycleOffWatch = false;
       holguraOffSinceMs = 0;
     }
@@ -728,13 +755,14 @@ void machineTick(uint32_t nowMs) {
       pendingTrigger = false;
       pendingTriggerId = 0;
       pendingTriggerSec = 0.0f;
-      if (P->hmiTfeedEnabled && holguraSensorOn())
+      if (P->hmiTfeedEnabled && holguraOkStable())
         startTfeedDemand(nowMs, sec, tid);
-      else {
+      else if (!holguraOkStable()) {
         if (tid) triggerIdRemember(tid);
         beginHolguraFeed(nowMs);
-      }
-    } else if (!feederDemand && !holguraSensorOn() && !holguraPostCycleOffWatch)
+      } else if (tid)
+        triggerIdRemember(tid);  // holgura ya ON: no arrancar ciclo OFF→ON
+    } else if (!feederDemand && !holguraOkStable() && !holguraPostCycleOffWatch)
       beginHolguraFeed(nowMs);
     serviceFeederDemand(nowMs);
     serviceBoostEdges(nowMs);     // impulsos mid/high

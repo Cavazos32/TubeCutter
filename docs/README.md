@@ -13,6 +13,7 @@ Interfaz maestro en Python (Flask) + React/Vite para los módulos de máquina v�
 ```
 HMI/
 ├── app.py              # Servidor Flask, API REST, SSE, sirve UI compilada
+├── iniciar_hmi.py      # Lanzador: venv, build UI, Chrome, acceso directo
 ├── state.py            # Estado + lógica de enlace
 ├── cycle.py            # Secuencia de ciclo
 ├── motion.py           # Cliente TCP Motion
@@ -23,12 +24,8 @@ HMI/
 │   └── cycle_config.json
 ├── frontend/           # UI React (Vite + Tailwind) — fuente
 │   └── dist/           # Build de producción (`npm run build`)
-├── scripts/
-│   ├── start-hmi.ps1
-│   └── create-desktop-shortcut.ps1
 ├── deploy/
 │   └── tcm-hmi.service # systemd (Raspberry Pi)
-├── Iniciar HMI.bat     # Acceso directo Windows
 └── requirements.txt
 ```
 
@@ -63,37 +60,25 @@ Abrir: **http://localhost:5050**
 
 Al arrancar, si `frontend/src` es más reciente que `dist`, `app.py` ejecuta `npm run build` solo (desactivar con `HMI_AUTO_BUILD_UI=0`). Flask **siempre** sirve `frontend/dist`, no el código fuente.
 
-### Acceso directo (Windows)
+### Arranque (`iniciar_hmi.py`)
 
-Doble clic en **`Iniciar HMI.bat`**: inicia el servidor en una ventana nueva y abre el navegador. Si el servidor ya corre, solo abre la web.
-
-Para un icono en el Escritorio:
-
-```powershell
-cd HMI
-powershell -ExecutionPolicy Bypass -File scripts/create-desktop-shortcut.ps1
-```
-
-Crea **`TCM HMI.lnk`** en el Escritorio.
-
-### Acceso directo (Linux)
-
-```bash
-cd HMI
-chmod +x "Iniciar HMI.sh" scripts/start-hmi.sh
-./"Iniciar HMI.sh"
-```
-
-Inicia el servidor en la terminal actual y abre el navegador (`xdg-open`). Si el servidor ya corre, solo abre la web. Opciones: `--port N`, `--no-browser`.
-
-### Lanzador Python (venv, Windows/Linux)
+Usa **`TCM/.venv`**, compila la UI si falta `frontend/dist`, levanta `app.py` y abre **Google Chrome** (perfil opcional: `HMI_CHROME_PROFILE` o `~/chrome-profile/Fork-3` en Linux).
 
 ```bash
 cd HMI
 python3 iniciar_hmi.py
 ```
 
-Usa siempre `TCM/.venv` en la raíz del repo (si no existe, indica cómo crearlo). Opciones: `--port N`, `--no-browser`.
+| Modo | Comando |
+|------|---------|
+| **Operador (Windows)** | Doble clic en `HMI/Iniciar-HMI.bat` — abre Chrome; **Ctrl+C** en la ventana negra apaga el HMI |
+| Acceso directo en el Escritorio | `python3 iniciar_hmi.py --install-shortcut` (apunta al `.bat`) |
+| Desarrollo | `python3 iniciar_hmi.py` o `python3 iniciar_hmi.py --restart` |
+| Segundo plano (kiosk avanzado) | `python3 iniciar_hmi.py --detach` |
+
+Opciones: `--port N`, `--no-browser`. Con `--restart`, si el puerto ya está ocupado se reinicia el servidor antes de abrir Chrome.
+
+Log del servidor en `--detach`: `HMI_LOG` o `/tmp/tcm-hmi-server.log` (Linux) / `HMI/logs/hmi-server.log` (Windows).
 
 ### Desarrollo UI (hot reload)
 
