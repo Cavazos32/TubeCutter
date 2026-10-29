@@ -499,9 +499,17 @@ class HmiState:
         self._notify_thread.start()
         self._client.start_background()
         self._plc_client.start_background()
-        self._pf_client.start_background()
+        # Escalonar PreFeeder: evita pico WiFi al arrancar con Motion/PLC a la vez.
+        self._pf_start_timer = threading.Timer(2.0, self._pf_client.start_background)
+        self._pf_start_timer.daemon = True
+        self._pf_start_timer.start()
+        self._andon_start_timer: threading.Timer | None = None
         if os.environ.get("ANDON_ENABLE", "1") == "1":
-            self._andon_client.start_background()
+            self._andon_start_timer = threading.Timer(
+                3.0, self._andon_client.start_background
+            )
+            self._andon_start_timer.daemon = True
+            self._andon_start_timer.start()
         self._cycle.mark_init_done()
 
     def stop(self) -> None:
@@ -510,6 +518,12 @@ class HmiState:
         self._notify_event.set()
         if self._cycle.is_active():
             self._cycle.request_stop()
+        t = getattr(self, "_pf_start_timer", None)
+        if t is not None:
+            t.cancel()
+        t = getattr(self, "_andon_start_timer", None)
+        if t is not None:
+            t.cancel()
         self._client.stop_background()
         self._plc_client.stop_background()
         self._pf_client.stop_background()
@@ -3773,9 +3787,8 @@ class HmiState:
         self._notify()
 
     def reconnect_all_modules(self) -> dict[str, bool]:
-        """Fuerza reconexión TCP a Motion, PLC, PreFeeder y Andon (en paralelo)."""
+        """Fuerza reconexión TCP a Motion, PLC, PreFeeder y Andon (escalonada)."""
         results: dict[str, bool] = {}
-        lock = threading.Lock()
         clients: list[tuple[str, ModuleTcpClient]] = [
             ("motion", self._client),
             ("plc", self._plc_client),
@@ -3784,19 +3797,10 @@ class HmiState:
         if os.environ.get("ANDON_ENABLE", "1") == "1":
             clients.append(("andon", self._andon_client))
 
-        def worker(name: str, client: ModuleTcpClient) -> None:
-            ok = client.reconnect(silent=True)
-            with lock:
-                results[name] = ok
-
-        threads = [
-            threading.Thread(target=worker, args=(name, client), daemon=True)
-            for name, client in clients
-        ]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=CONNECT_TIMEOUT + VERIFY_TIMEOUT_SEC + 1.0)
+        for i, (name, client) in enumerate(clients):
+            if i:
+                time.sleep(0.75)
+            results[name] = client.reconnect(silent=True)
 
         _append_log(
             self._main_log,

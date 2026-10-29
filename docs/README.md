@@ -71,11 +71,12 @@ python3 iniciar_hmi.py
 
 | Modo | Comando |
 |------|---------|
-| Desarrollo (servidor en la terminal) | `python3 iniciar_hmi.py` |
-| Icono / kiosk (reinicia servidor en 2.º plano + Chrome) | `python3 iniciar_hmi.py --detach` |
-| Crear acceso directo en el Escritorio | `python3 iniciar_hmi.py --install-shortcut` |
+| **Operador (Windows)** | Doble clic en `HMI/Iniciar-HMI.bat` — abre Chrome; **Ctrl+C** en la ventana negra apaga el HMI |
+| Acceso directo en el Escritorio | `python3 iniciar_hmi.py --install-shortcut` (apunta al `.bat`) |
+| Desarrollo | `python3 iniciar_hmi.py` o `python3 iniciar_hmi.py --restart` |
+| Segundo plano (kiosk avanzado) | `python3 iniciar_hmi.py --detach` |
 
-Opciones: `--port N`, `--no-browser`. Si el servidor ya corre, solo abre Chrome.
+Opciones: `--port N`, `--no-browser`. Con `--restart`, si el puerto ya está ocupado se reinicia el servidor antes de abrir Chrome.
 
 Log del servidor en `--detach`: `HMI_LOG` o `/tmp/tcm-hmi-server.log` (Linux) / `HMI/logs/hmi-server.log` (Windows).
 
