@@ -88,7 +88,8 @@ class PreFeederClient(ModuleTcpClient):
         super().__init__(DEFAULT_HOST, DEFAULT_PORT, on_message, on_connection)
 
     def _send_probe(self) -> bool:
-        return self.cmd_byte(TX_PF_IDLE)
+        # Keepalive de enlace (igual Motion/PLC); no mandar byte de estado cada 5 s.
+        return self.send_command(command="ping")
 
     def cmd_byte(self, byte_code: int, **extra: Any) -> bool:
         return self.send_command(byte=byte_code, **extra)

@@ -267,25 +267,32 @@ def _run_detach(port: int, url: str, *, open_browser: bool) -> int:
 
 
 def _install_shortcut(port: int) -> int:
-    py = _venv_python() or Path(sys.executable)
-    args = f'-u "{LAUNCHER}" --detach --port {port}'
+    bat = HMI_ROOT / "Iniciar-HMI.bat"
 
     if sys.platform == "win32":
+        if not bat.is_file():
+            print(f"No se encontro {bat}", file=sys.stderr)
+            return 1
         desktop = Path.home() / "Desktop"
         lnk = desktop / "TCM HMI.lnk"
         ps = f"""
 $Wsh = New-Object -ComObject WScript.Shell
 $s = $Wsh.CreateShortcut('{lnk}')
-$s.TargetPath = '{py}'
-$s.Arguments = '{args}'
+$s.TargetPath = '{bat}'
 $s.WorkingDirectory = '{HMI_ROOT}'
-$s.Description = 'TCM HMI en Chrome'
+$s.Description = 'TCM HMI — abrir Chrome; cerrar con Ctrl+C en la ventana negra'
 $s.IconLocation = "$env:SystemRoot\\System32\\shell32.dll,13"
 $s.Save()
 """
         subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=True)
         print(f"Acceso directo: {lnk}")
+        print(f"  → ejecuta {bat.name} (terminal visible + Chrome)")
+        if port != PORT_DEFAULT:
+            print(f"  (Puerto distinto de {PORT_DEFAULT}: edita Iniciar-HMI.bat o usa --port en iniciar_hmi.py)")
         return 0
+
+    py = _venv_python() or Path(sys.executable)
+    args = f'-u "{LAUNCHER}" --restart --port {port}'
 
     desktop_dir = None
     for d in (Path.home() / "Escritorio", Path.home() / "Desktop"):
@@ -389,7 +396,8 @@ def main() -> int:
         ).start()
 
     print(f"TCM HMI - {url}")
-    print("Deja esta terminal abierta. Cerrarla apaga el HMI.")
+    print("Deja esta ventana abierta. Para apagar el HMI: Ctrl+C.")
+    print("(En Windows puedes usar Iniciar-HMI.bat o el acceso directo del Escritorio.)")
     print()
 
     result = subprocess.run(

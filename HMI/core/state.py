@@ -499,9 +499,10 @@ class HmiState:
         self._notify_thread.start()
         self._client.start_background()
         self._plc_client.start_background()
-        self._pf_client.start_background()
+        # Escalonar PreFeeder: evita pico WiFi al arrancar con Motion/PLC a la vez.
+        threading.Timer(2.0, self._pf_client.start_background).start()
         if os.environ.get("ANDON_ENABLE", "1") == "1":
-            self._andon_client.start_background()
+            threading.Timer(3.0, self._andon_client.start_background).start()
         self._cycle.mark_init_done()
 
     def stop(self) -> None:
@@ -3773,9 +3774,8 @@ class HmiState:
         self._notify()
 
     def reconnect_all_modules(self) -> dict[str, bool]:
-        """Fuerza reconexión TCP a Motion, PLC, PreFeeder y Andon (en paralelo)."""
+        """Fuerza reconexión TCP a Motion, PLC, PreFeeder y Andon (escalonada)."""
         results: dict[str, bool] = {}
-        lock = threading.Lock()
         clients: list[tuple[str, ModuleTcpClient]] = [
             ("motion", self._client),
             ("plc", self._plc_client),
@@ -3784,19 +3784,10 @@ class HmiState:
         if os.environ.get("ANDON_ENABLE", "1") == "1":
             clients.append(("andon", self._andon_client))
 
-        def worker(name: str, client: ModuleTcpClient) -> None:
-            ok = client.reconnect(silent=True)
-            with lock:
-                results[name] = ok
-
-        threads = [
-            threading.Thread(target=worker, args=(name, client), daemon=True)
-            for name, client in clients
-        ]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=CONNECT_TIMEOUT + VERIFY_TIMEOUT_SEC + 1.0)
+        for i, (name, client) in enumerate(clients):
+            if i:
+                time.sleep(0.75)
+            results[name] = client.reconnect(silent=True)
 
         _append_log(
             self._main_log,
