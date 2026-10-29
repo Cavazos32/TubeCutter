@@ -10,7 +10,6 @@ struct SensorSnapshot {
   bool bufMidRaw = false;
   bool bufHighRaw = false;
   bool bufMaxRaw = false;
-  bool tensionRaw = false;
   bool cylinderOpen = false;
   bool hoseAbsent = false;
 };
@@ -75,7 +74,7 @@ struct OutputIntent {
   OutputMode mode = OUT_IDLE;
   float feederRpm = 0.0f;
   float dereelerRpm = 0.0f;
-  bool tensionReverse = false;
+  bool dereelerReverse = false;
   bool servoRun = false;
   int16_t servoExtraUs = 0;
 };
