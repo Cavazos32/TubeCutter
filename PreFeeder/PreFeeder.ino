@@ -740,7 +740,9 @@ void machineTick(uint32_t nowMs) {
         beginHolguraFeed(nowMs);
       } else if (tid)
         triggerIdRemember(tid);  // holgura ya ON: no arrancar ciclo OFF→ON
-    } else if (!feederDemand && !holguraOkStable() && !holguraPostCycleOffWatch)
+    // Holgura OFF siempre rearma feeder aunque postCycleOffWatch esté activo (ciclo
+    // terminó con holgura OFF tras haber visto ON): omitirlo dejaba solo buffer/DeReeler.
+    } else if (!feederDemand && !holguraOkStable())
       beginHolguraFeed(nowMs);
     serviceFeederDemand(nowMs);
     serviceBoostEdges(nowMs);     // impulsos mid/high + inversión temporizada

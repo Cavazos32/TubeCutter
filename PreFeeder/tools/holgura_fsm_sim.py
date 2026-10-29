@@ -107,7 +107,6 @@ def tick(st: State, now_ms: int, raw_on: bool, dt_ms: int = 10) -> None:
     if (
         not st.feeder_demand
         and not st.holg_stable_on
-        and not st.post_cycle_watch
         and not st.feeder_mode_holgura
     ):
         begin_holgura(st)
@@ -187,6 +186,25 @@ def main() -> None:
     tail_demand = [d for t, d, ph, s in log if t >= 6000 and s]
     if any(tail_demand):
         raise AssertionError("feeder siguió tras completar timed con holgura ON")
+
+    # Ciclo termina con holgura OFF (ON → settle → timed, luego OFF antes/despues del fin):
+    # debe rear mar feeder, no quedar en post_cycle_watch sin alimentar.
+    def on_then_off(t: int) -> bool:
+        if t < 800:
+            return False
+        if t < 3500:
+            return True
+        return False
+
+    log2 = run_timeline(on_then_off, 6000)
+    # Tras holgura estable OFF otra vez (~3.5s en on_then_off), feeder debe volver ON.
+    fed_after_reoff = any(
+        d for t, d, _ph, s in log2 if t >= 3600 and not s
+    )
+    if not fed_after_reoff:
+        raise AssertionError(
+            "feeder no rearma tras ciclo holgura y holgura OFF de nuevo (post_cycle_watch)"
+        )
 
     print("OK: simulación holgura — post-ON ~settle+on_s, sin arrastre con ON estable")
 
