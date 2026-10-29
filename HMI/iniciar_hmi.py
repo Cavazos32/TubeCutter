@@ -400,15 +400,12 @@ def main() -> int:
     print("(En Windows puedes usar Iniciar-HMI.bat o el acceso directo del Escritorio.)")
     print()
 
-    result = subprocess.run(
+    # Un solo proceso Python: Ctrl+C en CMD (Windows) detiene el servidor al instante.
+    os.chdir(HMI_ROOT)
+    os.execv(
+        sys.executable,
         [sys.executable, "-u", str(HMI_ROOT / "app.py")],
-        cwd=HMI_ROOT,
     )
-    code = int(result.returncode or 0)
-    if code != 0:
-        print(f"\nEl servidor salio con error {code}")
-        _pause("Enter para cerrar ")
-    return code
 
 
 if __name__ == "__main__":

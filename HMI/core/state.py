@@ -500,9 +500,16 @@ class HmiState:
         self._client.start_background()
         self._plc_client.start_background()
         # Escalonar PreFeeder: evita pico WiFi al arrancar con Motion/PLC a la vez.
-        threading.Timer(2.0, self._pf_client.start_background).start()
+        self._pf_start_timer = threading.Timer(2.0, self._pf_client.start_background)
+        self._pf_start_timer.daemon = True
+        self._pf_start_timer.start()
+        self._andon_start_timer: threading.Timer | None = None
         if os.environ.get("ANDON_ENABLE", "1") == "1":
-            threading.Timer(3.0, self._andon_client.start_background).start()
+            self._andon_start_timer = threading.Timer(
+                3.0, self._andon_client.start_background
+            )
+            self._andon_start_timer.daemon = True
+            self._andon_start_timer.start()
         self._cycle.mark_init_done()
 
     def stop(self) -> None:
@@ -511,6 +518,12 @@ class HmiState:
         self._notify_event.set()
         if self._cycle.is_active():
             self._cycle.request_stop()
+        t = getattr(self, "_pf_start_timer", None)
+        if t is not None:
+            t.cancel()
+        t = getattr(self, "_andon_start_timer", None)
+        if t is not None:
+            t.cancel()
         self._client.stop_background()
         self._plc_client.stop_background()
         self._pf_client.stop_background()
