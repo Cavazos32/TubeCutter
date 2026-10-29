@@ -247,9 +247,9 @@ def begin_lot(meta: dict[str, Any]) -> Path | None:
         ]
         _append_text(path, "".join(lines))
         note = str(meta.get("note") or "").strip()
-        if note:
-            record_event("inicio", note)
-        return path
+    if note:
+        record_event("inicio", note)
+    return path
 
 
 def begin_piece(rep: int, qty: int) -> None:

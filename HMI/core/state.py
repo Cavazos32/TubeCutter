@@ -885,6 +885,22 @@ class HmiState:
         with self._lock:
             return self._last_state_byte == TX_BUSY
 
+    def defer_motion_boot_home_for_cycle(self) -> None:
+        """Ciclo/purga: no disparar Home de arranque lineal (compite con park)."""
+        with self._lock:
+            self._motion_boot_armed = False
+            self._motion_boot_prep_done = True
+            self._motion_boot_awaiting_on_ack = False
+
+    def wait_motion_lineal_idle(self, timeout_s: float = 45.0) -> bool:
+        """Espera a que Motion salga de BUSY (p. ej. Home 0x001 en curso)."""
+        deadline = time.monotonic() + max(0.5, float(timeout_s))
+        while time.monotonic() < deadline:
+            if not self.motion_busy():
+                return True
+            time.sleep(0.08)
+        return False
+
     def holder_encoder_closed(self) -> bool:
         """True solo si la caché HMI tiene Holder y Encoder ON (None = no)."""
         return (
@@ -3726,6 +3742,14 @@ class HmiState:
         with self._lock:
             # Reconnect/aborto durante el asentamiento: no disparar Home.
             if not self._motion_boot_prep_done:
+                return
+            if self._cycle.is_active():
+                _append_log(
+                    self._motion_log,
+                    "Arranque lineal: Home omitido — ciclo o purga activa",
+                )
+                self._motion_boot_armed = False
+                self._notify()
                 return
             self._move_target_mm = 0.0
             self._move_start_mm = self._last_position_mm

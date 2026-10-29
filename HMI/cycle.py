@@ -728,6 +728,9 @@ class CycleHost(Protocol):
     ) -> str: ...
     def stage2_fault(self) -> str: ...
     def asda_position_mm(self) -> float | None: ...
+    def refresh_asda_position_mm(self) -> float | None: ...
+    def defer_motion_boot_home_for_cycle(self) -> None: ...
+    def wait_motion_lineal_idle(self, timeout_s: float = 45.0) -> bool: ...
     def om_official_mm(self, side: str) -> float | None: ...
     def motion_laser_on(self, side: str) -> bool: ...
     def refresh_motion_lasers(self) -> bool: ...
@@ -1540,6 +1543,7 @@ class CycleRunner:
             self._asda_move_warning = False
             self._refill_mode = True
             self._active = True
+        self._host.defer_motion_boot_home_for_cycle()
         self._set_state(TX_BUSY)
         self._host.cycle_log(
             f"Refill Start — ASDA→{use_asda:g} mm · "
@@ -2478,8 +2482,12 @@ class CycleRunner:
                     )
                     return False
             if self._host.wait_motion_idle_or_reached(0.1):
-                if target_mm is None or self._asda_at_target(target_mm) is not False:
+                if target_mm is None:
                     return True
+                at = self._asda_at_target(target_mm)
+                if at is True:
+                    return True
+                # Sin posición en caché (None) no cuenta como llegada — seguir esperando.
                 # Idle viejo (MOVE aún no arrancó) o MOVE no ejecutado: seguir
                 # esperando Reached; si Motion sigue quieto, E015.
                 self._host.clear_motion_reached_flag()
@@ -4045,18 +4053,33 @@ class CycleRunner:
         self._host.cmd_plc_tools_safe()
         if self._should_abort():
             return "fail"
+        if self._host.motion_busy():
+            self._host.cycle_log(
+                "Refill: Motion ocupado — esperando fin de Home/arranque…"
+            )
+            if not self._host.wait_motion_lineal_idle(45.0):
+                self._raise_fault("timeout_motion")
+                return "fail"
         self._host.clear_motion_wait_flags()
         current_asda = self._host.asda_position_mm()
         if current_asda is None:
-            self._host.cycle_log("Refill: posición ASDA no disponible → ejecutar MOVE de park")
-        elif abs(float(current_asda) - float(asda_mm)) <= 0.5:
+            current_asda = self._host.refresh_asda_position_mm()
+        at_park = (
+            current_asda is not None
+            and abs(float(current_asda) - float(asda_mm)) <= 0.5
+        )
+        if at_park:
             self._host.cycle_log(
                 f"Refill: ASDA ya en {current_asda:g} mm ≈ {asda_mm:g} mm → skip MOVE"
             )
-        elif not self._host.cmd_motion_move_mm(asda_mm, rpm):
-            self._raise_fault("move_cmd")
-            return "fail"
-        if current_asda is None or abs(float(current_asda) - float(asda_mm)) > 0.5:
+        else:
+            if current_asda is None:
+                self._host.cycle_log(
+                    "Refill: posición ASDA no disponible → ejecutar MOVE de park"
+                )
+            if not self._host.cmd_motion_move_mm(asda_mm, rpm):
+                self._raise_fault("move_cmd")
+                return "fail"
             if (
                 not self._wait_motion(
                     target_mm=asda_mm,
@@ -4065,8 +4088,6 @@ class CycleRunner:
                 or self._should_abort()
             ):
                 return "fail"
-        elif self._should_abort():
-            return "fail"
         with self._lock:
             self._progress = 20
 
@@ -4124,6 +4145,7 @@ class CycleRunner:
         with self._lock:
             self._active = True
             self._refill_mode = True
+            self._refill_prompt = "working"
             self._pieces_done = 0
             self._total_reps = 1
             self._pieces_per_rep = 1
