@@ -6,14 +6,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $HmiRoot = Split-Path $PSScriptRoot -Parent
-$Launcher = Join-Path $PSScriptRoot 'iniciar_hmi.py'
+$Launcher = Join-Path $HmiRoot 'iniciar_hmi.py'
 
 $py = Join-Path (Split-Path $HmiRoot -Parent) '.venv\Scripts\python.exe'
 if (-not (Test-Path $py)) {
     $py = 'python'
 }
 
-$args = @('-u', $Launcher, '--port', $Port)
+$args = @('-u', $Launcher, '--restart', '--port', $Port)
 if ($NoBrowser) { $args += '--no-browser' }
 
 Set-Location $HmiRoot

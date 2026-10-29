@@ -1,26 +1,18 @@
 #!/usr/bin/env python3
-"""Arranca TCM HMI y abre Google Chrome.
-
-  python3 scripts/iniciar_hmi.py              # servidor en esta terminal + Chrome
-  python3 scripts/iniciar_hmi.py --detach     # reinicia servidor en segundo plano + Chrome
-  python3 scripts/iniciar_hmi.py --install-shortcut
-  python3 scripts/iniciar_hmi.py --port 5050 --no-browser
-"""
+"""Delega en HMI/iniciar_hmi.py (compatibilidad si ejecutas desde scripts/)."""
 
 from __future__ import annotations
 
-import argparse
 import os
-import shutil
-import socket
-import subprocess
 import sys
-import threading
-import time
 from pathlib import Path
 
-_SCRIPTS_DIR = Path(__file__).resolve().parent
-HMI_ROOT = _SCRIPTS_DIR.parent
-TCM_ROOT = HMI_ROOT.parent
-PORT_DEFAULT = 5050
-LAUNCHER = Path(__file__).resolve()
+HMI_ROOT = Path(__file__).resolve().parent.parent
+ROOT_LAUNCHER = HMI_ROOT / "iniciar_hmi.py"
+
+if not ROOT_LAUNCHER.is_file():
+    print(f"No se encontro {ROOT_LAUNCHER}", file=sys.stderr)
+    raise SystemExit(1)
+
+os.chdir(HMI_ROOT)
+os.execv(sys.executable, [sys.executable, "-u", str(ROOT_LAUNCHER), *sys.argv[1:]])

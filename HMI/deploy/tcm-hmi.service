@@ -9,7 +9,7 @@ User=pi
 WorkingDirectory=/home/pi/TCM/HMI
 Environment=HMI_HOST=0.0.0.0
 Environment=HMI_PORT=5050
-ExecStart=/home/pi/TCM/HMI/.venv/bin/python app.py
+ExecStart=/home/pi/TCM/.venv/bin/python app.py
 Restart=on-failure
 RestartSec=5
 
