@@ -5,6 +5,7 @@ Estado máquina bytes 0x40–0x49.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from dataclasses import asdict, dataclass, fields
@@ -96,7 +97,20 @@ PF_READY_TIMEOUT_S = 15.0
 PIECE_WATCH_TIMEOUT_S = 20.0
 REFILL_LASER_TIMEOUT_S = 10.0
 PLC_ACK_TIMEOUT_S = 2.0
+# TEMPORAL (diagnóstico): no esperar ACK TCP del PLC; solo pulso nominal (~100+50 ms).
+# Producción: PLC_ACK_WAIT_BYPASS = False. Override: HMI_SKIP_PLC_ACK=0|1
+PLC_ACK_WAIT_BYPASS = True
+PLC_ACK_BYPASS_SLEEP_S = 0.15
 MOTION_IDLE_NO_TARGET_S = 1.0
+
+
+def plc_ack_wait_bypass_active() -> bool:
+    env = os.environ.get("HMI_SKIP_PLC_ACK", "").strip().lower()
+    if env in ("0", "false", "no", "off"):
+        return False
+    if env in ("1", "true", "yes", "on"):
+        return True
+    return bool(PLC_ACK_WAIT_BYPASS)
 PF_TFEED_DONE_TIMEOUT_S = 30.0
 PF_SETTLE_BEFORE_IDLE_S = 15.0
 PF_TFEED_CAPTURE_AFTER_PAUSE_S = 0.5
@@ -2525,12 +2539,22 @@ class CycleRunner:
                 if idle_off_target_since is None:
                     idle_off_target_since = time.monotonic()
             elif idle_off_target_since is not None:
+                # Reached puede actualizar la posición después del Idle que
+                # arrancó este conteo (home: el PUU se cierra en 0 un instante
+                # después). Si ya está en destino, no es E015.
+                if self._asda_at_target(target_mm) is True:
+                    return True
                 if self._host.motion_busy():
                     idle_off_target_since = None
                 elif (
                     time.monotonic() - idle_off_target_since
                     >= MOTION_IDLE_NO_TARGET_S
                 ):
+                    refresh = getattr(self._host, "refresh_asda_position_mm", None)
+                    if callable(refresh):
+                        refresh()
+                    if self._asda_at_target(target_mm) is True:
+                        return True
                     self._host.cycle_log(
                         f"MOVE sin llegar a destino: ASDA pos={self._fmt_asda_pos()} mm, "
                         f"destino={abs(float(target_mm)):.1f} mm (Idle sin Reached)"
@@ -2781,6 +2805,17 @@ class CycleRunner:
     ) -> bool | None:
         """Mide el ACK PLC como segmento propio; no altera su timeout ni su lógica."""
         op = self._begin_op(f"wait_ack:{label}")
+        if plc_ack_wait_bypass_active():
+            time.sleep(PLC_ACK_BYPASS_SLEEP_S)
+            elapsed = self._end_op(
+                op,
+                ok=True,
+                extra={"kind": "ack", "ack_result": True, "bypass": True},
+            )
+            self._host.cycle_log(
+                f"PLC ACK · {label}: bypass · {self._fmt_op(elapsed)}"
+            )
+            return True
         result = self._host.wait_plc_ack(byte_code, since_seq, timeout_s)
         elapsed = self._end_op(
             op,
@@ -2803,6 +2838,17 @@ class CycleRunner:
         if not byte_codes:
             return True
         op = self._begin_op(f"wait_ack:{label}")
+        if plc_ack_wait_bypass_active():
+            time.sleep(PLC_ACK_BYPASS_SLEEP_S)
+            elapsed = self._end_op(
+                op,
+                ok=True,
+                extra={"kind": "ack", "ack_result": True, "bypass": True},
+            )
+            self._host.cycle_log(
+                f"PLC ACK · {label}: bypass · {self._fmt_op(elapsed)}"
+            )
+            return True
         result = self._host.wait_plc_acks(byte_codes, since_seq, timeout_s)
         elapsed = self._end_op(
             op,

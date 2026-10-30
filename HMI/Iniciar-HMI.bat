@@ -4,6 +4,9 @@ rem Para cerrar el HMI: Ctrl+C (o cerrar la ventana). Al volver a abrir, reinici
 title TCM HMI
 cd /d "%~dp0"
 
+rem Bypass ACK PLC (cycle.py): activo por defecto; quitar bypass sin editar codigo:
+rem set HMI_SKIP_PLC_ACK=0
+
 set "PY=..\.venv\Scripts\python.exe"
 if not exist "%PY%" set "PY=python"
 

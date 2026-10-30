@@ -19,7 +19,7 @@ constexpr uint8_t  PLCA_PROTO_VER = 1;
 constexpr unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
 
 // --- Firmware / OTA (Arduino IDE, red local) ---
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "1.1.1"
 #define OTA_PASSWORD "TCM_PF2026"
 #define OTA_HOSTNAME "plc"
 

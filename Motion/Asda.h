@@ -61,6 +61,12 @@ static const uint16_t REG_P5_005 = 0x050A;
 static const uint16_t REG_P5_006 = 0x050C;
 static const uint16_t REG_P5_007 = 0x050E;
 static const uint16_t REG_P5_016 = 0x0520;
+// P0.046: imagen de DO. Bit2 ZSPD (paro), bit8 HOME (homing terminado).
+static const uint16_t REG_P0_046 = 0x005C;
+static const uint16_t ASDA_DO_ZSPD = 0x0004;
+static const uint16_t ASDA_DO_HOME = 0x0100;
+// Misma ventana que el ciclo HMI (MOTION_TARGET_TOL_MM).
+static const float ASDA_AT_TARGET_MM = 3.0f;
 static const uint16_t REG_P5_060 = 0x0578;
 static const uint16_t REG_P6_000 = 0x0600;
 static const uint16_t REG_P6_001 = 0x0602;

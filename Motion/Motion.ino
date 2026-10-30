@@ -681,6 +681,7 @@ enum MotionJobPollPhase : uint8_t {
   MJP_IDLE = 0,
   MJP_WAIT_TRIGGER,
   MJP_WAIT_POS,
+  MJP_WAIT_DO,  // P0.046 durante HOME (P5.007 se queda en 0)
 };
 
 static MotionJobPollPhase motionJobPollPhase = MJP_IDLE;
@@ -688,6 +689,15 @@ static uint8_t motionJobCloseKind = 0;  // 1=target, 2=loose, 3=cancel, 4=timeou
 static uint8_t motionJobPendingPosKind = 0;
 static uint16_t motionJobLastTrigger = 0;
 static bool motionJobGotTrigger = false;
+// P5.007 de un PR ya terminado sigue en 10000/20000 hasta que el nuevo
+// comando hace eco. Sin este flanco, el job se cierra con la posición vieja.
+static bool motionJobArmed = false;
+static bool motionJobConfirmOnly = false;
+static bool motionJobPosFresh = false;
+static bool motionJobHomeSeenLow = false;
+static bool motionJobTimeoutExtended = false;
+static int32_t motionJobStartPos = 0;
+static bool motionJobStartPosOk = false;
 
 uint8_t motionNestedServiceDepth = 0;
 
@@ -706,15 +716,74 @@ void motionJobBegin(uint16_t command, uint32_t timeoutMs) {
   motionJobCloseKind = 0;
   motionJobPendingPosKind = 0;
   motionJobGotTrigger = false;
+  motionJobArmed = false;
+  motionJobConfirmOnly = false;
+  motionJobPosFresh = false;
+  motionJobHomeSeenLow = false;
+  motionJobTimeoutExtended = false;
+  motionJobStartPos = cachedPosPuu;
+  motionJobStartPosOk = cachedPosOk;
 }
 
 static void motionJobCachePosFromModbus() {
   motionJobPos = (int32_t)(((uint32_t)mbReadRegs[1] << 16) | (uint32_t)mbReadRegs[0]);
   cachedPosPuu = motionJobPos;
   cachedPosOk = true;
+  motionJobPosFresh = true;
+}
+
+static bool motionJobPosAtTarget(int32_t pos) {
+  if (!motionJobPosFresh) return false;
+  const float here = puuToMm(pos, false);
+  if (motionJobCmd == 0)
+    return fabsf(here) <= ASDA_AT_TARGET_MM;
+  return fabsf(here - puuToMm(motionPrepTargetPuu, false)) <= ASDA_AT_TARGET_MM;
+}
+
+// El presupuesto salió corto (caché de posición vieja, p. ej. 0 mm) pero el
+// eje sí se está moviendo: no levantar E015 a mitad de carrera.
+static bool motionJobExtendShortTimeout() {
+  if (motionJobTimeoutExtended || !motionJobStartPosOk || !motionJobPosFresh)
+    return false;
+  const float moved = fabsf(
+      puuToMm(motionJobPos, false) - puuToMm(motionJobStartPos, false));
+  if (moved < 1.0f) return false;
+  float rpm = motionPrepSpeed;
+  if (rpm < 1.0f) rpm = (motionJobCmd == 0) ? DEFAULT_HOME_SPEED_RPM : DEFAULT_MOVE_SPEED_RPM;
+  const float budgetMm = (motionJobCmd == 0) ? HOME_MAX_TRAVEL_MM : 1500.0f;
+  const uint32_t fullMs = calcTravelTimeoutMs(budgetMm, rpm);
+  if (motionJobTimeoutMs + 500u >= fullMs) return false;
+  motionJobTimeoutExtended = true;
+  motionJobStartMs = millis();
+  motionJobTimeoutMs = fullMs;
+  motionJobPollPhase = MJP_IDLE;
+  motionJobCloseKind = 0;
+  motionJobGotTrigger = false;
+  motionJobPosFresh = false;
+  return true;
 }
 
 static bool motionJobFinishAfterPosRead() {
+  if (motionJobConfirmOnly) {
+    motionJobConfirmOnly = false;
+    // 10000/20000 heredados del PR anterior: la posición aún no es el destino.
+    if ((motionJobCloseKind == 1 || motionJobCloseKind == 2)
+        && !motionJobPosAtTarget(motionJobPos)) {
+      motionJobPollPhase = MJP_IDLE;
+      motionJobCloseKind = 0;
+      motionJobPosFresh = false;
+      return false;
+    }
+  }
+  if (motionJobCloseKind == 4) {
+    if (motionJobPosAtTarget(motionJobPos)) {
+      // El eje ya está en el destino; P5.007 no llegó a 20000/10000 a tiempo
+      // (típico en HOME, donde el registro se queda en 0).
+      motionJobCloseKind = 1;
+    } else if (motionJobExtendShortTimeout()) {
+      return false;
+    }
+  }
   motionJobPollPhase = MJP_IDLE;
   motionJobActive = false;
   busyMotion = false;
@@ -756,6 +825,7 @@ static bool motionJobFinishAfterPosRead() {
 
 static bool motionJobBeginPosRead(uint8_t closeKind) {
   motionJobCloseKind = closeKind;
+  motionJobPosFresh = false;
   if (modbusBusy()) {
     motionJobPendingPosKind = closeKind;
     return false;
@@ -763,10 +833,37 @@ static bool motionJobBeginPosRead(uint8_t closeKind) {
   motionJobPendingPosKind = 0;
   if (!modbusBeginRead32(REG_P5_016)) {
     motionJobPollPhase = MJP_IDLE;
+    if (motionJobConfirmOnly) {
+      motionJobConfirmOnly = false;
+      motionJobCloseKind = 0;
+      return false;
+    }
     return motionJobFinishAfterPosRead();
   }
   motionJobPollPhase = MJP_WAIT_POS;
   return false;
+}
+
+static bool motionJobBeginDoRead() {
+  if (modbusBusy()) return false;
+  if (!modbusBeginRead16(REG_P0_046)) return false;
+  motionJobPollPhase = MJP_WAIT_DO;
+  return false;
+}
+
+// HOME (P5.007 = 0) no siempre pasa a 10000/20000. P0.046 bit8 + paro (ZSPD)
+// indica fin de homing. Solo se cierra si la posición ya es ~0: el bit HOME
+// del homing anterior sigue alto unos cientos de ms y, si se aceptara así,
+// el job moriría antes de que el eje llegue al tope.
+static bool motionJobNoteDoStatus(uint16_t status) {
+  const bool home = (status & ASDA_DO_HOME) != 0;
+  const bool stopped = (status & ASDA_DO_ZSPD) != 0;
+  if (!home) motionJobHomeSeenLow = true;
+  if (!(home && stopped)) return false;
+  if (!motionJobHomeSeenLow && (millis() - motionJobStartMs) < 400u)
+    return false;
+  motionJobConfirmOnly = true;
+  return motionJobBeginPosRead(1);
 }
 
 static bool motionJobEvaluateTrigger() {
@@ -775,13 +872,25 @@ static bool motionJobEvaluateTrigger() {
   const uint16_t doneLoose  = (uint16_t)(motionJobCmd + 10000);
   const uint16_t doneTarget = (uint16_t)(motionJobCmd + 20000);
 
-  if (got && trigger == doneTarget)
-    return motionJobBeginPosRead(1);
-  if (got && trigger == doneLoose)
-    return motionJobBeginPosRead(2);
+  if (got && trigger == motionJobCmd)
+    motionJobArmed = true;
+
+  const bool doneT = got && trigger == doneTarget;
+  const bool doneL = got && trigger == doneLoose;
+  if (doneT || doneL) {
+    // En HOME, 10000/20000 sin haber visto el eco 0 es el valor viejo.
+    if (motionJobArmed || motionJobCmd != 0) {
+      // HOME: 20000 puede llegar antes de que el drive ponga el origen en 0.
+      motionJobConfirmOnly = (motionJobCmd == 0) || !motionJobArmed;
+      return motionJobBeginPosRead(doneT ? 1 : 2);
+    }
+  }
 
   if ((millis() - motionJobStartMs) >= motionJobTimeoutMs)
     return motionJobBeginPosRead(got ? 4 : 5);
+
+  if (motionJobCmd == 0 && motionJobArmed && got && trigger == 0)
+    return motionJobBeginDoRead();
   return false;
 }
 
@@ -795,7 +904,8 @@ static bool pollMotionOnce() {
   if (motionJobPendingPosKind != 0)
     return motionJobBeginPosRead(motionJobPendingPosKind);
 
-  if (motionJobPollPhase == MJP_WAIT_TRIGGER || motionJobPollPhase == MJP_WAIT_POS) {
+  if (motionJobPollPhase == MJP_WAIT_TRIGGER || motionJobPollPhase == MJP_WAIT_POS
+      || motionJobPollPhase == MJP_WAIT_DO) {
     const int mb = modbusPoll();
     if (mb == 0) return false;
     if (mb < 0) {
@@ -803,6 +913,12 @@ static bool pollMotionOnce() {
         motionJobGotTrigger = false;
         motionJobPollPhase = MJP_IDLE;
         return motionJobEvaluateTrigger();
+      }
+      if (motionJobPollPhase == MJP_WAIT_DO || motionJobConfirmOnly) {
+        motionJobConfirmOnly = false;
+        motionJobPollPhase = MJP_IDLE;
+        motionJobCloseKind = 0;
+        return false;
       }
       motionJobPollPhase = MJP_IDLE;
       return motionJobFinishAfterPosRead();
@@ -815,9 +931,14 @@ static bool pollMotionOnce() {
       motionJobPollPhase = MJP_IDLE;
       if (motionCancelled) {
         motionJobCloseKind = 3;
+        motionJobConfirmOnly = false;
         return motionJobBeginPosRead(3);
       }
       return motionJobEvaluateTrigger();
+    }
+    if (motionJobPollPhase == MJP_WAIT_DO) {
+      motionJobPollPhase = MJP_IDLE;
+      return motionJobNoteDoStatus(mbReadRegs[0]);
     }
     motionJobCachePosFromModbus();
     return motionJobFinishAfterPosRead();
