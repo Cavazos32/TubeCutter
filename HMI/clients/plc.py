@@ -21,6 +21,15 @@ TX_HOLDER_ERR = 0x21
 TX_ENCODER_ERR = 0x22
 CMD_BLOWER = 0x23
 
+# Único recorte de duración en la HMI. El PLC vuelve a recortar en blowerStart().
+BLOWER_SEC_MIN = 0.2
+BLOWER_SEC_MAX = 300.0
+
+
+def clamp_blower_sec(sec: float) -> float:
+    return max(BLOWER_SEC_MIN, min(BLOWER_SEC_MAX, float(sec)))
+
+
 # --- Estatus PLC (bytes 0x24–0x29, esclavo → maestro) ---
 TX_PLC_INIT = 0x24
 TX_PLC_IDLE = 0x25
@@ -87,7 +96,7 @@ class PlcClient(ModuleTcpClient):
             "value": "on" if on else "off",
         }
         if on and duration_sec is not None:
-            fields["durationSec"] = max(0.2, float(duration_sec))
+            fields["durationSec"] = clamp_blower_sec(duration_sec)
         return self.send_command(**fields)
 
     def cmd_valve_by_byte(
@@ -101,7 +110,7 @@ class PlcClient(ModuleTcpClient):
             return self.cmd_set_out(out_name, on, duration_sec=duration_sec)
         extra: dict[str, Any] = {"on": on}
         if on and duration_sec is not None:
-            extra["durationSec"] = max(0.2, float(duration_sec))
+            extra["durationSec"] = clamp_blower_sec(duration_sec)
         return self.cmd_byte(byte_code, **extra)
 
     def cmd_cutter_r(self, on: bool = True) -> bool:

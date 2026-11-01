@@ -281,8 +281,6 @@ static bool setPlcOutputByName(const char* outName, bool state, bool& deferred)
   else if (nameEq(outName, "FGTRAY") || nameEq(outName, "TRAY") || nameEq(outName, "ENCODER")) {
     if (!valveArm(stEncoder, PIN_OUT_ENCODER, state, 0, JOB_STATUS, deferred)) return false;
   }
-  else if (nameEq(outName, "BLOWER"))
-    blowerSet(state, BLOWER_DEFAULT_SEC * 1000UL);
   else if (nameEq(outName, "RESET")) {
     if (!plcDoHardwareReset(0, JOB_STATUS, deferred)) return false;
   }
@@ -718,24 +716,17 @@ static float jNum(const char* j, const char* k)
   return atof(p);
 }
 
+// Traduce el JSON a ms. El rango lo aplica blowerStart().
 static unsigned long blowerParseDurationMs(const char* line)
 {
   float sec = jNum(line, "durationSec");
   if (sec < 0) sec = jNum(line, "blowerSec");
   if (sec < 0) sec = jNum(line, "sec");
-  if (sec > 0) {
-    unsigned long ms = (unsigned long)(sec * 1000.0f + 0.5f);
-    if (ms < BLOWER_MIN_MS) ms = BLOWER_MIN_MS;
-    if (ms > BLOWER_MAX_MS) ms = BLOWER_MAX_MS;
-    return ms;
-  }
+  if (sec > 0)
+    return (unsigned long)(sec * 1000.0f + 0.5f);
   const float msVal = jNum(line, "durationMs");
-  if (msVal > 0) {
-    unsigned long ms = (unsigned long)(msVal + 0.5f);
-    if (ms < BLOWER_MIN_MS) ms = BLOWER_MIN_MS;
-    if (ms > BLOWER_MAX_MS) ms = BLOWER_MAX_MS;
-    return ms;
-  }
+  if (msVal > 0)
+    return (unsigned long)(msVal + 0.5f);
   return BLOWER_DEFAULT_SEC * 1000UL;
 }
 

@@ -27,7 +27,6 @@ from cycle_analysis_log import (
 )
 MODEL_PATH = HMI_ROOT / "config" / "model.json"
 REGISTER_PATH = HMI_ROOT / "config" / "register.json"
-DEFAULT_BLOWER_SEC = 0.2
 
 
 DEFAULT_ANDON_BUZZER_MUTE = False
@@ -105,7 +104,9 @@ from clients.motion import (
     motion_http_set_feed_offset,
 )
 from clients.plc import (
+    BLOWER_SEC_MIN,
     CMD_BLOWER,
+    clamp_blower_sec,
     CMD_CUTTER_L,
     CMD_CUTTER_R,
     CMD_ENCODER,
@@ -169,6 +170,8 @@ from machine_states import (
     STATE_LABELS,
     andon_tower_outputs,
 )
+
+DEFAULT_BLOWER_SEC = BLOWER_SEC_MIN
 MAX_LOG_LINES = 400
 # No latchear E065–E067 en microcortes WiFi; solo si el enlace sigue caído.
 LINK_DOWN_CONFIRM_SEC = 8.0
@@ -785,7 +788,7 @@ class HmiState:
             sec = float(self._cycle.get_config().plc_blower_sec)
         except (AttributeError, TypeError, ValueError):
             sec = DEFAULT_BLOWER_SEC
-        sec = max(0.2, min(300.0, sec))
+        sec = clamp_blower_sec(sec)
         with self._lock:
             self._plc["blowerSec"] = sec
         self._notify()
@@ -1059,7 +1062,7 @@ class HmiState:
             if duration_sec is None:
                 use_sec = self.plc_blower_sec()
             else:
-                use_sec = max(0.2, min(300.0, float(duration_sec)))
+                use_sec = clamp_blower_sec(duration_sec)
         ok = bool(self._plc_client.cmd_blower(on, duration_sec=use_sec))
         if ok:
             with self._lock:
@@ -2825,10 +2828,10 @@ class HmiState:
         self._plc["blowerSec"] = DEFAULT_BLOWER_SEC
 
     def set_blower_sec(self, sec: float) -> float:
-        sec = max(0.2, min(300.0, float(sec)))
-        with self._lock:
-            self._plc["blowerSec"] = sec
-        self._notify()
+        """Tiempo del soplo manual. Se guarda en cycle.json y se refleja en la pestaña PLC."""
+        sec = clamp_blower_sec(sec)
+        self._cycle.set_plc_blower_sec(sec)
+        self.sync_plc_blower_from_cycle()
         return sec
 
     def _plc_apply_home_valve_cache(self) -> None:
@@ -2885,7 +2888,7 @@ class HmiState:
                         duration_sec = float(self._plc.get("blowerSec", DEFAULT_BLOWER_SEC))
                 else:
                     duration_sec = float(raw)
-                duration_sec = max(0.2, min(300.0, duration_sec))
+                duration_sec = clamp_blower_sec(duration_sec)
             with self._lock:
                 extra = f" {duration_sec:g}s" if duration_sec is not None else ""
                 _append_log(

@@ -101,9 +101,6 @@ export const translations = {
     cfg_cut_offset: 'Ajuste de longitud de corte (mm)',
     cfg_cut_lineal_total: 'Recorrido total de corte',
     cfg_cut_offset_hint: 'Se aplica en el siguiente corte, sin reiniciar el lote',
-    cfg_wip_blower_inicio_offset: 'Soplador de acomodo: ajuste desde cada punta (mm)',
-    cfg_wip_blower_inicio_offset_hint:
-      'Al volver a inicio tras depositar: cuántos mm hacia el centro desde pinzas y desde el cortador para soplar la pieza (WIP).',
     cfg_feed_sides: 'Lados que alimentan',
     cfg_feed_sides_both: 'Ambos',
     cfg_feed_sides_hint: 'Izquierdo, derecho o ambos lados',

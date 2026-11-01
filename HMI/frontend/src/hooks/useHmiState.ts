@@ -18,17 +18,20 @@ import {
   parseLogs,
   valveByteFromId,
 } from '../api/mappers';
-import type {
-  AndonState,
-  ConnectionState,
-  CycleConfig,
-  LogEntry,
-  MachineState,
-  MotionState,
-  PfRefillChannel,
-  PlcState,
-  PreFeederState,
-  TabType,
+import {
+  BLOWER_SEC_DEFAULT,
+  BLOWER_SEC_MAX,
+  BLOWER_SEC_MIN,
+  type AndonState,
+  type ConnectionState,
+  type CycleConfig,
+  type LogEntry,
+  type MachineState,
+  type MotionState,
+  type PfRefillChannel,
+  type PlcState,
+  type PreFeederState,
+  type TabType,
 } from '../types';
 import type { ChecklistState } from '../types/checklist';
 
@@ -126,7 +129,7 @@ export function useHmiState() {
     },
     plcState: {
       connection: { connected: false, ip: '', port: 0 },
-      blowerSec: 2,
+      blowerSec: BLOWER_SEC_DEFAULT,
       valves: [],
     },
     preFeederState: {
@@ -652,9 +655,11 @@ export function useHmiState() {
     const extra: Record<string, unknown> = { byte, on: newOn };
     if (valveId === 'blower' && newOn) {
       const sec = Number(
-        snapRef.current?.plc?.blowerSec ?? snap.plc.blowerSec ?? 2
+        snapRef.current?.plc?.blowerSec ?? snap.plc.blowerSec ?? BLOWER_SEC_DEFAULT
       );
-      extra.durationSec = Number.isFinite(sec) ? Math.max(0.2, sec) : 2;
+      extra.durationSec = Number.isFinite(sec)
+        ? Math.max(BLOWER_SEC_MIN, Math.min(BLOWER_SEC_MAX, sec))
+        : BLOWER_SEC_DEFAULT;
     }
     if (snap.plc.valves[String(byte)]) {
       snap.plc.valves[String(byte)] = {
@@ -689,7 +694,7 @@ export function useHmiState() {
   }, []);
 
   const setBlowerSec = useCallback((sec: number) => {
-    const v = Math.max(0.2, Math.min(300, Number(sec)));
+    const v = Math.max(BLOWER_SEC_MIN, Math.min(BLOWER_SEC_MAX, Number(sec)));
     if (!Number.isFinite(v)) return;
     if (snapRef.current?.plc) {
       snapRef.current.plc.blowerSec = v;

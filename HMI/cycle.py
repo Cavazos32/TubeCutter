@@ -25,6 +25,7 @@ from machine_states import (
     TX_PAUSE,
     TX_STOP,
 )
+from clients.plc import BLOWER_SEC_MIN
 from core.error_catalog import format_ui, lookup
 from cycle_analysis_log import (
     begin_lot as analysis_begin_lot,
@@ -304,7 +305,7 @@ class CycleConfig:
     pf_trigger_enabled: bool = False
     refill_mm: float = 55.0
     refill_asda_mm: float = -300.0
-    plc_blower_sec: float = 0.2
+    plc_blower_sec: float = BLOWER_SEC_MIN
     holder_on_ms: int = 25
     holder_precut_ms: int = 20
     holder_open_ms: int = 20
@@ -978,7 +979,7 @@ class CycleRunner:
             incoming = {
                 k: v
                 for k, v in dict(data or {}).items()
-                if k in allowed
+                if k in allowed and k != "plcBlowerSec"
             }
             merged = self._cfg.to_dict()
             merged.update(incoming)
@@ -990,6 +991,14 @@ class CycleRunner:
         if hasattr(self._host, "sync_plc_blower_from_cycle"):
             self._host.sync_plc_blower_from_cycle()
         return cfg
+
+    def set_plc_blower_sec(self, sec: float) -> None:
+        """Persiste el tiempo del soplo manual. El guardado general del ciclo no lo toca."""
+        with self._lock:
+            self._cfg.plc_blower_sec = float(sec)
+            cfg = CycleConfig(**asdict(self._cfg))
+        save_cycle_config(cfg)
+
     def state_byte(self) -> int:
         with self._lock:
             return self._state_byte
@@ -1702,11 +1711,16 @@ class CycleRunner:
         self._asda_move_warning = False
 
     def _cancel_wip_blower(self) -> None:
-        """Corta durationSec del blower. No es All Off ni pulso KEEP."""
+        """Pide OFF. Si el envío falla, el temporizador del PLC igual apaga."""
+        ok = False
         try:
-            self._host.cmd_plc_blower(False)
+            ok = bool(self._host.cmd_plc_blower(False))
         except Exception:
-            pass
+            ok = False
+        if not ok:
+            self._host.cycle_log(
+                "Soplo OFF no enviado — el PLC lo apaga al vencer el tiempo"
+            )
 
     def _arm_recovery_pause(self) -> None:
         """recovery: lote vivo en Pause. Resume terminará la pieza."""
@@ -3026,7 +3040,11 @@ class CycleRunner:
         *,
         prefetch_running: bool,
     ) -> bool:
-        """Pinzas ya abiertas: MOVE→0 → delay → blower ON ≡ |L| → Reached."""
+        """Soplo de pieza: HOME, delay, y al cumplirse el delay se activa.
+
+        Duración según el largo de la pieza. El PLC apaga al vencer el tiempo;
+        al llegar a 0 se manda OFF por si sobró.
+        """
         if start_mm is None:
             self._raise_fault("wip_start")
             self._host.cycle_log(

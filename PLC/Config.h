@@ -66,7 +66,8 @@ constexpr unsigned long VALVE_PULSE_MS = 100;
 // y el cortador queda activado.
 constexpr unsigned long VALVE_PULSE_GAP_MS = 50;
 
-// Blower: nivel ON durante N s (ajustable desde HMI), luego OFF automático.
+// Blower: nivel ON durante N ms, luego OFF automático.
+// Solo blowerStart() recorta. Sin duración en el JSON se usan los 2 s.
 constexpr unsigned long BLOWER_DEFAULT_SEC = 2;
 constexpr unsigned long BLOWER_MIN_MS = 200;
 constexpr unsigned long BLOWER_MAX_MS = 300000;  // 5 min

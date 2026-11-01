@@ -9,6 +9,11 @@ export type TabType =
 
 export type HmiModuleKey = 'motion' | 'plc' | 'prefeeder' | 'andon';
 
+/** Tiempo del soplo manual. El mismo rango lo aplica clamp_blower_sec en el backend. */
+export const BLOWER_SEC_MIN = 0.2;
+export const BLOWER_SEC_MAX = 300;
+export const BLOWER_SEC_DEFAULT = BLOWER_SEC_MIN;
+
 /** Purga: Long feed desde await_feed / after_feed (skipValidate en Motion). */
 export const REFILL_LONG_FEED_MM = 100;
 
@@ -22,8 +27,6 @@ export interface CycleConfig {
   /** Avance corto ASDA tras abrir pinzas; entra en ref WIP soplo fin. */
   gripperClearanceMm?: number;
   cutOffsetMm?: number;
-  /** Offset blower desde cada punta hacia el centro (fin=start−off, inicio=+off). */
-  wipBlowerInicioOffsetMm?: number;
   /** Feed / Stage2 OM: 'L' | 'R' | 'LR' */
   feedSides: 'L' | 'R' | 'LR';
   /** Tfeed tras el corte (paso 18). false = omitir. */

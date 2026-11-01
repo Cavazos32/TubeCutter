@@ -1,16 +1,17 @@
 import type { BackendCycleConfig, BackendSnapshot } from './backendTypes';
-import type {
-  AndonState,
-  ConnectionState,
-  CycleConfig,
-  LogEntry,
-  MachineState,
-  MotionState,
-  PfRefillState,
-  PlcState,
-  PreFeederState,
-  PreFeederSensor,
-  ValveItem,
+import {
+  BLOWER_SEC_DEFAULT,
+  type AndonState,
+  type ConnectionState,
+  type CycleConfig,
+  type LogEntry,
+  type MachineState,
+  type MotionState,
+  type PfRefillState,
+  type PlcState,
+  type PreFeederState,
+  type PreFeederSensor,
+  type ValveItem,
 } from '../types';
 import type { ChecklistState, ChecklistStepId } from '../types/checklist';
 
@@ -343,7 +344,7 @@ export function mapPlcState(snap: BackendSnapshot): PlcState {
     },
     statusText: cleanVisibleStatusText(snap.plc.status?.text),
     hasError: snap.plc.status?.kind === 'error',
-    blowerSec: Number(snap.plc.blowerSec ?? 2),
+    blowerSec: Number(snap.plc.blowerSec ?? BLOWER_SEC_DEFAULT),
     valves,
   };
 }

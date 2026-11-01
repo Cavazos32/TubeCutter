@@ -5,7 +5,7 @@ import {
   AlertCircle,
   Wind,
 } from 'lucide-react';
-import { PlcState, LogEntry } from '../types';
+import { BLOWER_SEC_MAX, BLOWER_SEC_MIN, PlcState, LogEntry } from '../types';
 import { LogTerminal } from './LogTerminal';
 import { ModuleStatusBar } from './ModuleStatusBar';
 import { useApp } from '../context/AppContext';
@@ -154,8 +154,8 @@ export const PlcTab: React.FC<PlcTabProps> = ({
                         <input
                           id="input-blower-sec"
                           type="number"
-                          min={0.2}
-                          max={300}
+                          min={BLOWER_SEC_MIN}
+                          max={BLOWER_SEC_MAX}
                           step={0.5}
                           value={plcState.blowerSec}
                           onChange={(e) => {
