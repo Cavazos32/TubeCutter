@@ -1154,6 +1154,7 @@ static void motionPrepPollOnce() {
 }
 
 void motionCooperateDuringWait() {
+  feedPollVelocityLaserUrgent();
   modbusPoll();
   if (!modbusBusy()) {
     motionPrepPollOnce();
@@ -1166,10 +1167,10 @@ void motionCooperateDuringWait() {
   asdaTcpPollEvents();
   motionPollIoSensors();
   updateEncoderMotion(millis());
-  serviceCANRx();
   if (motionNestedServiceDepth == 0) {
     feedLoop();
   }
+  serviceCANRx();
   yield();
 }
 
@@ -3762,6 +3763,7 @@ void setup() {
 }
 
 void loop() {
+  feedPollVelocityLaserUrgent();
   if (arduinoOtaInProgress) {
     serviceArduinoOta(24);
     server.handleClient();
@@ -3780,8 +3782,6 @@ void loop() {
   motionPrepPollOnce();
   if (motionJobActive) pollMotionOnce();
   updateEncoderMotion(millis());
-  // CAN / alimentación (sin reinicio automático del bus)
-  serviceCANRx();
   feedLoop();
 }
 

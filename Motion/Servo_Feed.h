@@ -92,6 +92,8 @@ void feedInit();
 void feedLoadConfig();
 void feedSaveConfig();
 void feedLoop();
+// FSP_VEL_FAST/SLOW: lee ambos GPIO y encola el primer Halt sin esperar.
+void feedPollVelocityLaserUrgent();
 // HMI TCP conectado: no bloquear loop() con setup CAN (retrasa ACK CMD_MOVE).
 bool motionHostTcpLinked();
 // ASDA prep/job activo — tampooco bloquear el loop con setup CAN.

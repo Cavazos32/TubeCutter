@@ -134,6 +134,23 @@ bool sendCanHaltImmediate(bool sideR)
   return ok;
 }
 
+// Primer Halt del láser: un intento, sin esperar mutex ni cola TX.
+static bool sendCanHaltFirstNonBlocking(bool sideR)
+{
+  if (!canInitialized) return false;
+  if (canMutex && xSemaphoreTake(canMutex, 0) != pdTRUE)
+    return false;
+  byte data[8] = {0x2B, 0x40, 0x60, 0x00, 0x0F, 0x01, 0x00, 0x00};
+  twai_message_t message = {};
+  message.identifier = sideR ? (uint32_t)SERVO_CAN_TX_R : (uint32_t)SERVO_CAN_TX_L;
+  message.data_length_code = 8;
+  for (uint8_t i = 0; i < 8; i++)
+    message.data[i] = data[i];
+  const bool ok = twai_transmit(&message, 0) == ESP_OK;
+  if (canMutex) xSemaphoreGive(canMutex);
+  return ok;
+}
+
 bool canReadStatusWord(uint8_t nodeId, uint16_t& statusOut, uint32_t timeoutMs)
 {
   if (!canInitialized) return false;
@@ -743,6 +760,8 @@ struct FeedSideRt {
   // Velocity + Sensor (ciclo de producción; purga no entra aquí)
   bool velModeActive = false;
   bool velStopLatched = false;
+  // Primer Halt ya encolado: feedLoop hace burst, omAtLaser y el log.
+  bool velHaltFollowupPending = false;
   float velTransitionMm = 0.0f;
   float omLiveMm = -1.0f;
   float omAtTransition = -1.0f;
@@ -1134,6 +1153,7 @@ static void feedSideClearDiag(FeedSideRt& s)
   s.moveSteps = 0;
   s.velModeActive = false;
   s.velStopLatched = false;
+  s.velHaltFollowupPending = false;
   s.velTransitionMm = 0.0f;
   s.omLiveMm = -1.0f;
   s.omAtTransition = -1.0f;
@@ -1429,20 +1449,54 @@ static void feedSideVelocityHaltNow(bool sideR, uint32_t now, const char* why)
   Serial.printf("FEED %c %s\n", sideR ? 'R' : 'L', why ? why : "HALT");
 }
 
-// GPIO crudo → un Halt por lado. L y R se arman antes de burst/SDO/OM.
-static bool feedPollVelocityLaserCw(bool sideR, uint32_t now)
+static bool feedVelocityLaserHaltEligible(const FeedSideRt& s)
 {
-  FeedSideRt& s = feedSideAt(sideR);
-  if (!s.active || s.skipValidate || s.velStopLatched) return false;
-  if (s.phase != FSP_VEL_FAST && s.phase != FSP_VEL_SLOW) return false;
-  if (!feedLaserMaterialPresentRaw(sideR)) return false;
+  return s.active && !s.skipValidate && !s.velStopLatched
+      && (s.phase == FSP_VEL_FAST || s.phase == FSP_VEL_SLOW);
+}
+
+static void feedAcceptVelocityLaserHalt(FeedSideRt& s, uint32_t now)
+{
   s.laserState = true;
   s.velStopLatched = true;
   s.phase = FSP_VEL_STOPPING;
   s.velHaltMs = now;
   s.velStopRetryMs = now + FEED_VEL_STOP_FAILSAFE_MS;
-  feedVelocityHaltCw(sideR);
-  return true;
+  s.velHaltFollowupPending = true;
+}
+
+static void feedTryVelocityLaserHalt(bool sideR, bool laserOn, uint32_t now)
+{
+  FeedSideRt& s = feedSideAt(sideR);
+  if (!feedVelocityLaserHaltEligible(s) || !laserOn) return;
+  if (!sendCanHaltFirstNonBlocking(sideR)) return;
+  feedAcceptVelocityLaserHalt(s, now);
+}
+
+// Ambos GPIO primero. Un Halt no bloqueante por lado. Sin SDO, OM, RX ni log.
+void feedPollVelocityLaserUrgent()
+{
+  const bool laserL = feedLaserMaterialPresentRaw(false);
+  const bool laserR = feedLaserMaterialPresentRaw(true);
+  const uint32_t now = millis();
+  feedTryVelocityLaserHalt(false, laserL, now);
+  feedTryVelocityLaserHalt(true, laserR, now);
+}
+
+// Tras el primer Halt aceptado: el resto del burst, omAtLaser y el log.
+static void feedVelocityLaserHaltFollowup(bool sideR)
+{
+  FeedSideRt& s = feedSideAt(sideR);
+  if (!s.velHaltFollowupPending) return;
+  if (!s.active || s.phase != FSP_VEL_STOPPING) {
+    s.velHaltFollowupPending = false;
+    return;
+  }
+  s.velHaltFollowupPending = false;
+  for (uint8_t i = 1; i < FEED_LASER_HALT_BURST; i++)
+    feedVelocityHaltCw(sideR);
+  s.omAtLaser = feedSideReadOmLiveMm(sideR, s);
+  Serial.printf("FEED %c LR-X ON → HALT\n", sideR ? 'R' : 'L');
 }
 
 // Watchdog / fallo PV: halt + TVel0 y esperar 0x606C~0 en VEL_STOPPING.
@@ -1847,9 +1901,8 @@ static void feedSideService(bool sideR, uint32_t now)
           s.phase = FSP_VEL_STOPPING;
           break;
         }
-        s.laserState = feedLaserMaterialPresentRaw(sideR);
-        if (s.laserState) {
-          feedSideVelocityHaltNow(sideR, now, "LR-X ON → HALT");
+        feedPollVelocityLaserUrgent();
+        if (s.velStopLatched) {
           s.phase = FSP_VEL_STOPPING;
           break;
         }
@@ -1869,6 +1922,7 @@ static void feedSideService(bool sideR, uint32_t now)
       break;
 
     case FSP_VEL_STOPPING:
+      if (s.velHaltFollowupPending) break;
       if (s.velHaltMs == 0) s.velHaltMs = now;
       if (s.velStopRetryMs == 0)
         s.velStopRetryMs = s.velHaltMs + FEED_VEL_STOP_FAILSAFE_MS;
@@ -2063,6 +2117,9 @@ static void feedPollLaserHaltSide(bool sideR, uint32_t now)
 void feedLoop()
 {
   motionNestedServiceDepth++;
+  feedPollVelocityLaserUrgent();
+  feedVelocityLaserHaltFollowup(false);
+  feedVelocityLaserHaltFollowup(true);
   feedCanServiceInitRequest(feedPhaseIsActive());
 
   // Legacy HTTP both-sides: encolar L y R independientes
@@ -2080,21 +2137,6 @@ void feedLoop()
 
   const uint32_t now = millis();
   serviceCANRx();
-  // LR-X: un Halt L y un Halt R antes de burst/SDO (prefetch || HOME no serializa tope).
-  const bool velHitL = feedPollVelocityLaserCw(false, now);
-  const bool velHitR = feedPollVelocityLaserCw(true, now);
-  if (velHitL) {
-    for (uint8_t i = 1; i < FEED_LASER_HALT_BURST; i++)
-      feedVelocityHaltCw(false);
-    feedSides[0].omAtLaser = feedSideReadOmLiveMm(false, feedSides[0]);
-    Serial.printf("FEED L LR-X ON → HALT\n");
-  }
-  if (velHitR) {
-    for (uint8_t i = 1; i < FEED_LASER_HALT_BURST; i++)
-      feedVelocityHaltCw(true);
-    feedSides[1].omAtLaser = feedSideReadOmLiveMm(true, feedSides[1]);
-    Serial.printf("FEED R LR-X ON → HALT\n");
-  }
   feedPollLaserHaltSide(false, now);
   feedPollLaserHaltSide(true, now);
   feedSideService(false, now);
