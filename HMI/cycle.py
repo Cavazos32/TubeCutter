@@ -94,7 +94,6 @@ FEED_WAIT_TIMEOUT_S = 15.0
 PF_READY_TIMEOUT_S = 15.0
 PIECE_WATCH_TIMEOUT_S = 20.0
 REFILL_LASER_TIMEOUT_S = 10.0
-PLC_ACK_TIMEOUT_S = 2.0
 # Vigilancia de ACK, fuera del camino de la pieza. No es un sleep del ciclo.
 PLC_ACK_WATCH_S = 1.0
 # Órdenes ya vencidas que siguen en cola para que su ACK tardío no cierre la siguiente.
@@ -328,7 +327,6 @@ class CycleConfig:
     pf_ready_timeout_s: float = 15.0
     piece_watch_timeout_s: float = 20.0
     refill_laser_timeout_s: float = 10.0
-    plc_ack_timeout_s: float = 2.0
     motion_idle_no_target_s: float = 1.0
     pf_tfeed_done_timeout_s: float = 30.0
     pf_settle_before_idle_s: float = 15.0
@@ -424,7 +422,6 @@ class CycleConfig:
             "pfReadyTimeoutS": "pf_ready_timeout_s",
             "pieceWatchTimeoutS": "piece_watch_timeout_s",
             "refillLaserTimeoutS": "refill_laser_timeout_s",
-            "plcAckTimeoutS": "plc_ack_timeout_s",
             "motionIdleNoTargetS": "motion_idle_no_target_s",
             "pfTfeedDoneTimeoutS": "pf_tfeed_done_timeout_s",
             "pfSettleBeforeIdleS": "pf_settle_before_idle_s",
@@ -550,7 +547,7 @@ def apply_cycle_config_runtime(cfg: CycleConfig) -> None:
     global WIP_BLOWER_MIN_TRAVEL_MM, WIP_START_CACHE_TOL_MM
     global WIP_BLOWER_LINEAL_MATCH_MIN_S, WIP_BLOWER_LINEAL_MATCH_MAX_S
     global MOTION_WAIT_TIMEOUT_S, FEED_WAIT_TIMEOUT_S, PF_READY_TIMEOUT_S
-    global PIECE_WATCH_TIMEOUT_S, REFILL_LASER_TIMEOUT_S, PLC_ACK_TIMEOUT_S
+    global PIECE_WATCH_TIMEOUT_S, REFILL_LASER_TIMEOUT_S
     global MOTION_IDLE_NO_TARGET_S, PF_TFEED_DONE_TIMEOUT_S
     global PF_SETTLE_BEFORE_IDLE_S, PF_TFEED_CAPTURE_AFTER_PAUSE_S
     global ASDA_HOME_EPS_MM, MOTION_TARGET_TOL_MM
@@ -579,7 +576,6 @@ def apply_cycle_config_runtime(cfg: CycleConfig) -> None:
     PF_READY_TIMEOUT_S = float(cfg.pf_ready_timeout_s)
     PIECE_WATCH_TIMEOUT_S = float(cfg.piece_watch_timeout_s)
     REFILL_LASER_TIMEOUT_S = float(cfg.refill_laser_timeout_s)
-    PLC_ACK_TIMEOUT_S = float(cfg.plc_ack_timeout_s)
     MOTION_IDLE_NO_TARGET_S = float(cfg.motion_idle_no_target_s)
     PF_TFEED_DONE_TIMEOUT_S = float(cfg.pf_tfeed_done_timeout_s)
     PF_SETTLE_BEFORE_IDLE_S = float(cfg.pf_settle_before_idle_s)

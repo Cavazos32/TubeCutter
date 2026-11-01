@@ -35,7 +35,6 @@
   "pfTfeedDoneTimeoutS": 30.0,
   "pfTriggerEnabled": false,
   "pieceWatchTimeoutS": 20.0,
-  "plcAckTimeoutS": 2.0,
   "plcBlowerSec": 0.2,
   "purgeWarningLeadS": 0.3,
   "refillAsdaMm": -300.0,
