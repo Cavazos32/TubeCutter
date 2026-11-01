@@ -1346,7 +1346,13 @@ class CycleRunner:
                 self._recovery_prompt = ""
                 self._pending_lot_decision = False
             if ok:
-                self._host.cycle_log("Recovery: operador eligió continuar el lote")
+                # Ya decidió seguir el lote: la pieza rearrancada no vuelve a
+                # pedir revisión, purga ni «continuar ciclo».
+                self._recovery_after_error = False
+                self._host.cycle_log(
+                    "Recovery: operador eligió continuar el lote — "
+                    "producción sigue sin otra confirmación"
+                )
                 self._host.cycle_notify()
                 return {"ok": True, "resume": True}
             self._host.cycle_log("Recovery: operador eligió abortar el ciclo")
