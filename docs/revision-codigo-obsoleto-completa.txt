@@ -1,0 +1,491 @@
+================================================================================
+TCM — REVISIÓN COMPLETA: CÓDIGO OBSOLETO, DUPLICADO Y COMPLEJIDAD INNECESARIA
+================================================================================
+Alcance: HMI (Python + React), PLC, Motion, PreFeeder, Andon, common/, docs/
+Modo: solo revisión (sin cambios de código en firmware/lógica de negocio)
+Fecha: 1 de noviembre de 2026
+
+================================================================================
+RESUMEN EJECUTIVO
+================================================================================
+
+La intuición de “muchas cosas que no se usan, parches sobre parches, funciones
+repetidas con otros nombres y parámetros repartidos” encaja con el estado del repo.
+
+  HMI backend
+    - state.py (~5017 líneas) y cycle.py (~5280 líneas) concentran casi todo.
+    - Catálogo de errores EXXX duplicado; dos fórmulas de progreso de lote.
+    - Varios wrappers TCP/API sin uso; nombres confusos (“error policy” x2).
+
+  HMI frontend
+    - Recuperación/purga de lote duplicada en MaquinaTab y CycleTab (~150+ líneas
+      cada uno) con deriva ya visible entre tabs.
+    - API muerta (resetCycle, getCycleConfig, getAppConfig); reset real vía
+      resetError con handler mal nombrado resetCycleCmd.
+    - ~178 de ~553 claves i18n sin cablear; tema oscuro e i18n EN preparados
+      pero inactivos; flags CAN en Motion siempre false en el mapper.
+
+  Firmware
+    - EspLink común, pero hold/TCP flush y parsers JSON copiados en cada .ino.
+    - PreFeeder Master vs esclavo: dos fuentes de verdad (comandos, fallos,
+      enums SystemFault distintos); posible bug en FAULT_OPERATOR → wire 0.
+    - plcStateName/motStateName en headers sin uso; switches locales duplicados.
+
+  Repo y docs
+    - PreFeeder/tools: ~92 MB (arduino-cli duplicado + zip); sin referencias fuera.
+    - docs/README.md: estructura HMI desactualizada (rutas y nombres de config).
+
+No hay TODO/FIXME en .py del backend HMI (grep vacío).
+
+
+================================================================================
+1. SEÑALES DE “PARCHE SOBRE PARCHE”
+================================================================================
+
+1.1 Dos capas llamadas “política de error”
+  - core/error_policy.py → clase ErrorPolicy (latch EXXX para snapshot/API).
+  - cycle.py → CycleRunner.apply_error_policy() (pausa secuencia / hold del lote).
+  - core/state.py encadena: _error_policy.set_error y luego puede llamar
+    _cycle.apply_error_policy(ui).
+  Mismo término, dos responsabilidades; confunde lectura y onboarding.
+
+1.2 Catálogo EXXX en dos sitios (solo uno manda en runtime)
+  - HMI/machine_states.py líneas ~18-33: CYC_ERR_*, MAIN_ERR_*, ANDON_ERR_*.
+  - HMI/core/error_catalog.py: tabla _ROWS con mismos bytes y slugs.
+  Evidencia: rg CYC_ERR_|MAIN_ERR_ en *.py → solo machine_states.py y strings
+  en error_catalog.py; ningún import de esas constantes desde machine_states
+  para resolver errores. Quien manda: lookup(), format_ui(), ErrorPolicy.
+
+1.3 Dos fórmulas de progreso de lote
+  - cycle.py: _set_progress (~2357-2359): ((rep-1) + step/PROGRESS)/total.
+  - core/state.py: _cycle_live_progress (~4012-4018): incluye (step-1 + intra).
+  UI mezcla cycle_snap["progress"] con recálculo en HmiState → % puede divergir.
+
+1.4 Migración legacy activa (no es dead code, pero infla cycle.py)
+  - LEGACY_*, migrate_legacy_config_files() en cada load/save de config.
+  - Migra/borra config/cycle_config.json y app_config.json viejos hacia
+    config/cycle.json, etc.
+
+1.5 Dos endpoints HTTP → misma función backend
+  - app.py: POST /api/cycle/reset y POST /api/error/reset → get_state().cmd_error_reset().
+  - Frontend: resetCycle() → /api/cycle/reset (sin consumidores).
+  - useHmiState resetCycleCmd → api.resetError → /api/error/reset (confirm: true).
+
+1.6 Build frontend con reglas distintas
+  - app.py ensure_frontend_dist / frontend_dist_is_stale: rebuild si src > dist.
+  - iniciar_hmi.py _build_frontend_if_needed: solo si falta dist/index.html.
+  Variable: HMI_AUTO_BUILD_UI (default rebuild en app.py).
+
+1.7 Puntos de entrada HMI (todos válidos, documentación debe aclarar)
+  - HMI/iniciar_hmi.py — canónico operador (bat, ps1).
+  - HMI/scripts/iniciar_hmi.py — execv al launcher raíz (compatibilidad).
+  - python app.py — systemd tcm-hmi.service, desarrollo.
+
+
+================================================================================
+2. HMI PYTHON — SÍMBOLOS MUERTOS O HUÉRFANOS
+================================================================================
+
+Severidad ALTA
+  machine_states.py — CYC_ERR_*, MAIN_ERR_*, ANDON_ERR_PRESSURE (L18-33)
+    Duplicado de error_catalog; cero imports de uso.
+
+Severidad MEDIA
+  core/error_catalog.py — is_detail_error_byte() (L133): sin call sites.
+  core/error_catalog.py — ERROR_LABELS: importado en plc.py, prefeeder.py,
+    state.py; el dict no se lee en código (coste al importar).
+  clients/plc.py — STATE_LABELS (L43-50): huérfano; textos en state.py PLC_STATE_TEXT.
+  clients/prefeeder.py — STATE_LABELS: igual; PF_STATE_TEXT en state.py.
+  core/state.py — cmd_cycle_reset(): solo definición; Flask usa cmd_error_reset.
+  cycle.py — imports CMD_START, CMD_STOP, CMD_RESET, MACHINE_STATE_BYTES sin uso.
+  clients/motion.py — cmd_reset_error() idéntico a cmd_reset_errors(); solo usa
+    cmd_reset_errors en state.py.
+  clients/plc.py — cmd_poll(): nunca invocado.
+  clients/andon.py — cmd_status(): nunca invocado.
+
+Severidad BAJA
+  machine_states.py — MACH_RETURN, TX_RETURN alias MACH_PAUSE; sin consumidores
+    fuera del archivo. state.py usa TX_RETURN de clients/motion.py (0x0E), no torre.
+  machine_states.py — MACH_INIT, MACH_START, MACH_FINISH: ciclo usa TX_* importados.
+  Comentario obsoleto machine_states L35: "Aliases usados por cycle.py" + CMD_*;
+    cycle importa CMD_* pero no los usa.
+
+
+================================================================================
+3. HMI PYTHON — LÓGICA DUPLICADA
+================================================================================
+
+ALTA
+  Progreso de lote (cycle._set_progress vs state._cycle_live_progress).
+  Bytes EXXX (machine_states vs error_catalog).
+
+MEDIA
+  Nombre apply_error_policy (runner) vs clase ErrorPolicy (state).
+  Reset HTTP dual (/api/cycle/reset vs /api/error/reset).
+  Compilación UI (app.py vs iniciar_hmi.py).
+  cmd_reset_error = cmd_reset_errors en motion.py.
+  utc_now_iso en checklist_history vs _utc_now_iso en clients/checklist.py.
+  Mapas byte→texto: STATE_LABELS en machine_states (torre) + PLC_STATE_TEXT,
+    PF_STATE_TEXT, STATE_TEXT en state.py + STATE_LABELS muertos en clients.
+
+BAJA
+  Alias MACH_* → TX_* / CMD_* en machine_states; comentario desactualizado.
+
+
+================================================================================
+4. HMI PYTHON — MÓDULOS: SOLAPAMIENTO Y ROLES
+================================================================================
+
+cycle.py vs cycle_analysis_log.py
+  Complementarios. cycle.py = secuencia de lote. cycle_analysis_log.py = Markdown
+  en logs/cycle_runs/, classify_cycle_log_message, record_event. state.py importa
+  ambos vía hooks.
+
+machine_states.py vs core/state.py
+  machine_states: bytes torre Andon 0x40-0x49, andon_tower_outputs().
+  state.py: HmiState, TCP, snapshot Flask, checklist, latch EXXX.
+  Problema: bloque EXXX en machine_states sin uso.
+
+error_catalog.py vs error_policy.py
+  Diseño intencional: catálogo estático vs latch runtime. No fusionar sin motivo.
+
+CycleRunner.apply_error_policy vs ErrorPolicy
+  Cadena: catálogo → latch state → runner pausa. Nomenclatura duplicada confunde.
+
+
+================================================================================
+5. HMI PYTHON — MAPA DE DEPENDENCIAS (referencia)
+================================================================================
+
+iniciar_hmi.py → app.py → core/state.py
+  ├── cycle.py → machine_states, cycle_analysis_log, clients.plc
+  ├── clients/* → core/tcp_link, error_catalog (plc/pf)
+  ├── error_policy → error_catalog
+  └── checklist_history, cycle_analysis_log
+
+scripts/iniciar_hmi.py → exec → iniciar_hmi.py
+tests/test_link_ping.py → clients/*, ping TCP
+scripts/verificar_rutas.py → rutas en disco (no importa app)
+
+
+================================================================================
+6. HMI FRONTEND — HALLAZGOS
+================================================================================
+
+6.1 Severidad ALTA
+
+Recuperación / purga duplicada (MaquinaTab ↔ CycleTab)
+  Archivos:
+    HMI/frontend/src/components/MaquinaTab.tsx
+      recoveryStage ~321, recoveryTitle/recoveryHint ~403-458, UI ~1049-1234
+    HMI/frontend/src/components/CycleTab.tsx
+      recoveryStage ~227, recoveryTitle/recoveryHint ~244-295, UI ~541-728
+  Deriva: MaquinaTab incluye recoveryStage === 'working' en banner ámbar;
+    CycleTab omite 'working' en recoveryTitle (solo en showManualRefill).
+
+resetCycle API sin uso; reset real es resetError
+  hmiApi.ts resetCycle → POST /api/cycle/reset (solo definición, cero imports).
+  useHmiState.ts resetCycleCmd → api.resetError({ confirm: true }) → /api/error/reset.
+  App.tsx pasa hmi.resetCycleCmd a onReset en tabs.
+
+Motion CAN testing siempre false
+  mappers.ts mapMotionState: feederCanLTesting: false, feederCanRTesting: false.
+  MotionTab.tsx estilos botones “Probar izq./der.” ~482, ~511 → UI “muerta”.
+
+
+6.2 Severidad MEDIA
+
+Funciones API sin referencias en src/
+  resetCycle, getCycleConfig, getAppConfig (hmiApi.ts).
+  post exportado público: solo uso interno en hmiApi.ts.
+
+Patrones API duplicados
+  Mayoría: api() + post() con Content-Type JSON.
+  Excepciones: unlockDebugMode, resetMaintenanceCycleCounter — fetch manual,
+    códigos server_unavailable / invalid_password reimplementados (~177-236).
+
+Aliases mapper sin consumidores (mappers.ts ~425-426)
+  isPfGenericErrorText, pfVisibleStatusText — solo se usa isGenericErrorText
+  (MaquinaTab).
+
+parseLogs reexportado por useHmiState (~935): ningún componente usa hmi.parseLogs.
+
+Superposición types.ts ↔ backendTypes.ts
+  CycleConfig vs BackendCycleConfig (feedSides, plcBlowerSec? solo en backend).
+  BackendFlowStep (action|wait|parallel) vs CycleStep (action|delay|background|join);
+    stepsFromFlow() en CycleTab ~146.
+  BackendLink vs ConnectionState (+ latencyMs?, lastHeartbeat? nunca asignados).
+  mapCycleConfig: cast frágil { ...(cfg as CycleConfig), feedSides, pfTriggerEnabled }.
+
+Tipos/campos sin uso runtime
+  AppConfigState (~220): cero imports.
+  ConnectionState.latencyMs, lastHeartbeat.
+  ValveItem.errorMessage.
+  MotionState.errorCode (mapper no rellena).
+
+AppContext.tsx
+  isDarkMode false; comentario “siempre tema claro”.
+  setIsDarkMode / toggleDarkMode: ningún componente en components/ los usa.
+  Persiste tcm_hmi_theme; t() solo translations.es; elimina tcm_hmi_lang al montar.
+
+Traducciones muertas (~32%, ~178 claves)
+  Archivo: src/i18n/translations.ts (~553 claves, ~375 usadas).
+  Grupos típicos sin t('…'):
+    hmi_title, hmi_subtitle
+    settings_*, sim_*, theme_*, appearance_*, network_nodes_*, shortcuts_*
+    cycle_config_title, cfg_deposito_*, btn_test_step, btn_simulate_cycle
+    lot_recover_*, pf_recover_* (coach no cableado)
+    andon_preset_*, andon_hint_*, andon_out_*
+    search_placeholder vs search_logs; filter_* vs all/cmds/errors
+    tab_maquina (Navigation no tiene tab máquina dedicado como en claves)
+
+Optimistic updates gemelos en useHmiState
+  toggleCycleMaterialist (~376-435) y toggleCycleBusy (~437-468): mismo patrón
+  snap + view, patch optimista, POST, revert (materialist revierte en catch).
+
+ChecklistModal.applyChecklistResponse
+  Si respuesta sin checklist → getState() extra aunque SSE + poll ya existen.
+  mapChecklistState({ checklist: res.checklist } as BackendSnapshot) — snapshot parcial.
+
+
+6.3 Severidad BAJA
+
+  14 componentes en src/components/ — todos importados en App.tsx (ninguno huérfano).
+  Un solo hook: useHmiState.ts en uso.
+  CYCLE_STEPS_DEFINITION en CycleTab ~70: fallback si cycleFlow vacío (no dead).
+  motionMove encadena setMmRpm + motionAction('move'); App usa setMmRpm solo — OK.
+
+
+================================================================================
+7. FIRMWARE — DUPLICACIÓN Y CONFIG
+================================================================================
+
+7.1 Config repetida (Medium)
+  Mismo bloque WiFi/IP/puerto/OTA en:
+    PLC/Config.h          (.51, 8766, WIFI_SSID, WIFI_PASS)
+    Motion/Config.h       (.20, 8767, + STA_DNS)
+    Andon/Config.h        (.61, 8769, + STA_DNS)
+    PreFeeder/config.h    (.101/.102, peer 8765)
+    PreFeeder/Master/config.h (.100, 8768, PF_MASTER_WIFI_*)
+  Nota: credenciales reales en árbol; consolidar no debe ampliar exposición.
+
+7.2 Constantes WiFi timeout muertas (Medium)
+  ESP_WIFI_ATTEMPT_MS / ESP_WIFI_RETRY_MS en common/EspLink.h — usadas.
+  WIFI_CONNECT_TIMEOUT_MS, WIFI_RETRY_INTERVAL_MS en Config.h de módulos —
+    grep: solo en headers, no en .ino.
+
+7.3 DNS (Low)
+  Motion/Andon: STA_DNS en espStaKick.
+  PLC/PreFeeder: STA_GW como DNS en espStaKick.
+
+7.4 PIN_ETH_* (Low)
+  PLC/Config.h, Motion/Config.h: sin referencias fuera Config.
+  Andon/Andon.ino ~555-559: sí usa PIN_ETH_*.
+
+7.5 Naming (Low)
+  Config.h (PLC/Motion/Andon) vs config.h (PreFeeder).
+
+
+================================================================================
+8. FIRMWARE — EspLink Y TCP/JSON COPIADOS
+================================================================================
+
+EspLink (common/EspLink.h) — BIEN centralizado
+  Incluido en: PLC.ino, Motion.ino, Andon.ino, PreFeeder.ino, Master.ino.
+
+Copias locales del patrón hold/flush/noteDead (High)
+  PLC:     txHold, tcpNoteDead, tcpTx, tcpTxPump (+ ACK queue solo PLC)
+  Andon:   tcpHold, misma forma (String vs const char*)
+  Motion:  asdaHold, asdaTcpNoteDead, asdaTcpTx
+  PF slave: peerHold, peerNoteDead, peerTx
+  PF Master: pfTcpHold, pfHoldL/R, pfTcpNoteDead, pfTx, pfTcpTxPump
+
+Parsers JSON substring (High) — sin common/JsonScan.h
+  jStr, jBool, jInt en PLC.ino ~733+, Andon ~326-354, PreFeeder.ino ~830+,
+  Master.ino ~114-153 (+ jFloat, jSideChar).
+  Motion: asdaTcpJStr, asdaTcpJBool ~2839+.
+
+
+================================================================================
+9. FIRMWARE — HEADERS/FUNCIONES SIN USO
+================================================================================
+
+  PlcStates.h   plcStateName()     — PLC.ino usa plcTcpStateName() local ~478-488
+  MotionStates.h motStateName()    — Motion.ino usa asdaTcpStateName() ~3085-3094
+  protocol.h    pfErrorName()      — Master usa pfTcpErrorName() ~1030
+  protocol.h    pfIsCmdByte/State/Error — solo pfTcpIs* en Master ~1282
+  protocol.h    no incluido por PreFeeder.ino (solo Master + contrato HMI)
+  pf_types.h    vía pf_status_mode.h en Master; esclavo usa machine.h
+  preview_ui.html — gen_preview.py; no build firmware
+
+
+================================================================================
+10. PREFeeder — MASTER VS ESCLAVO (CRÍTICO / ALTO)
+================================================================================
+
+10.1 Arquitectura (intencional)
+  Master .100:8768 — agrega L/R, protocol.h opcodes, master_html.h
+  Esclavo L/R .101/.102:8765 + HTTP :80 — machineTick, holgura, page.h
+
+10.2 Comandos — dual source of truth (HIGH)
+  Master: PreFeeder/Master/master_cmds.h pfMasterCmdScope
+  Esclavo: PreFeeder.ino dispatchPeerJson() ~865-907
+  Mismos strings (start, setInProcess, refillHold*, setAllCfg, …) sin header común.
+  Master envía JSON command/value/id; esclavo parsea misma forma.
+
+10.3 HTTP /api/auto — semántica paralela (Medium)
+  Esclavo handleAuto() ~1140-1184: cola NetCommand local.
+  Master pfBroadcastAutoFromQuery() ~695-734: broadcast a peers TCP.
+
+10.4 Status JSON (Medium)
+  Esclavo buildPeerStatus() ~910-971 vs Master parseSideSnapshot ~330-411
+  Esclavo sendStatusJson() ~1031-1123 más rico (auto, trigger2, sensors) — UI local.
+
+10.5 SystemFault — enums duplicados (CRITICAL)
+  PreFeeder/machine.h:
+    FAULT_TENSION, FAULT_CYLINDER, FAULT_OPERATOR, …
+  PreFeeder/Master/pf_types.h:
+    FAULT_TENSION_TIMEOUT, FAULT_CYLINDER_OPEN, FAULT_OPERATOR_STOP, …
+  Misma disposición numérica implícita vía PF_ERROR_TABLE / machineFaultWireCode,
+  pero dos tipos C++ sin header compartido.
+
+10.6 Bug probable operador (CRITICAL)
+  PreFeeder.ino asigna fault = FAULT_OPERATOR (~634).
+  machineFaultWireCode() ~801-813:
+    cases 1-6 para ENDSTOP…HOLGURA; default return 0 — NO case FAULT_OPERATOR.
+  Master pf_status_mode.h espera PF-007, id 7, FAULT_OPERATOR_STOP.
+  → Esclavo puede reportar wire 0 con fallo operador activo.
+
+10.7 Bases wire duplicadas (Medium)
+  PreFeeder/config.h PF_FAULT_WIRE_BASE 20/30
+  Master pf_status_mode.h PF_WIRE_BASE_L/R — mismos valores, dos defs.
+
+
+================================================================================
+11. FIRMWARE — MÁQUINAS DE ESTADO TCP HMI (patrón clonado)
+================================================================================
+
+Mismo esqueleto en PLC, Motion (ASDA TCP), PreFeeder Master:
+  *TcpResolveStateByte — ERROR/STOP/RETURN/BUSY/IDLE
+  *TcpPushStateIfChanged — dedupe *LastStateByte
+  *TcpTxState — JSON type state, byte, name InitState|…
+  *TcpPollStateEvents — INIT una vez
+
+  PLC:    plcTcpResolveStateByte ~467; nombres locales duplican PlcStates.h
+  Motion: asdaTcpResolveStateByte ~3078
+  Master: pfTcpResolveStateByte ~975; pfTcpStateName desde protocol.h (OK)
+
+Esclavos PF no exponen FSM byte HMI en :8765 (solo status JSON).
+
+ErrClass triplicado (#ifndef ERR_CLASS_DEFINED) en PlcStates, MotionStates, AndonStates.
+
+OTA setup duplicado: PLC.ino, Motion.ino, PreFeeder.ino. Master: hostname WiFi,
+  sin ArduinoOTA en Master.ino. Andon: sin bloque OTA encontrado.
+
+
+================================================================================
+12. PREFeeder/tools — REPO BLOAT
+================================================================================
+
+  PreFeeder/tools/arduino-cli/     ~37M  arduino-cli.exe
+  PreFeeder/tools/ac/              ~37M  duplicado exe + LICENSE
+  PreFeeder/tools/arduino-cli.zip  ~18M
+  Total aproximado ~92 MB
+
+  gen_preview.py     — dev; preview_ui.html
+  holgura_fsm_sim.py — sim offline; riesgo drift vs PreFeeder.ino
+
+  Grep repo: sin referencias a arduino-cli, gen_preview, holgura_fsm fuera tools/.
+  Comparar: Motion/tools/embed_index.py pequeño y ligado a Index.h.
+
+
+================================================================================
+13. DOCUMENTACIÓN DESACTUALIZADA
+================================================================================
+
+docs/README.md (estructura listada vs real):
+
+  Doc dice                          Realidad
+  ─────────────────────────────────────────────────────────
+  HMI/state.py                      HMI/core/state.py
+  HMI/motion.py, plc.py, prefeeder  HMI/clients/motion.py, plc.py, prefeeder.py
+  config/models.json                config/model.json
+  config/cycle_config.json          config/cycle.json (+ register.json)
+  Ajustes: tema, idioma ES/EN       UI: tema claro forzado, solo ES activo
+
+Doc dice ajustar IPs en motion.py, plc.py, prefeeder.py — rutas clients/.
+
+
+================================================================================
+14. LO QUE SÍ PARECE DISEÑO INTENCIONAL (no tachar como basura)
+================================================================================
+
+  - Separación error_catalog (estático) vs error_policy (runtime).
+  - machine_states.py para torre Andon 0x40-0x49 y andon_tower_outputs().
+  - scripts/iniciar_hmi.py como delegador de una línea al launcher raíz.
+  - Headers *States.h / protocol.h como contrato de opcodes por módulo.
+  - cycle_analysis_log.py complementa cycle.py (no compite).
+  - EspLink ya compartido; ACK ring y dual-client Master son extensiones válidas.
+
+
+================================================================================
+15. PRIORIDADES SUGERIDAS (si se limpia en el futuro)
+================================================================================
+
+CRÍTICA
+  1. Un solo PreFeeder/pf_fault_types.h (o equivalente): SystemFault, wire ids,
+     machineFaultWireCode() / PF_ERROR_TABLE — corregir FAULT_OPERATOR → wire.
+
+ALTA
+  2. Una sola fuente bytes EXXX (error_catalog); quitar bloque muerto machine_states
+     o re-exportar desde catálogo.
+  3. Unificar fórmula progreso cycle.py ↔ state.py.
+  4. Componente/hook único recuperación MaquinaTab + CycleTab.
+  5. Gitignore o eliminar PreFeeder/tools/{arduino-cli,ac,arduino-cli.zip};
+     documentar instalación CLI en README.
+
+MEDIA
+  6. Podar símbolos muertos Python (ERROR_LABELS, is_detail_error_byte, imports
+     cycle.py, cmd_* huérfanos, STATE_LABELS clients).
+  7. Frontend: API muerta, i18n, aliases mapper, alinear resetCycle/resetError.
+  8. common/pf_peer_commands.h — strings comando + scope compartido Master/esclavo.
+  9. common/EspTcpClient.h + common/JsonScan.h en firmware.
+ 10. Documentar arranque UI y API reset; unificar criterio build si se desea.
+
+BAJA
+  11. Actualizar docs/README.md estructura y rutas config.
+  12. Usar plcStateName/motStateName en .ino o borrar duplicados en headers.
+  13. Quitar WIFI_*_TIMEOUT muertos de Config o conectar a EspLink.
+  14. preview_ui.html solo en dev / CI freshness.
+
+
+================================================================================
+16. ARCHIVOS CLAVE REVISADOS (índice)
+================================================================================
+
+HMI Python:
+  app.py, cycle.py, cycle_analysis_log.py, machine_states.py, checklist_history.py,
+  iniciar_hmi.py, core/state.py, core/error_catalog.py, core/error_policy.py,
+  core/tcp_link.py, clients/andon.py, checklist.py, motion.py, plc.py, prefeeder.py,
+  scripts/iniciar_hmi.py, scripts/verificar_rutas.py, tests/test_link_ping.py,
+  deploy/tcm-hmi.service
+
+HMI Frontend:
+  src/App.tsx, api/hmiApi.ts, api/mappers.ts, api/backendTypes.ts, types.ts,
+  hooks/useHmiState.ts, context/AppContext.tsx, i18n/translations.ts,
+  components/MaquinaTab.tsx, CycleTab.tsx, MotionTab.tsx, ChecklistModal.tsx, …
+
+Firmware:
+  common/EspLink.h, PLC/PLC.ino, PLC/Config.h, PLC/PlcStates.h,
+  Motion/Motion.ino, Motion/Config.h, Motion/MotionStates.h,
+  Andon/Andon.ino, Andon/Config.h, Andon/AndonStates.h,
+  PreFeeder/PreFeeder.ino, PreFeeder/config.h, PreFeeder/machine.h, PreFeeder/protocol.h,
+  PreFeeder/Master/Master.ino, master_cmds.h, pf_types.h, pf_status_mode.h, config.h
+
+Docs:
+  docs/README.md
+
+
+================================================================================
+FIN DEL INFORME
+================================================================================
