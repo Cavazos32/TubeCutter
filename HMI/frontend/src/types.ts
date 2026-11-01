@@ -35,6 +35,8 @@ export interface CycleConfig {
   refillMm?: number;
   /** Posición park ASDA antes del refill (convención firmada HMI). */
   refillAsdaMm?: number;
+  /** Espera tras ordenar HOME y antes de prender el soplo, en segundos. */
+  wipBlowerStartDelayS?: number;
 }
 
 export type CycleStepType = 'action' | 'delay' | 'background' | 'join';

@@ -3085,10 +3085,11 @@ class CycleRunner:
                     kind = self._host.last_move_fail_kind()
                 self._raise_fault("E065" if kind == "transport" else "home_cmd")
             return False
-        # Idle/Reached del despeje no debe cerrar este HOME.
-        self._host.clear_motion_reached_flag()
         if not self._wait_duration_s(WIP_BLOWER_START_DELAY_S):
             return False
+        # Un solo descarte, ya cumplido el delay. Si el carro no está en 0,
+        # el Reached de este rato es del despeje y no debe cerrar el HOME.
+        # Si ya está en 0, se conserva para que la espera termine.
         pos = self._host.asda_position_mm()
         if pos is None or abs(float(pos)) > WIP_BLOWER_MIN_TRAVEL_MM:
             self._host.clear_motion_reached_flag()

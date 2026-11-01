@@ -64,6 +64,7 @@ export const DEFAULT_CYCLE_CONFIG: CycleConfig = {
   pfTriggerEnabled: true,
   refillMm: 55,
   refillAsdaMm: -300,
+  wipBlowerStartDelayS: 0.05,
 };
 
 /** Fallback local si el backend aún no envió flow (arranque). */
@@ -1064,6 +1065,22 @@ export const CycleTab: React.FC<CycleTabProps> = ({
                 min={0}
                 value={config.gripperClearanceMm ?? 0}
                 onChange={(e) => updateConfigField('gripperClearanceMm', Number(e.target.value))}
+                className={hmiModuleCompactFieldInput}
+              />
+            </label>
+            <label className="min-w-0">
+              <span className={cfgLabel}>{t('cfg_wip_blower_start_delay')}</span>
+              <input
+                id="input-wip-blower-start-delay"
+                type="number"
+                step={1}
+                min={0}
+                value={Math.round((config.wipBlowerStartDelayS ?? 0.05) * 1000)}
+                onChange={(e) => {
+                  const ms = Number(e.target.value);
+                  if (!Number.isFinite(ms)) return;
+                  updateConfigField('wipBlowerStartDelayS', Math.max(0, ms) / 1000);
+                }}
                 className={hmiModuleCompactFieldInput}
               />
             </label>

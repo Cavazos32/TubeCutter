@@ -96,6 +96,7 @@ export const translations = {
     cfg_deposito_stack_gap: 'Separación entre montones (mm)',
     cfg_deposito_max_travel: 'Recorrido máximo de depósito (mm)',
     cfg_gripper_clearance: 'Espacio libre tras abrir pinzas (mm)',
+    cfg_wip_blower_start_delay: 'Retardo del soplo al ir a inicio (ms)',
     cfg_offset_izq: 'Ajuste lado izquierdo (mm)',
     cfg_offset_der: 'Ajuste lado derecho (mm)',
     cfg_cut_offset: 'Ajuste de longitud de corte (mm)',
