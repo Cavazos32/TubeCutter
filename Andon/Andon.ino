@@ -4,6 +4,7 @@
 #include "Config.h"
 #include "AndonStates.h"
 #include <WiFi.h>
+#include "../common/EspLink.h"
 
 static WiFiServer tcpServer(ANDON_TCP_PORT);
 static WiFiClient tcpClient;
@@ -12,9 +13,9 @@ static uint16_t tcpRxLen = 0;
 static bool tcpServicesUp = false;
 static bool tcpWasConnected = false;
 
-static bool wifiStaWasConnected = false;
-static uint32_t wifiConnectStartedMs = 0;
-static uint32_t wifiLastKickMs = 0;
+static EspSta staLink;
+static char tcpHoldBuf[512];
+static EspTcpHold tcpHold = {tcpHoldBuf, sizeof(tcpHoldBuf), 0};
 
 static uint8_t lastMachineByte = ANDON_RX_IDLE;
 static bool pressureFaultLatched = false;
@@ -300,17 +301,26 @@ static bool tcpLinkOk()
   return tcpClient && tcpClient.connected();
 }
 
+static void tcpNoteDead()
+{
+  espTcpStop(tcpClient);
+  espTcpHoldClear(tcpHold);
+}
+
 static bool tcpTx(const String& m)
 {
-  if (!tcpLinkOk()) return false;
-  bool ok = tcpClient.print(m) > 0;
-  if (!m.endsWith("\n"))
-    ok = (tcpClient.print("\n") > 0) && ok;
-  if (!ok) {
-    tcpClient.stop();
-    return false;
-  }
-  return true;
+  if (!m.length() || tcpHold.len || !tcpLinkOk()) return false;
+  if (!espTcpHoldPut(tcpHold, m.c_str())) return false;
+  if (espTcpHoldFlush(tcpClient, tcpHold)) return true;
+  if (!tcpClient.connected()) tcpNoteDead();
+  return false;
+}
+
+static void tcpTxPump()
+{
+  if (!tcpLinkOk() || !tcpHold.len) return;
+  if (!espTcpHoldFlush(tcpClient, tcpHold) && !tcpClient.connected())
+    tcpNoteDead();
 }
 
 static int jInt(const char* j, const char* k, int d)
@@ -361,7 +371,15 @@ static void tcpOnLine(const char* line)
 
   const String cmd = jStr(line, "command");
   if (cmd == "ping") {
-    tcpTx("{\"type\":\"pong\"}");
+    char pong[80];
+    snprintf(pong, sizeof(pong),
+             "{\"ver\":%u,\"type\":\"pong\",\"actuator\":\"andon\"}",
+             (unsigned)ANDON_PROTO_VER);
+    tcpTx(pong);
+    return;
+  }
+  if (cmd == "status" || cmd == "poll") {
+    andonTxStatus();
     return;
   }
   if (cmd == "buzzerMute") {
@@ -425,6 +443,8 @@ static void tcpRxDrain()
 static void tcpOnClientAccepted()
 {
   tcpClient.setNoDelay(true);
+  espTcpKeepAlive(tcpClient);
+  espTcpHoldClear(tcpHold);
   tcpRxLen = 0;
   tcpTx(String("{\"ver\":") + ANDON_PROTO_VER + ",\"type\":\"hello\",\"role\":\"andon\"}");
   andonTxStatus();
@@ -437,7 +457,7 @@ static bool tcpAcceptIncoming()
   WiFiClient incoming = tcpServer.available();
   if (!incoming) return false;
   if (tcpClient)
-    tcpClient.stop();
+    espTcpStop(tcpClient);
   tcpClient = incoming;
   tcpOnClientAccepted();
   return true;
@@ -459,106 +479,61 @@ static void tcpEnsureServices()
 
 static void tcpStopServices()
 {
-  // Invalidar siempre el socket (también zombies con connected()==false).
-  if (tcpClient) tcpClient.stop();
+  tcpNoteDead();
   tcpWasConnected = false;
   tcpRxLen = 0;
   if (!tcpServicesUp) return;
   tcpServer.end();
   tcpServicesUp = false;
-  Serial.println("[TCP] Off");
-}
-
-// --- WiFi (reconexión no bloqueante) ---
-static void wifiKickConnect(bool isRetry)
-{
-  if (isRetry) {
-    // Sin delay: el loop debe seguir atendiendo torreta / presión / TCP teardown.
-    WiFi.disconnect(false);
-  }
-
-  WiFi.persistent(false);
-  WiFi.mode(WIFI_STA);
-  WiFi.setHostname("andon");
-  WiFi.setSleep(false);
-
-  if (!WiFi.config(STA_IP, STA_GW, STA_MASK, STA_DNS)) {
-    Serial.println("WiFi.config() fallo (IP estatica)");
-  }
-
-  const uint32_t now = millis();
-  wifiConnectStartedMs = now;
-  wifiLastKickMs = now;
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  if (isRetry)
-    Serial.println("[WiFi] Reintentando STA...");
-  else
-    Serial.printf("Conectando a WiFi '%s' -> %s...\n",
-                  WIFI_SSID, STA_IP.toString().c_str());
+  Serial.println("[TCP] Servicios Off");
 }
 
 static void serviceWifi()
 {
-  const wl_status_t st = WiFi.status();
-
-  if (st == WL_CONNECTED) {
-    if (!wifiStaWasConnected) {
-      wifiStaWasConnected = true;
-      wifiConnectStartedMs = 0;
-      const IPAddress ip = WiFi.localIP();
-      Serial.printf("WiFi OK  IP=%s  RSSI=%d dBm\n",
-                    ip.toString().c_str(), WiFi.RSSI());
-      if (ip != STA_IP) {
-        Serial.printf("[WiFi] AVISO: IP real %s != fija %s\n",
-                      ip.toString().c_str(), STA_IP.toString().c_str());
-      }
+  const uint8_t ev = espStaPoll(staLink);
+  if (ev & ESP_STA_UP) {
+    const IPAddress ip = WiFi.localIP();
+    Serial.printf("WiFi OK  IP=%s  RSSI=%d dBm\n",
+                  ip.toString().c_str(), WiFi.RSSI());
+    if (ip != STA_IP) {
+      Serial.printf("[WiFi] AVISO: IP real %s != fija %s\n",
+                    ip.toString().c_str(), STA_IP.toString().c_str());
     }
-    return;
+    tcpEnsureServices();
   }
-
-  // STA caído: invalidar TCP de inmediato; luego rearmar WiFi sin bloquear.
-  if (wifiStaWasConnected) {
-    wifiStaWasConnected = false;
+  if (ev & ESP_STA_BLIP)
+    Serial.println("[WiFi] blip — esperando auto-reconexion");
+  if (ev & ESP_STA_DOWN) {
     tcpStopServices();
-    wifiConnectStartedMs = 0;
-    wifiLastKickMs = 0;  // permitir reintento inmediato
-    Serial.println("WiFi perdido — reconectando...");
+    Serial.println("[WiFi] Off");
   }
-
-  const uint32_t now = millis();
-  if (wifiLastKickMs != 0 && (now - wifiLastKickMs) < WIFI_RETRY_INTERVAL_MS)
-    return;
-
-  const bool attemptExpired =
-      wifiConnectStartedMs != 0 &&
-      (now - wifiConnectStartedMs) >= WIFI_CONNECT_TIMEOUT_MS;
-  const bool hardFail =
-      (st == WL_NO_SSID_AVAIL || st == WL_CONNECT_FAILED || st == WL_CONNECTION_LOST);
-  const bool idle =
-      (wifiConnectStartedMs == 0);
-
-  if (idle || attemptExpired || hardFail)
-    wifiKickConnect(/*isRetry=*/true);
+  if (ev & ESP_STA_KICK) {
+    tcpStopServices();
+    if (!espStaKick(staLink, "andon", WIFI_SSID, WIFI_PASS,
+                    STA_IP, STA_GW, STA_MASK, STA_DNS))
+      Serial.println("WiFi.config() fallo (IP estatica)");
+    Serial.println("[WiFi] Reintentando STA...");
+  }
 }
 
 static void serviceTcp()
 {
-  if (WiFi.status() != WL_CONNECTED) {
-    tcpStopServices();
-    return;
-  }
+  if (!staLink.wasUp) return;
 
   tcpEnsureServices();
+  tcpTxPump();
 
   if (tcpAcceptIncoming())
     return;
 
   if (!tcpLinkOk()) {
+    if (tcpClient.available()) tcpRxDrain();
     if (tcpWasConnected) {
       Serial.println("[TCP] Off");
       tcpWasConnected = false;
+      tcpRxLen = 0;
     }
+    if (tcpClient) tcpNoteDead();
     return;
   }
 
@@ -586,7 +561,12 @@ void setup()
   andonTowerAllOff();
   andonApplyMachineByte(ANDON_RX_INIT);
 
-  wifiKickConnect(/*isRetry=*/false);
+  espStaClear(staLink);
+  Serial.printf("Conectando a WiFi '%s' -> %s...\n",
+                WIFI_SSID, STA_IP.toString().c_str());
+  if (!espStaKick(staLink, "andon", WIFI_SSID, WIFI_PASS,
+                  STA_IP, STA_GW, STA_MASK, STA_DNS))
+    Serial.println("WiFi.config() fallo (IP estatica)");
   if (WiFi.status() != WL_CONNECTED)
     Serial.println("WiFi pendiente — reconexion no bloqueante en loop...");
   tcpEnsureServices();

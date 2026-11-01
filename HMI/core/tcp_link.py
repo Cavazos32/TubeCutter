@@ -1,4 +1,9 @@
-"""Enlace TCP compartido hacia módulos ESP32 — verificación, heartbeat y reconexión."""
+"""Enlace TCP compartido hacia módulos ESP32 — verificación al conectar y reconexión.
+
+No hay ping periódico. El lote comprueba el pong una vez, en paralelo, antes de
+la primera actuación. Durante las piezas el silencio no corta el enlace: la
+caída se ve por cierre del socket o porque la orden real se queda sin ACK.
+"""
 
 from __future__ import annotations
 
@@ -7,17 +12,15 @@ import socket
 import sys
 import threading
 import time
-from abc import ABC, abstractmethod
 from typing import Any, Callable, Optional
 
 CONNECT_TIMEOUT = 2.0
 RECONNECT_SEC = 3.0
-HEARTBEAT_INTERVAL_SEC = 5.0
-HEARTBEAT_STALE_SEC = 25.0
 VERIFY_TIMEOUT_SEC = 4.0
-PROBE_FAIL_MAX = 5
 RX_TIMEOUT_SEC = 0.5
 RX_JOIN_TIMEOUT_SEC = 1.0
+# Línea incompleta. Si el MCU no manda newline, el buffer no crece sin límite.
+RX_BUF_MAX = 65536
 
 
 def enable_tcp_keepalive(sock: socket.socket) -> None:
@@ -39,8 +42,8 @@ def enable_tcp_keepalive(sock: socket.socket) -> None:
                 pass
 
 
-class ModuleTcpClient(ABC):
-    """Cliente TCP con verificación al conectar y detección de enlace muerto."""
+class ModuleTcpClient:
+    """Cliente TCP con verificación al conectar y reconexión si el socket cae."""
 
     def __init__(
         self,
@@ -63,10 +66,10 @@ class ModuleTcpClient(ABC):
         self._connected = False
         self._session = 0
         self._last_rx_mono = 0.0
-        self._last_probe_mono = 0.0
+        self._pong_mono = 0.0
+        self._pong_cv = threading.Condition()
         self._connect_gate = threading.Lock()
         self._handshake = False
-        self._probe_misses = 0
         # Evita que los 4 módulos reconecten en el mismo instante (pico WiFi/CPU).
         self._reconnect_jitter = (hash(f"{host}:{port}") & 0xFF) / 256.0 * RECONNECT_SEC
 
@@ -74,9 +77,36 @@ class ModuleTcpClient(ABC):
     def connected(self) -> bool:
         return self._connected
 
-    @abstractmethod
+    def ping(self) -> bool:
+        """Ack de enlace. No consulta sensores ni cambia el estado del módulo."""
+        return self.send_command(command="ping")
+
+    def wait_pong_since(self, since: float, timeout_s: float) -> bool:
+        """True si llegó un pong con marca posterior a ``since``."""
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        with self._pong_cv:
+            while self._pong_mono < since:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._pong_cv.wait(timeout=remaining)
+            return True
+
+    def ping_confirmed(self, *, attempts: int = 3, timeout_s: float = 1.0) -> bool:
+        """Reintenta el ping, que no actúa. No reenvía órdenes de válvula ni de movimiento."""
+        tries = max(1, int(attempts))
+        for _ in range(tries):
+            if not self.connected:
+                self.reconnect(silent=True)
+            since = time.monotonic()
+            if not self.ping():
+                continue
+            if self.wait_pong_since(since, timeout_s):
+                return True
+        return False
+
     def _send_probe(self) -> bool:
-        """Envía comando de sondeo (status/poll) al módulo."""
+        return self.ping()
 
     def start_background(self) -> None:
         if self._bg_thread and self._bg_thread.is_alive():
@@ -105,11 +135,7 @@ class ModuleTcpClient(ABC):
     def _connect_locked(self, timeout: float, silent: bool) -> bool:
         with self._conn_lock:
             if self._connected and self._sock is not None:
-                if (
-                    not self._last_rx_mono
-                    or (time.monotonic() - self._last_rx_mono) < HEARTBEAT_STALE_SEC
-                ):
-                    return True
+                return True
         self._drop_link(notify=False)
 
         session = 0
@@ -132,7 +158,6 @@ class ModuleTcpClient(ABC):
                 session = self._session
                 self._sock = sock
                 self._last_rx_mono = 0.0
-                self._last_probe_mono = 0.0
                 self._stop_rx.clear()
                 session_start = time.monotonic()
                 self._rx_thread = threading.Thread(
@@ -157,8 +182,6 @@ class ModuleTcpClient(ABC):
             if session != self._session or self._sock is not sock:
                 return False
             self._connected = True
-            self._last_probe_mono = time.monotonic()
-            self._probe_misses = 0
 
         self._schedule_connection(True)
         return True
@@ -245,20 +268,6 @@ class ModuleTcpClient(ABC):
                 self._stop_bg.wait(RECONNECT_SEC)
                 continue
 
-            now = time.monotonic()
-            if self._last_rx_mono and now - self._last_rx_mono > HEARTBEAT_STALE_SEC:
-                self.disconnect(silent=False)
-                continue
-
-            if now - self._last_probe_mono >= HEARTBEAT_INTERVAL_SEC:
-                self._last_probe_mono = now
-                if not self._send_probe():
-                    self._probe_misses += 1
-                    if self._probe_misses >= PROBE_FAIL_MAX:
-                        self.disconnect(silent=False)
-                    continue
-                self._probe_misses = 0
-
             self._stop_bg.wait(0.5)
 
     def _send_json(self, payload: dict) -> bool:
@@ -291,8 +300,11 @@ class ModuleTcpClient(ABC):
                 if session != self._session:
                     break
                 self._last_rx_mono = time.monotonic()
-                self._probe_misses = 0
                 buf += chunk.decode("utf-8", errors="replace")
+                if len(buf) > RX_BUF_MAX and "\n" not in buf:
+                    buf = ""
+                    self._emit_error("RX descartado: linea sin fin")
+                    continue
                 while "\n" in buf:
                     line, buf = buf.split("\n", 1)
                     line = line.strip()
@@ -303,6 +315,10 @@ class ModuleTcpClient(ABC):
                     except json.JSONDecodeError:
                         self._emit_error(f"JSON invalido: {line[:120]}")
                         continue
+                    if isinstance(msg, dict) and msg.get("type") == "pong":
+                        with self._pong_cv:
+                            self._pong_mono = time.monotonic()
+                            self._pong_cv.notify_all()
                     if self._on_message:
                         try:
                             self._on_message(msg)

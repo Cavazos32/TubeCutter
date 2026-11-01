@@ -24,8 +24,8 @@ class AndonClient(ModuleTcpClient):
     ) -> None:
         super().__init__(DEFAULT_HOST, DEFAULT_PORT, on_message, on_connection)
 
-    def _send_probe(self) -> bool:
-        return self.send_command(command="ping")
+    def cmd_status(self) -> bool:
+        return self.send_command(command="status")
 
     def send_machine_byte(self, byte: int) -> bool:
         """HMI → Andon: estado máquina (torre)."""

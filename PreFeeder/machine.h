@@ -28,7 +28,6 @@ enum NetCommandType : uint8_t {
   NC_SET_HMI_TFEED,
   NC_BENCH_IN_PROCESS,
   NC_SET_REFILL_PULSE,
-  NC_PING,
   NC_HALT,
 };
 

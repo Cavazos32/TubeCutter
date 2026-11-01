@@ -48,7 +48,7 @@ bool feedCanStartup();
 bool feedCanBootInit();
 bool feedCanInitRequest();
 void serviceCANRx();
-// Atiende TCP/HTTP/Modbus/CAN mientras se espera SDO (sin delay). No reentra feed/stage2.
+// Atiende TCP/HTTP/Modbus/CAN mientras se espera SDO (sin delay). No reentra feed.
 void motionCooperateDuringWait();
 extern uint8_t motionNestedServiceDepth;
 // true = movimiento(s) pedido(s) emitidos; false = SDO posición falló / no se movió

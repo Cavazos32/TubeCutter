@@ -111,7 +111,6 @@ def classify_cycle_log_message(text: str) -> tuple[str, str] | None:
         "cortador off (res)",
         "delay ·",
         "enc_set0: omitido",
-        "stage2 phase=",
         "prefeeder: in process on",
         "cycle flow:",
         " · move=",

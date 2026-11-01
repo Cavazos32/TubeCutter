@@ -5,7 +5,6 @@ Estado máquina bytes 0x40–0x49.
 from __future__ import annotations
 
 import json
-import os
 import threading
 import time
 from dataclasses import asdict, dataclass, fields
@@ -27,7 +26,6 @@ from machine_states import (
     TX_STOP,
 )
 from core.error_catalog import format_ui, lookup
-from clients.plc import CMD_ENCODER, CMD_GRIPPER, CMD_HOLDER, CMD_HOLDER_ENCODER
 from cycle_analysis_log import (
     begin_lot as analysis_begin_lot,
     begin_piece as analysis_begin_piece,
@@ -97,20 +95,11 @@ PF_READY_TIMEOUT_S = 15.0
 PIECE_WATCH_TIMEOUT_S = 20.0
 REFILL_LASER_TIMEOUT_S = 10.0
 PLC_ACK_TIMEOUT_S = 2.0
-# TEMPORAL (diagnóstico): no esperar ACK TCP del PLC; solo pulso nominal (~100+50 ms).
-# Producción: PLC_ACK_WAIT_BYPASS = False. Override: HMI_SKIP_PLC_ACK=0|1
-PLC_ACK_WAIT_BYPASS = True
-PLC_ACK_BYPASS_SLEEP_S = 0.15
+# Vigilancia de ACK, fuera del camino de la pieza. No es un sleep del ciclo.
+PLC_ACK_WATCH_S = 1.0
+# Órdenes ya vencidas que siguen en cola para que su ACK tardío no cierre la siguiente.
+ACK_GHOST_MAX = 2
 MOTION_IDLE_NO_TARGET_S = 1.0
-
-
-def plc_ack_wait_bypass_active() -> bool:
-    env = os.environ.get("HMI_SKIP_PLC_ACK", "").strip().lower()
-    if env in ("0", "false", "no", "off"):
-        return False
-    if env in ("1", "true", "yes", "on"):
-        return True
-    return bool(PLC_ACK_WAIT_BYPASS)
 PF_TFEED_DONE_TIMEOUT_S = 30.0
 PF_SETTLE_BEFORE_IDLE_S = 15.0
 PF_TFEED_CAPTURE_AFTER_PAUSE_S = 0.5
@@ -713,6 +702,7 @@ class CycleHost(Protocol):
     def pf_tfeed_resume_sec(self, side: str) -> float: ...
     def pf_auto_filling(self, side: str) -> bool | None: ...
     def pf_request_status(self) -> bool: ...
+    def confirm_lot_links(self) -> tuple[bool, str, str]: ...
     def pf_status_seq(self) -> int: ...
     def clear_motion_wait_flags(self) -> None: ...
     def clear_motion_reached_flag(self) -> None: ...
@@ -726,20 +716,6 @@ class CycleHost(Protocol):
         abort_event: threading.Event | None = None,
     ) -> dict[str, str]: ...
     def feed_fault_for(self, side: str) -> str: ...
-    def arm_stage2(self) -> None: ...
-    def cmd_motion_stage2_start(
-        self,
-        piece_mm: float | None = None,
-        sides: str = "LR",
-        *,
-        target_abs_mm: float | None = None,
-    ) -> bool: ...
-    def wait_stage2_result(
-        self,
-        timeout_s: float,
-        *,
-        abort_event: threading.Event | None = None,
-    ) -> str: ...
     def stage2_fault(self) -> str: ...
     def asda_position_mm(self) -> float | None: ...
     def refresh_asda_position_mm(self) -> float | None: ...
@@ -787,6 +763,36 @@ class CycleHost(Protocol):
     def clear_e050_latch_for_materialist(self) -> bool: ...
     def apply_detail_error(self, code_or_byte: str | int) -> bool: ...
     def error_is_latched(self) -> bool: ...
+
+class _PlcAckPending:
+    """Una orden de válvula esperando su ACK. El ciclo no se bloquea en ella."""
+
+    __slots__ = (
+        "id",
+        "byte",
+        "since_seq",
+        "label",
+        "timer",
+        "matched",
+        "expired",
+    )
+
+    def __init__(
+        self,
+        order_id: int,
+        byte_code: int,
+        since_seq: int,
+        label: str,
+        timer: threading.Timer,
+    ) -> None:
+        self.id = order_id
+        self.byte = byte_code
+        self.since_seq = since_seq
+        self.label = label
+        self.timer = timer
+        self.matched = False
+        self.expired = False
+
 
 class CycleRunner:
     """Ejecuta el flujo de CycleFlowCopy en un hilo (orquestación)."""
@@ -868,6 +874,12 @@ class CycleRunner:
         # monotonic() del Set/Res de cortador (asiento antes de depósito/despeje).
         self._cutter_set_mono: float | None = None
         self._cutter_res_mono: float | None = None
+        # ACK TCP por orden: la secuencia no espera; el plazo corre aparte.
+        self._ack_lock = threading.Lock()
+        self._ack_next_id = 0
+        self._ack_by_id: dict[int, _PlcAckPending] = {}
+        self._ack_q: dict[int, list[_PlcAckPending]] = {}
+        self._ack_stop_sent = False
         self._started_at: float | None = None
         # CT productivo: 1ª pieza (holder/feed) → última freeze (antes post_piece).
         # No incluye prep / Finish / settled. Pause no suma.
@@ -1216,7 +1228,7 @@ class CycleRunner:
             self._recovery_awaiting = False
             self._recovery_prompt = ""
             self._pending_lot_decision = False
-        # Desarma waits Stage2/Feed/Reached — si no, el hilo queda active ~3 min
+        # Desarma waits Feed/Reached — si no, el hilo queda active ~3 min
         # y Reset responde "Detener ciclo antes de Reset".
         self._host.clear_motion_wait_flags()
         self._host.cmd_motion_stop()
@@ -1635,7 +1647,7 @@ class CycleRunner:
 
     def request_reset(self) -> dict[str, Any]:
         if self.is_active():
-            # Stop ya pedido: dar tiempo a que salga del wait Stage2/Feed.
+            # Stop ya pedido: dar tiempo a que salga del wait Feed.
             if self._stop.is_set() or self._aborted:
                 self._host.clear_motion_wait_flags()
                 th = self._thread
@@ -1717,6 +1729,8 @@ class CycleRunner:
             self._recovery = ""
         # No borrar _recovery_after_error: el lote sigue en recuperación.
         self._abort_needs_ack = False
+        with self._ack_lock:
+            self._ack_stop_sent = False
 
     def set_materialist(self, on: bool) -> dict[str, Any]:
         self._materialist = bool(on)
@@ -2800,74 +2814,104 @@ class CycleRunner:
             return f"{s * 1000.0:.0f} ms"
         return f"{s:.3f}s"
 
-    def _wait_plc_ack_timed(
-        self, label: str, byte_code: int, since_seq: int, timeout_s: float
-    ) -> bool | None:
-        """Mide el ACK PLC como segmento propio; no altera su timeout ni su lógica."""
-        op = self._begin_op(f"wait_ack:{label}")
-        if plc_ack_wait_bypass_active():
-            time.sleep(PLC_ACK_BYPASS_SLEEP_S)
-            elapsed = self._end_op(
-                op,
-                ok=True,
-                extra={"kind": "ack", "ack_result": True, "bypass": True},
+    def arm_plc_ack_watch(self, byte_code: int, label: str) -> int:
+        """Registra la orden y arranca su plazo de 1 s. No bloquea la secuencia."""
+        with self._ack_lock:
+            self._ack_next_id += 1
+            order_id = self._ack_next_id
+            since_seq = int(self._host.plc_ack_seq())
+            timer = threading.Timer(
+                PLC_ACK_WATCH_S, self._plc_ack_timed_out, args=(order_id,)
             )
-            self._host.cycle_log(
-                f"PLC ACK · {label}: bypass · {self._fmt_op(elapsed)}"
+            timer.daemon = True
+            pending = _PlcAckPending(
+                order_id, int(byte_code), since_seq, str(label), timer
             )
-            return True
-        result = self._host.wait_plc_ack(byte_code, since_seq, timeout_s)
-        elapsed = self._end_op(
-            op,
-            ok=result is True,
-            extra={"kind": "ack", "ack_result": result},
-        )
-        status = "confirmado" if result is True else "rechazado" if result is False else "timeout"
-        self._host.cycle_log(
-            f"PLC ACK · {label}: {status} · {self._fmt_op(elapsed)}"
-        )
-        return result
+            self._ack_by_id[order_id] = pending
+            queue = self._ack_q.setdefault(int(byte_code), [])
+            expired_ix = [i for i, item in enumerate(queue) if item.expired]
+            while len(expired_ix) > ACK_GHOST_MAX:
+                old = queue.pop(expired_ix[0])
+                self._ack_by_id.pop(old.id, None)
+                expired_ix = [i for i, item in enumerate(queue) if item.expired]
+            queue.append(pending)
+        timer.start()
+        return order_id
 
-    def _wait_plc_acks_timed(
-        self,
-        label: str,
-        byte_codes: list[int],
-        since_seq: int,
-        timeout_s: float,
-    ) -> bool | None:
-        if not byte_codes:
-            return True
-        op = self._begin_op(f"wait_ack:{label}")
-        if plc_ack_wait_bypass_active():
-            time.sleep(PLC_ACK_BYPASS_SLEEP_S)
-            elapsed = self._end_op(
-                op,
-                ok=True,
-                extra={"kind": "ack", "ack_result": True, "bypass": True},
-            )
-            self._host.cycle_log(
-                f"PLC ACK · {label}: bypass · {self._fmt_op(elapsed)}"
-            )
-            return True
-        result = self._host.wait_plc_acks(byte_codes, since_seq, timeout_s)
-        elapsed = self._end_op(
-            op,
-            ok=result is True,
-            extra={"kind": "ack", "ack_result": result},
-        )
-        status = "confirmado" if result is True else "rechazado" if result is False else "timeout"
-        self._host.cycle_log(
-            f"PLC ACK · {label}: {status} · {self._fmt_op(elapsed)}"
-        )
-        return result
+    def discard_stale_plc_acks(self) -> None:
+        """Vacía vigilancias del lote anterior. Un ACK suelto ya no tiene orden."""
+        timers: list[threading.Timer] = []
+        with self._ack_lock:
+            for pending in self._ack_by_id.values():
+                pending.matched = True
+                if pending.timer is not None:
+                    timers.append(pending.timer)
+            self._ack_by_id.clear()
+            self._ack_q.clear()
+        for timer in timers:
+            timer.cancel()
 
-    @staticmethod
-    def _plc_ack_bytes_for_holder_encoder(
-        need_holder: bool, need_encoder: bool
-    ) -> list[int]:
-        if need_holder or need_encoder:
-            return [CMD_HOLDER_ENCODER]
-        return []
+    def cancel_plc_ack_watch(self, order_id: int | None) -> None:
+        """La orden no salió: no debe vencer ni consumir un ACK posterior."""
+        if order_id is None:
+            return
+        timer: threading.Timer | None = None
+        with self._ack_lock:
+            pending = self._ack_by_id.pop(int(order_id), None)
+            if pending is None:
+                return
+            queue = self._ack_q.get(pending.byte, [])
+            self._ack_q[pending.byte] = [item for item in queue if item.id != pending.id]
+            pending.matched = True
+            timer = pending.timer
+        if timer is not None:
+            timer.cancel()
+
+    def on_plc_ack(self, byte_code: int, seq: int, ok: bool) -> None:
+        """Cierra solo la orden más vieja de ese byte. Un ACK tardío no valida la siguiente."""
+        fault_label: str | None = None
+        timer: threading.Timer | None = None
+        with self._ack_lock:
+            queue = self._ack_q.get(int(byte_code))
+            if not queue:
+                return
+            head = queue[0]
+            if int(seq) <= head.since_seq:
+                return
+            queue.pop(0)
+            self._ack_by_id.pop(head.id, None)
+            head.matched = True
+            timer = head.timer
+            if not head.expired and not ok:
+                fault_label = head.label
+        if timer is not None:
+            timer.cancel()
+        if fault_label:
+            self._stop_for_plc_ack(fault_label, "rechazado")
+
+    def _plc_ack_timed_out(self, order_id: int) -> None:
+        label: str | None = None
+        with self._ack_lock:
+            pending = self._ack_by_id.get(int(order_id))
+            if pending is None or pending.matched or pending.expired:
+                return
+            pending.expired = True
+            label = pending.label
+        if label:
+            self._stop_for_plc_ack(label, "sin respuesta en 1 s")
+
+    def _stop_for_plc_ack(self, label: str, reason: str) -> None:
+        with self._ack_lock:
+            if self._ack_stop_sent:
+                return
+            self._ack_stop_sent = True
+        with self._lock:
+            already = bool(self._fault) or self._state_byte == TX_ERROR
+        if already:
+            return
+        text = f"PLC ACK · {label}: {reason}"
+        self._host.cycle_log(text)
+        self.apply_error_policy(text)
 
     def _begin_op(self, name: str) -> dict[str, Any]:
         now = time.monotonic()
@@ -3446,8 +3490,6 @@ class CycleRunner:
     def _run_lineal_abs(self, abs_target_mm: float) -> bool:
         """Lineal producción: CMD_MOVE (0x05) + Reached por TCP ASDA.
 
-        No usa Stage2 HTTP (/api/stage2/*): ese camino compite con serviceAsdaTcp
-        en el loop de Motion y deja huecos muertos justo tras pinzas/holder.
         Mismo canal que feed (TCP) y que depósito/HOME.
         Guarda duración/distancia en `_last_lineal_*` para soplo match-lineal.
         """
@@ -3517,32 +3559,11 @@ class CycleRunner:
         self._host.cycle_log(
             "Holder+Encoder abiertos antes del feed (Reset PLC / All Off) — re-cerrar"
         )
-        # Solo se espera ACK de la válvula que hizo falta enviar.
-        need_holder = self._host.plc_valve_is_on(CMD_HOLDER) is not True
-        need_encoder = self._host.plc_valve_is_on(CMD_ENCODER) is not True
-        ack_seq = self._host.plc_ack_seq()
         if not self._arm_holder_encoder():
             self._host.cycle_log("Feed sin Holder/Encoder: envío al PLC falló")
             self._raise_fault("E066")
             return False
         if self._pausable_delay(HOLDER_ON_MS):
-            return False
-        ack_bytes = self._plc_ack_bytes_for_holder_encoder(
-            need_holder, need_encoder
-        )
-        if ack_bytes and (
-            self._wait_plc_acks_timed(
-                "feed_holder_encoder_closed",
-                ack_bytes,
-                ack_seq,
-                PLC_ACK_TIMEOUT_S,
-            )
-            is not True
-        ):
-            self._host.cycle_log(
-                "Feed sin Holder/Encoder: el PLC no confirmó el cierre"
-            )
-            self._raise_fault("E066")
             return False
         return True
 
@@ -3576,6 +3597,19 @@ class CycleRunner:
             return False
         return not self._should_abort()
 
+    def _confirm_lot_links(self) -> bool:
+        """Un ping por MCU, en paralelo, antes de la primera actuación del lote."""
+        self.discard_stale_plc_acks()
+        ok, code, detail = self._host.confirm_lot_links()
+        if ok:
+            self._host.cycle_log(
+                "Enlace inicial: Motion, PLC, PreFeeder y Andon respondieron"
+            )
+            return True
+        self._host.cycle_log(detail or "Enlace inicial: sin pong")
+        self._raise_fault(code or "E066")
+        return False
+
     def _prepare_before_cut(self) -> bool:
         # Start: tools a seguro + Holder/Encoder ON + ASDA en 0 confirmado.
         # HOME entre piezas: el feed puede venir adelantado; ASDA se confirma en 0
@@ -3587,9 +3621,6 @@ class CycleRunner:
             self._host.cycle_log("prepareBeforeCut: envío de seguro al PLC falló")
             self._raise_fault("E066")
             return False
-        need_holder = self._host.plc_valve_is_on(CMD_HOLDER) is not True
-        need_encoder = self._host.plc_valve_is_on(CMD_ENCODER) is not True
-        ack_seq = self._host.plc_ack_seq()
         if not self._arm_holder_encoder():
             self._host.cycle_log("prepareBeforeCut: envío Holder/Encoder falló")
             self._raise_fault("E066")
@@ -3597,25 +3628,6 @@ class CycleRunner:
         if self._should_abort():
             return False
         if not self._ensure_asda_at_zero():
-            return False
-        # El ACK se solapa con el MOVE_ZERO de arriba; aquí solo se bloquea
-        # el resto hasta que el PLC confirme ambos cierres antes del feed.
-        ack_bytes = self._plc_ack_bytes_for_holder_encoder(
-            need_holder, need_encoder
-        )
-        if ack_bytes and (
-            self._wait_plc_acks_timed(
-                "prepare_holder_encoder_closed",
-                ack_bytes,
-                ack_seq,
-                PLC_ACK_TIMEOUT_S,
-            )
-            is not True
-        ):
-            self._host.cycle_log(
-                "prepareBeforeCut: el PLC no confirmó Holder/Encoder"
-            )
-            self._raise_fault("E066")
             return False
         return True
     def _confirm_asda_at_zero_for_feed(self) -> bool:
@@ -4455,6 +4467,9 @@ class CycleRunner:
             "barrera ASDA=0 en feed_after_home"
         )
         try:
+            if not self._confirm_lot_links():
+                self._finish(False)
+                return
             if not self._prepare_before_cut():
                 self._finish(False)
                 return
@@ -4582,13 +4597,6 @@ class CycleRunner:
                             if self._enter(rep, qty, "holder_on"):
                                 break
                             hold_op = self._begin_op("holder_on")
-                            need_holder_ack = (
-                                self._host.plc_valve_is_on(CMD_HOLDER) is not True
-                            )
-                            need_encoder_ack = (
-                                self._host.plc_valve_is_on(CMD_ENCODER) is not True
-                            )
-                            ack_seq = self._host.plc_ack_seq()
                             arm_ok = self._arm_holder_encoder()
                             self._end_op(hold_op, ok=arm_ok)
                             if not arm_ok:
@@ -4603,23 +4611,6 @@ class CycleRunner:
                             if self._after_step("holder_on"):
                                 break
                             if self._cycle_delay(rep, qty, "wait_holder_on"):
-                                break
-                            ack_bytes = self._plc_ack_bytes_for_holder_encoder(
-                                need_holder_ack, need_encoder_ack
-                            )
-                            if ack_bytes and (
-                                self._wait_plc_acks_timed(
-                                    "feed_holder_encoder_closed_before_motion",
-                                    ack_bytes,
-                                    ack_seq,
-                                    PLC_ACK_TIMEOUT_S,
-                                )
-                                is not True
-                            ):
-                                self._host.cycle_log(
-                                    "Feed sin Holder/Encoder cerrado: el PLC no confirmó"
-                                )
-                                self._raise_fault("E066")
                                 break
                         # Verifica HOME antes de alimentar tras recovery
                         if (
@@ -4759,13 +4750,6 @@ class CycleRunner:
                             if self._enter(rep, qty, "holder_off"):
                                 break
                             hold_off_op = self._begin_op("holder_off")
-                            need_holder_ack = (
-                                self._host.plc_valve_is_on(CMD_HOLDER) is not False
-                            )
-                            need_encoder_ack = (
-                                self._host.plc_valve_is_on(CMD_ENCODER) is not False
-                            )
-                            ack_seq = self._host.plc_ack_seq()
                             open_ok = self._open_holder_encoder()
                             self._end_op(hold_off_op, ok=open_ok)
                             if not open_ok:
@@ -4780,23 +4764,6 @@ class CycleRunner:
                             if self._after_step("holder_off"):
                                 break
                             if self._cycle_delay(rep, qty, "wait_holder_open"):
-                                break
-                            ack_bytes = self._plc_ack_bytes_for_holder_encoder(
-                                need_holder_ack, need_encoder_ack
-                            )
-                            if ack_bytes and (
-                                self._wait_plc_acks_timed(
-                                    "holder_encoder_open_before_lineal",
-                                    ack_bytes,
-                                    ack_seq,
-                                    PLC_ACK_TIMEOUT_S,
-                                )
-                                is not True
-                            ):
-                                self._host.cycle_log(
-                                    "Lineal sin Holder/Encoder abierto: el PLC no confirmó"
-                                )
-                                self._raise_fault("E066")
                                 break
 
                             if self._enter(rep, qty, "lineal_fwd"):
@@ -4826,13 +4793,6 @@ class CycleRunner:
                         if self._enter(rep, qty, "holder_precut"):
                             break
                         precut_op = self._begin_op("holder_precut")
-                        need_holder_ack = (
-                            self._host.plc_valve_is_on(CMD_HOLDER) is not True
-                        )
-                        need_encoder_ack = (
-                            self._host.plc_valve_is_on(CMD_ENCODER) is not True
-                        )
-                        ack_seq = self._host.plc_ack_seq()
                         arm_ok = self._arm_holder_encoder()
                         self._end_op(precut_op, ok=arm_ok)
                         if not arm_ok:
@@ -4845,23 +4805,6 @@ class CycleRunner:
                         if self._after_step("holder_precut"):
                             break
                         if self._cycle_delay(rep, qty, "wait_holder_precut"):
-                            break
-                        ack_bytes = self._plc_ack_bytes_for_holder_encoder(
-                            need_holder_ack, need_encoder_ack
-                        )
-                        if ack_bytes and (
-                            self._wait_plc_acks_timed(
-                                "holder_encoder_closed_before_cut",
-                                ack_bytes,
-                                ack_seq,
-                                PLC_ACK_TIMEOUT_S,
-                            )
-                            is not True
-                        ):
-                            self._host.cycle_log(
-                                "Corte sin Holder/Encoder cerrado: el PLC no confirmó"
-                            )
-                            self._raise_fault("E066")
                             break
                         # Corta la pieza
                         cut_sides = CycleConfig.normalize_feed_sides(self.get_config().feed_sides)
@@ -4998,7 +4941,6 @@ class CycleRunner:
                         if self._enter(rep, qty, "grippers_off"):
                             break
                         grip_off_op = self._begin_op("grippers_off")
-                        ack_seq = self._host.plc_ack_seq()
                         grip_ok = self._host.cmd_plc_gripper(False)
                         self._end_op(grip_off_op, ok=grip_ok)
                         if not grip_ok:
@@ -5009,15 +4951,6 @@ class CycleRunner:
                         if self._after_step("grippers_off"):
                             break
                         if self._cycle_delay(rep, qty, "wait_gripper_release"):
-                            break
-                        if (
-                            self._wait_plc_ack_timed("gripper_open_before_clearance", CMD_GRIPPER, ack_seq, PLC_ACK_TIMEOUT_S)
-                            is not True
-                        ):
-                            self._host.cycle_log(
-                                "Despeje sin pinzas abiertas: el PLC no confirmó"
-                            )
-                            self._raise_fault("E066")
                             break
                         # Despeja la pieza de las pinzas
                         if self._enter(rep, qty, "gripper_clearance"):

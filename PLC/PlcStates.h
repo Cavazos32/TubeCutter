@@ -32,6 +32,8 @@ enum PlcCmd : uint8_t {
   PLC_CMD_BLOWER   = 0x23,  // BlowerE() / Blower()
   // Holder + Encoder en un pulso paralelo (un ACK TCP; HMI ciclo)
   PLC_CMD_HOLDER_ENCODER = 0x2A,
+  // Cortadores L+R en un pulso paralelo (setOut CUTTERS). Un ACK, no es comando de entrada.
+  PLC_CMD_CUTTERS = 0x2B,
 };
 
 // --- Errores detalle (esclavo → HMI) ---

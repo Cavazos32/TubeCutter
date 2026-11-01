@@ -14,6 +14,7 @@ CMD_HOLDER = 0x1C
 CMD_ENCODER = 0x1D
 CMD_RESET = 0x1E
 CMD_HOLDER_ENCODER = 0x2A
+CMD_CUTTERS = 0x2B  # ACK del pulso paralelo L+R (setOut CUTTERS). No es comando de entrada.
 TX_CUTTER_ERR = 0x1F
 TX_GRIPPER_ERR = 0x20
 TX_HOLDER_ERR = 0x21
@@ -70,10 +71,6 @@ class PlcClient(ModuleTcpClient):
         on_connection: Optional[Callable[[bool], None]] = None,
     ) -> None:
         super().__init__(DEFAULT_HOST, DEFAULT_PORT, on_message, on_connection)
-
-    def _send_probe(self) -> bool:
-        # Keepalive de enlace (tcp_link), no sondeo de sensores (regla C1 Set/Res).
-        return self.send_command(command="ping")
 
     def cmd_byte(self, byte_code: int, **extra: Any) -> bool:
         return self.send_command(byte=byte_code, **extra)
@@ -135,7 +132,7 @@ class PlcClient(ModuleTcpClient):
         return self.send_command(command="allOff")
 
     def cmd_poll(self) -> bool:
-        return self.send_command(command="poll")
+        return self.cmd_status()
 
     def cmd_status(self) -> bool:
-        return self.cmd_byte(TX_PLC_IDLE)
+        return self.send_command(command="status")

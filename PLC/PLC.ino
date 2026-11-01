@@ -2,6 +2,7 @@
 
 #include <WiFi.h>
 #include <ArduinoOTA.h>
+#include "../common/EspLink.h"
 #include "Config.h"
 #include "PlcStates.h"
 
@@ -17,8 +18,6 @@ bool peerLinkOk = false;
 uint8_t lastBitmask = 0xFF;
 uint8_t rawCandidateMask = 0xFF;
 unsigned long rawCandidateSinceMs = 0;
-unsigned long lastSnapshotTxMs = 0;
-unsigned long lastStatusPushMs = 0;
 // Grace de sensores desde fin de setup() (WiFi puede tardar > BOOT_GRACE).
 unsigned long bootGraceStartMs = 0;
 uint8_t sequence = 0;
@@ -37,17 +36,14 @@ static unsigned long blowerHoldMs = 0;
 
 char tcpRxLine[512];
 uint16_t tcpRxLen = 0;
-unsigned long wifiConnectStartedMs = 0;
-bool staWasConnected = false;
+static EspSta staLink;
 
 static bool lastPeerCutterR = false;
 static bool lastPeerCutterL = false;
-static bool lastPeerCutters = false;
 static bool lastPeerGrippers = false;
 static bool lastPeerHolder = false;
 static bool lastPeerEncoder = false;
 static bool lastPeerBlower = false;
-static bool lastPeerReset = false;
 static uint8_t lastPeerMask = 0xFF;
 
 static uint8_t plcTcpLastStateByte = 0;
@@ -92,6 +88,7 @@ static bool updateDebouncedMask(uint8_t raw, uint8_t& stableOut, unsigned long n
 
 // --- Válvulas (pulso ON/OFF) ---
 static void blowerStop();
+static void plcSendAck(uint8_t cmdByte, bool ok, const char* message);
 static bool plcDoHardwareReset(uint8_t ackByte, uint8_t flags, bool& deferred);
 
 static void valveWritePin(uint8_t pin, bool on)
@@ -260,11 +257,13 @@ static bool setPlcOutputByName(const char* outName, bool state, bool& deferred)
       uint8_t np = 0;
       if (needR) pins[np++] = PIN_OUT_CUTTER_R;
       if (needL) pins[np++] = PIN_OUT_CUTTER_L;
-      if (!valveEnqueue(pins, np, 0, JOB_STATUS)) return false;
+      if (!valveEnqueue(pins, np, PLC_CMD_CUTTERS, JOB_ACK | JOB_STATUS)) return false;
       if (needR) stCutterR = state;
       if (needL) stCutterL = state;
       syncCuttersFlag();
       deferred = true;
+    } else {
+      plcSendAck(PLC_CMD_CUTTERS, true, "");
     }
   }
   else if (nameEq(outName, "CUTTER_R") || nameEq(outName, "CUTTERS_R")) {
@@ -354,54 +353,10 @@ static bool tcpLinkOk()
   return tcpClient && tcpClient.connected();
 }
 
-// Un write corto no es un enlace muerto. availableForWrite()==0 en el ESP32
-// justo tras el accept es un falso "lleno": si no se escribe, la HMI no recibe
-// hello/pong y la reconexión queda plc=OFF con el socket abierto.
-static char txHold[700];
-static bool txHoldOn = false;
-
-static void txHoldReset()
-{
-  txHoldOn = false;
-  txHold[0] = 0;
-}
-
-static bool tcpSendRaw(const char* out, size_t n)
-{
-  if (!out || !n || !tcpLinkOk()) return false;
-  const int room = tcpClient.availableForWrite();
-  if (room > 0 && room < (int)n) return false;
-  const size_t sent = tcpClient.write((const uint8_t*)out, n);
-  if (sent == n) return true;
-  if (!tcpClient.connected()) {
-    tcpClient.stop();
-    peerLinkOk = false;
-  }
-  return false;
-}
-
-static bool tcpTx(const char* m)
-{
-  if (!m || !m[0]) return false;
-  size_t n = strlen(m);
-  char tmp[700];
-  const char* out = m;
-  if (m[n - 1] != '\n') {
-    if (n + 2 > sizeof(tmp)) return false;
-    memcpy(tmp, m, n);
-    tmp[n] = '\n';
-    tmp[n + 1] = 0;
-    out = tmp;
-    n++;
-  }
-  if (tcpSendRaw(out, n)) return true;
-  if (!txHoldOn && n < sizeof(txHold)) {
-    memcpy(txHold, out, n);
-    txHold[n] = 0;
-    txHoldOn = true;
-  }
-  return false;
-}
+// Un write corto no es un enlace muerto. El sufijo queda en txHold
+// y tcpTxPump lo reintenta. stop() solo si connected() ya es falso.
+static char txHoldBuf[700];
+static EspTcpHold txHold = {txHoldBuf, sizeof(txHoldBuf), 0};
 
 static const uint8_t ACK_Q = 4;
 static char ackQ[ACK_Q][192];
@@ -414,35 +369,68 @@ static void ackReset()
   ackQn = 0;
 }
 
+static void tcpNoteDead()
+{
+  espTcpStop(tcpClient);
+  peerLinkOk = false;
+  espTcpHoldClear(txHold);
+  ackReset();
+}
+
+static bool tcpTx(const char* m)
+{
+  if (!m || !m[0] || txHold.len || !tcpLinkOk()) return false;
+  if (!espTcpHoldPut(txHold, m)) return false;
+  if (espTcpHoldFlush(tcpClient, txHold)) return true;
+  if (!tcpClient.connected()) tcpNoteDead();
+  return false;
+}
+
 static void ackPush(const char* line)
 {
   if (!line || !line[0]) return;
-  if (tcpSendRaw(line, strlen(line))) return;
+  char tmp[192];
+  size_t n = strlen(line);
+  if (n >= sizeof(tmp)) return;
+  memcpy(tmp, line, n + 1);
+  if (n && tmp[n - 1] != '\n') {
+    if (n + 1 >= sizeof(tmp)) return;
+    tmp[n++] = '\n';
+    tmp[n] = 0;
+  }
+  if (!txHold.len && tcpLinkOk()) {
+    if (espTcpWriteAll(tcpClient, tmp, &n)) return;
+    if (!tcpClient.connected()) {
+      tcpNoteDead();
+      return;
+    }
+  }
   if (!tcpLinkOk()) return;
   if (ackQn >= ACK_Q) {
     Serial.println("[TCP] ACK no enviado");
     return;
   }
   char* dst = ackQ[(ackQHead + ackQn) % ACK_Q];
-  strncpy(dst, line, 191);
-  dst[191] = 0;
+  memcpy(dst, tmp, n + 1);
   ackQn++;
 }
 
 static void tcpTxPump()
 {
-  if (!tcpLinkOk()) {
-    if (!tcpClient) {
-      txHoldReset();
-      ackReset();
+  if (!tcpLinkOk()) return;
+  if (txHold.len) {
+    if (!espTcpHoldFlush(tcpClient, txHold)) {
+      if (!tcpClient.connected()) tcpNoteDead();
+      return;
     }
-    return;
   }
-  if (txHoldOn) {
-    if (tcpSendRaw(txHold, strlen(txHold))) txHoldReset();
-    else return;
-  }
-  while (ackQn && tcpSendRaw(ackQ[ackQHead], strlen(ackQ[ackQHead]))) {
+  while (ackQn) {
+    char* slot = ackQ[ackQHead];
+    size_t n = strlen(slot);
+    if (!espTcpWriteAll(tcpClient, slot, &n)) {
+      if (!tcpClient.connected()) tcpNoteDead();
+      return;
+    }
     ackQHead = (ackQHead + 1) % ACK_Q;
     ackQn--;
   }
@@ -543,7 +531,7 @@ static bool buildStatusJson(char* out, size_t n, const char* type)
   const uint8_t mask = currentStableMask();
   const int w = snprintf(
       out, n,
-      "{\"ver\":%u,\"type\":\"%s\",\"role\":\"plca\",\"mask\":%u,\"seq\":%u,"
+      "{\"ver\":%u,\"type\":\"%s\",\"actuator\":\"plc\",\"role\":\"plc\",\"mask\":%u,\"seq\":%u,"
       "\"sensorGripper\":%s,\"sensorHolder\":%s,\"sensorCutter\":%s,"
       "\"sensorHoseA\":%s,\"sensorHoseB\":%s,\"sensorTray\":%s,"
       "\"cutterR\":%s,\"cutterL\":%s,\"cutters\":%s,\"grippers\":%s,"
@@ -565,78 +553,37 @@ static bool tcpTxStatus(const char* type)
   return tcpTx(buf);
 }
 
-static bool sendSnapshot(uint8_t bitmask)
-{
-  char buf[96];
-  snprintf(buf, sizeof(buf),
-           "{\"type\":\"event\",\"field\":\"snapshot\",\"mask\":%u,\"seq\":%u}\n",
-           (unsigned)bitmask, (unsigned)sequence);
-  if (!tcpTx(buf))
-    return false;
-  sequence++;
-  lastSnapshotTxMs = millis();
-  return true;
-}
-
-static void sendAlert(uint8_t code)
-{
-  char buf[64];
-  snprintf(buf, sizeof(buf),
-           "{\"type\":\"event\",\"field\":\"alert\",\"code\":%u}\n", (unsigned)code);
-  tcpTx(buf);
-}
-
-static void plcTcpTxEvent(uint8_t byteCode, const char* name)
-{
-  char buf[160];
-  snprintf(buf, sizeof(buf),
-           "{\"ver\":%u,\"type\":\"event\",\"actuator\":\"plc\",\"byte\":%u,\"name\":\"%s\"}",
-           (unsigned)PLCA_PROTO_VER, (unsigned)byteCode, name);
-  tcpTx(buf);
-}
-
-static void plcTcpTxValve(uint8_t byteCode, const char* name, bool on)
+// on < 0: evento sin nivel. on 0/1: el mismo evento, con el nivel que cambió.
+static void plcTcpTxEvent(uint8_t byteCode, const char* name, int on = -1)
 {
   char buf[192];
-  snprintf(buf, sizeof(buf),
-           "{\"ver\":%u,\"type\":\"event\",\"actuator\":\"plc\",\"byte\":%u,"
-           "\"name\":\"%s\",\"on\":%s}",
-           (unsigned)PLCA_PROTO_VER, (unsigned)byteCode, name, on ? "true" : "false");
+  if (on < 0) {
+    snprintf(buf, sizeof(buf),
+             "{\"ver\":%u,\"type\":\"event\",\"actuator\":\"plc\",\"byte\":%u,\"name\":\"%s\"}",
+             (unsigned)PLCA_PROTO_VER, (unsigned)byteCode, name);
+  } else {
+    snprintf(buf, sizeof(buf),
+             "{\"ver\":%u,\"type\":\"event\",\"actuator\":\"plc\",\"byte\":%u,"
+             "\"name\":\"%s\",\"on\":%s}",
+             (unsigned)PLCA_PROTO_VER, (unsigned)byteCode, name, on ? "true" : "false");
+  }
   tcpTx(buf);
-}
-
-static void sendAlertsForNewBits(uint8_t prev, uint8_t now)
-{
-  uint8_t risen = (uint8_t)(now & ~prev);
-  if (!risen) return;
-  if (risen & BIT_GRIPPER) { sendAlert(1); plcTcpTxEvent(PLC_TX_GRIPPER_ERR, "GripperE"); }  // falla gripper / aire
-  if (risen & BIT_HOLDER)  { sendAlert(2); plcTcpTxEvent(PLC_TX_HOLDER_ERR, "HolderE"); }
-  if (risen & BIT_CUTTER)  { sendAlert(3); plcTcpTxEvent(PLC_TX_CUTTER_ERR, "CutterE"); }
-  if (risen & (BIT_HOSE_A | BIT_HOSE_B)) sendAlert(4);
-  if (risen & BIT_ENCODER) { sendAlert(5); plcTcpTxEvent(PLC_TX_ENCODER_ERR, "EncoderE"); }  // aire / manguera / cilindro
-  plcTcpPushStateIfChanged();
 }
 
 static void peerTxSensorBitEvents(uint8_t prev, uint8_t now)
 {
-  struct { uint8_t bit; const char* field; } map[] = {
-    { BIT_GRIPPER, "sensorGripper" },
-    { BIT_HOLDER,  "sensorHolder" },
-    { BIT_CUTTER,  "sensorCutter" },
-    { BIT_HOSE_A,  "sensorHoseA" },
-    { BIT_HOSE_B,  "sensorHoseB" },
-    { BIT_ENCODER, "sensorTray" },
+  struct { uint8_t bit; uint8_t byteCode; const char* name; } map[] = {
+    { BIT_GRIPPER, PLC_TX_GRIPPER_ERR, "GripperE" },
+    { BIT_HOLDER,  PLC_TX_HOLDER_ERR,  "HolderE" },
+    { BIT_CUTTER,  PLC_TX_CUTTER_ERR,  "CutterE" },
+    { BIT_ENCODER, PLC_TX_ENCODER_ERR, "EncoderE" },
   };
   for (unsigned i = 0; i < sizeof(map) / sizeof(map[0]); i++)
   {
     const bool was = (prev & map[i].bit) != 0;
     const bool nowOn = (now & map[i].bit) != 0;
     if (was == nowOn) continue;
-    char buf[96];
-    snprintf(buf, sizeof(buf),
-             "{\"type\":\"event\",\"field\":\"%s\",\"value\":%s}\n",
-             map[i].field, nowOn ? "true" : "false");
-    tcpTx(buf);
+    plcTcpTxEvent(map[i].byteCode, map[i].name, nowOn ? 1 : 0);
   }
 }
 
@@ -644,7 +591,7 @@ static void peerTxValveIfChanged(bool& last, bool now, uint8_t byteCode, const c
 {
   if (now == last) return;
   last = now;
-  plcTcpTxValve(byteCode, name, now);
+  plcTcpTxEvent(byteCode, name, now ? 1 : 0);
 }
 
 static void peerTxEvents()
@@ -653,38 +600,13 @@ static void peerTxEvents()
   if (lastPeerMask != 0xFF && mask != lastPeerMask)
     peerTxSensorBitEvents(lastPeerMask, mask);
   if (mask != lastPeerMask)
-  {
     lastPeerMask = mask;
-    char buf[80];
-    snprintf(buf, sizeof(buf),
-             "{\"type\":\"event\",\"field\":\"sensorMask\",\"value\":%u}\n",
-             (unsigned)mask);
-    tcpTx(buf);
-  }
   peerTxValveIfChanged(lastPeerCutterR, stCutterR, PLC_CMD_CUTTER_R, "CutterR");
   peerTxValveIfChanged(lastPeerCutterL, stCutterL, PLC_CMD_CUTTER_L, "CutterL");
-  if (stCutters != lastPeerCutters)
-  {
-    lastPeerCutters = stCutters;
-    char buf[72];
-    snprintf(buf, sizeof(buf),
-             "{\"type\":\"event\",\"field\":\"cutters\",\"value\":%s}\n",
-             stCutters ? "true" : "false");
-    tcpTx(buf);
-  }
   peerTxValveIfChanged(lastPeerGrippers, stGrippers, PLC_CMD_GRIPPER, "Gripper");
   peerTxValveIfChanged(lastPeerHolder, stHolder, PLC_CMD_HOLDER, "Holder");
   peerTxValveIfChanged(lastPeerEncoder, stEncoder, PLC_CMD_ENCODER, "Encoder");
   peerTxValveIfChanged(lastPeerBlower, stBlower, PLC_CMD_BLOWER, "Blower");
-  if (stReset != lastPeerReset)
-  {
-    lastPeerReset = stReset;
-    char buf[72];
-    snprintf(buf, sizeof(buf),
-             "{\"type\":\"event\",\"field\":\"reset\",\"value\":%s}\n",
-             stReset ? "true" : "false");
-    tcpTx(buf);
-  }
 }
 
 static void peerPushNow(bool fullStatus = true)
@@ -692,14 +614,11 @@ static void peerPushNow(bool fullStatus = true)
   peerTxEvents();
   if (fullStatus)
     tcpTxStatus("status");
-  lastStatusPushMs = millis();
 }
 
-static void replyPollSnapshot()
+static void replyStatus()
 {
-  sendSnapshot(currentStableMask());
   tcpTxStatus("status");
-  lastStatusPushMs = millis();
 }
 
 static void blowerService()
@@ -709,9 +628,7 @@ static void blowerService()
   blowerStop();
   if (tcpLinkOk()) {
     peerTxEvents();
-    tcpTxStatus("status");
     plcTcpPushStateIfChanged();
-    lastStatusPushMs = millis();
   }
 }
 
@@ -724,14 +641,10 @@ static void valveFinishJob()
   vpFlags = 0;
   if ((flags & JOB_ACK) && ackByte)
     plcSendAck(ackByte, true, "");
-  if (flags & (JOB_ACK | JOB_STATUS))
+  if (flags & (JOB_ACK | JOB_STATUS)) {
     peerTxEvents();
-  if (flags & JOB_STATUS) {
-    tcpTxStatus("status");
-    lastStatusPushMs = millis();
-  }
-  if (flags & (JOB_ACK | JOB_STATUS))
     plcTcpPushStateIfChanged();
+  }
 }
 
 static void valveStartNext()
@@ -1006,9 +919,7 @@ static void tcpHandleLine(const char* line)
       return;
     if (!deferred) {
       peerTxEvents();
-      tcpTxStatus("status");
       plcTcpPushStateIfChanged();
-      lastStatusPushMs = millis();
     }
     return;
   }
@@ -1024,21 +935,22 @@ static void tcpHandleLine(const char* line)
     }
     if (!queued) {
       peerTxEvents();
-      tcpTxStatus("status");
-      lastStatusPushMs = millis();
+      plcTcpPushStateIfChanged();
     }
     return;
   }
-  if (nameEq(cmd, "poll"))
+  if (nameEq(cmd, "status") || nameEq(cmd, "poll"))
   {
-    // Solo bajo demanda / debug — no usar como heartbeat (regla C1).
-    replyPollSnapshot();
+    replyStatus();
     return;
   }
   if (nameEq(cmd, "ping"))
   {
-    // Keepalive de enlace: ack mínimo, sin snapshot de sensores.
-    tcpTx("{\"type\":\"pong\"}");
+    char pong[80];
+    snprintf(pong, sizeof(pong),
+             "{\"ver\":%u,\"type\":\"pong\",\"actuator\":\"plc\"}",
+             (unsigned)PLCA_PROTO_VER);
+    tcpTx(pong);
     return;
   }
 }
@@ -1116,26 +1028,26 @@ static void tcpRxDrain()
 static void tcpOnClientAccepted()
 {
   tcpClient.setNoDelay(true);
+  espTcpKeepAlive(tcpClient);
   tcpRxLen = 0;
   lastPeerMask = 0xFF;
-  lastPeerCutterR = !stCutterR;
-  lastPeerCutterL = !stCutterL;
-  lastPeerCutters = !stCutters;
-  lastPeerGrippers = !stGrippers;
-  lastPeerHolder = !stHolder;
-  lastPeerEncoder = !stEncoder;
-  lastPeerBlower = !stBlower;
-  lastPeerReset = !stReset;
+  lastPeerCutterR = stCutterR;
+  lastPeerCutterL = stCutterL;
+  lastPeerGrippers = stGrippers;
+  lastPeerHolder = stHolder;
+  lastPeerEncoder = stEncoder;
+  lastPeerBlower = stBlower;
+  lastPeerMask = currentStableMask();
   plcTcpLastStateByte = 0;
   plcTcpNeedInit = true;
   plcTcpStopPending = false;
   peerLinkOk = true;
   valveDropPending();
   ackReset();
-  txHoldReset();
+  espTcpHoldClear(txHold);
   char hello[80];
   snprintf(hello, sizeof(hello),
-           "{\"ver\":%u,\"type\":\"hello\",\"role\":\"plca\"}\n",
+           "{\"ver\":%u,\"type\":\"hello\",\"role\":\"plc\"}\n",
            (unsigned)PLCA_PROTO_VER);
   tcpTx(hello);
   peerPushNow(true);
@@ -1152,7 +1064,7 @@ static bool tcpAcceptIncoming()
   // Un solo maestro. Zombies WiFi a menudo quedan con connected()==false
   // (o true) y bloquean el pool LWIP → HMI “a veces conecta”.
   if (tcpClient)
-    tcpClient.stop();
+    espTcpStop(tcpClient);
   tcpClient = incoming;
   tcpOnClientAccepted();
   return true;
@@ -1224,9 +1136,9 @@ static void tcpEnsureServices()
 
 static void tcpStopServices()
 {
-  if (tcpClient.connected()) tcpClient.stop();
-  peerLinkOk = false;
+  tcpNoteDead();
   tcpWasConnected = false;
+  tcpRxLen = 0;
   if (!tcpServicesUp) return;
   tcpServer.end();
   tcpServicesUp = false;
@@ -1234,72 +1146,33 @@ static void tcpStopServices()
   Serial.println("[TCP] Servicios Off");
 }
 
-static unsigned long wifiDownSinceMs = 0;
-static const unsigned long WIFI_DOWN_GRACE_MS = 2500;
-
-static void wifiLogStatus()
+static void serviceSta()
 {
-  const bool on = WiFi.status() == WL_CONNECTED;
-  if (on) {
-    wifiDownSinceMs = 0;
-    if (staWasConnected) return;
-    staWasConnected = true;
-    wifiConnectStartedMs = 0;
+  const uint8_t ev = espStaPoll(staLink);
+  if (ev & ESP_STA_UP) {
     Serial.printf("[WiFi] On %s\n", WiFi.localIP().toString().c_str());
     tcpEnsureServices();
-    return;
   }
-  // Un WL_CONNECTION_LOST de un instante no debe tumbar el :8766.
-  // Antes eso reiniciaba el radio y la HMI latcheaba E066.
-  if (!staWasConnected) return;
-  if (wifiDownSinceMs == 0) {
-    wifiDownSinceMs = millis();
+  if (ev & ESP_STA_BLIP)
     Serial.println("[WiFi] blip — esperando auto-reconexion");
-    return;
+  if (ev & ESP_STA_DOWN) {
+    tcpStopServices();
+    Serial.println("[WiFi] Off");
   }
-  if (millis() - wifiDownSinceMs < WIFI_DOWN_GRACE_MS) return;
-  staWasConnected = false;
-  wifiDownSinceMs = 0;
-  tcpStopServices();
-  Serial.println("[WiFi] Off");
-}
-
-static bool wifiNeedsRetry()
-{
-  wl_status_t s = WiFi.status();
-  if (s == WL_CONNECTED) return false;
-  if (wifiDownSinceMs && (millis() - wifiDownSinceMs) < WIFI_DOWN_GRACE_MS)
-    return false;
-  if (s == WL_NO_SSID_AVAIL || s == WL_CONNECT_FAILED || s == WL_CONNECTION_LOST) return true;
-  return wifiConnectStartedMs && (millis() - wifiConnectStartedMs > 15000);
-}
-
-static void wifiRetry()
-{
-  tcpStopServices();
-  wifiConnectStartedMs = millis();
-  WiFi.disconnect(true);
-  delay(500);
-  WiFi.mode(WIFI_STA);
-  WiFi.setHostname(OTA_HOSTNAME);
-  WiFi.setSleep(false);
-  WiFi.config(STA_IP, STA_GW, STA_MASK, STA_GW);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.println("[WiFi] Reintentando STA...");
+  if (ev & ESP_STA_KICK) {
+    tcpStopServices();
+    if (!espStaKick(staLink, OTA_HOSTNAME, WIFI_SSID, WIFI_PASS,
+                    STA_IP, STA_GW, STA_MASK, STA_GW))
+      Serial.println("WiFi.config() fallo.");
+    Serial.println("[WiFi] Reintentando STA...");
+  }
 }
 
 static void serviceTcp()
 {
-  wifiLogStatus();
-  if (wifiNeedsRetry())
-  {
-    static unsigned long lastRetryMs = 0;
-    if (millis() - lastRetryMs >= 8000)
-    {
-      lastRetryMs = millis();
-      wifiRetry();
-    }
-  }
+  serviceSta();
+  if (!staLink.wasUp) return;
+
   tcpEnsureServices();
 
   if (tcpAcceptIncoming())
@@ -1307,16 +1180,15 @@ static void serviceTcp()
 
   if (!tcpLinkOk())
   {
+    if (tcpClient.available()) tcpRxDrain();
     if (tcpWasConnected)
     {
       Serial.println("[TCP] Off");
       tcpWasConnected = false;
-      peerLinkOk = false;
       tcpRxLen = 0;
       valveDropPending();
-      ackReset();
-      txHoldReset();
     }
+    if (tcpClient) tcpNoteDead();
     return;
   }
 
@@ -1324,15 +1196,6 @@ static void serviceTcp()
   peerLinkOk = true;
   tcpRxDrain();
   plcTcpPollStateEvents();
-
-  const unsigned long iv = STATUS_PUSH_MS;
-  if (millis() - lastStatusPushMs >= iv)
-  {
-    peerTxEvents();
-    tcpTxStatus("status");
-    plcTcpPushStateIfChanged();
-    lastStatusPushMs = millis();
-  }
 }
 
 // --- Setup / Loop ---
@@ -1362,26 +1225,11 @@ void setup()
   syncCuttersFlag();
   Serial.printf("Valvulas: modo pulso %lums (on=pulso, off=pulso); boot=all OFF\n", VALVE_PULSE_MS);
 
-  wifiConnectStartedMs = millis();
-  WiFi.persistent(false);
-  WiFi.mode(WIFI_STA);
-  WiFi.setHostname(OTA_HOSTNAME);
-  WiFi.setSleep(false);
-  WiFi.setAutoReconnect(true);
-  delay(100);
-  if (!WiFi.config(STA_IP, STA_GW, STA_MASK, STA_GW))
-    Serial.println("WiFi.config() fallo.");
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  espStaClear(staLink);
   Serial.printf("Buscando router \"%s\"...\n", WIFI_SSID);
-  unsigned long wifiStart = millis();
-  while (WiFi.status() != WL_CONNECTED && (millis() - wifiStart < WIFI_CONNECT_TIMEOUT_MS))
-  {
-    delay(250);
-    Serial.print(".");
-  }
-  Serial.println();
-  wifiLogStatus();
-  tcpEnsureServices();
+  if (!espStaKick(staLink, OTA_HOSTNAME, WIFI_SSID, WIFI_PASS,
+                  STA_IP, STA_GW, STA_MASK, STA_GW))
+    Serial.println("WiFi.config() fallo.");
   if (WiFi.status() != WL_CONNECTED)
     Serial.println("WiFi pendiente — reintentos en loop");
   bootGraceStartMs = millis();
@@ -1434,9 +1282,6 @@ void loop()
 
   if (!changed)
   {
-    if (tcpLinkOk() && lastBitmask != 0xFF
-        && (now - lastSnapshotTxMs) >= SNAPSHOT_HEARTBEAT_MS)
-      sendSnapshot(currentStableMask());
     yield();
     return;
   }
@@ -1444,20 +1289,15 @@ void loop()
   // Baseline (lastBitmask==0xFF): solo fijar máscara; no tratar bits presentes
   // como flanco rising (E050/E047–E049 fantasma al primer sample / HMI connect).
   const bool establishingBaseline = (lastBitmask == 0xFF);
-  uint8_t previousMask = establishingBaseline ? 0 : lastBitmask;
+  if (establishingBaseline)
+    lastPeerMask = stable;
+  lastBitmask = stable;
   if (tcpLinkOk())
   {
-    sendSnapshot(stable);
-    if (!establishingBaseline && !plcInBootGrace())
-      sendAlertsForNewBits(previousMask, stable);
     peerTxEvents();
-    tcpTxStatus("status");
     plcTcpPushStateIfChanged();
-    lastStatusPushMs = millis();
   }
   else
     Serial.println("TCP offline — sensores/válvulas solo locales");
-
-  lastBitmask = stable;
   serviceTcp();
 }

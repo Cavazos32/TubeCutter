@@ -17,7 +17,7 @@ Servos CAN: nodo **R=1** (`0x601`), **L=2** (`0x602`).
 ## Arduino IDE
 
 1. Abrir carpeta **`Motion_v2/`** (sketch **`Motion_v2.ino`**).
-2. Código: **`Motion_v2.ino`** (comunicación, ASDA, encoder, config) + **`Servo_Feed.cpp`** (CAN/alimentación) + **`Stage2.cpp`** (Stage2). Headers de opcodes/constantes: `Config.h`, `MotionStates.h`, `Asda.h`, `FeederCan.h`, `Encoder.h`.
+2. Código: **`Motion_v2.ino`** (comunicación, ASDA, encoder, config) + **`Servo_Feed.cpp`** (CAN/alimentación). Headers de opcodes/constantes: `Config.h`, `MotionStates.h`, `Asda.h`, `FeederCan.h`, `Encoder.h`.
 2. Librerías: ESP32 core (TWAI incluido; ya no se usa `mcp_can`)
 3. IP estática: `10.10.32.20` · hostname: `motion`
 

@@ -8,6 +8,7 @@
 #include <HardwareSerial.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include "../common/EspLink.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
@@ -821,6 +822,10 @@ static WiFiServer peerServer(PEER_TCP_PORT);
 static WiFiClient peerClient;
 static uint32_t peerLastStatusMs = 0;
 static bool peerLinkOk = false;
+static bool peerUp = false;
+static EspSta staLink;
+static char peerHoldBuf[1500];
+static EspTcpHold peerHold = {peerHoldBuf, sizeof(peerHoldBuf), 0};
 
 static String jStr(const char* j, const char* k) {
   String n = String("\"") + k + "\":\"";
@@ -837,10 +842,24 @@ static int jInt(const char* j, const char* k, int d) {
   return i < 0 ? d : String(j).substring(i + n.length()).toInt();
 }
 
+static void peerNoteDead() {
+  espTcpStop(peerClient);
+  espTcpHoldClear(peerHold);
+  peerLinkOk = false;
+}
+
 static void peerTx(const String& m) {
-  if (!peerClient.connected()) return;
-  peerClient.print(m);
-  if (!m.endsWith("\n")) peerClient.print("\n");
+  if (!peerClient.connected()) {
+    if (peerClient) peerNoteDead();
+    return;
+  }
+  if (peerHold.len && !espTcpHoldFlush(peerClient, peerHold)) {
+    if (!peerClient.connected()) peerNoteDead();
+    return;
+  }
+  if (!m.length() || !espTcpHoldPut(peerHold, m.c_str())) return;
+  if (!espTcpHoldFlush(peerClient, peerHold) && !peerClient.connected())
+    peerNoteDead();
 }
 
 static void dispatchPeerJson(const String& line) {
@@ -848,6 +867,10 @@ static void dispatchPeerJson(const String& line) {
   String cmd = jStr(line.c_str(), "command");
   String val = jStr(line.c_str(), "value");
   int id = jInt(line.c_str(), "id", 0);
+  if (cmd == "ping") {
+    peerTx("{\"ver\":1,\"type\":\"pong\"}");
+    return;
+  }
   NetCommand nc;
   if (cmd == "start") nc.type = NC_START;
   else if (cmd == "stop") nc.type = NC_STOP;
@@ -872,8 +895,7 @@ static void dispatchPeerJson(const String& line) {
   } else if (cmd == "setRefillPulseS" || cmd == "refillPulseS") {
     nc.type = NC_SET_REFILL_PULSE;
     nc.arg = val;
-  } else if (cmd == "ping") nc.type = NC_PING;
-  else if (cmd == "halt" || cmd == "motionStop" || cmd == "hardStop") nc.type = NC_HALT;
+  } else if (cmd == "halt" || cmd == "motionStop" || cmd == "hardStop") nc.type = NC_HALT;
   else if (cmd.startsWith("refill")) {
     nc.type = cmd.startsWith("refillHold") ? NC_REFILL_HOLD : NC_REFILL;
     nc.refillOn = (val == "1" || val == "true" || val == "on");
@@ -950,19 +972,53 @@ static String buildPeerStatus(const MachineStatus& c, const SensorSnapshot& s) {
 }
 
 static void ensurePeerServer() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  static bool up = false;
-  if (!up) {
+  const uint8_t ev = espStaPoll(staLink);
+  if (ev & ESP_STA_UP)
+    Serial.printf("[PF] WiFi On %s\n", WiFi.localIP().toString().c_str());
+  if (ev & ESP_STA_BLIP)
+    Serial.println("[PF] WiFi blip — esperando auto-reconexion");
+  if (ev & ESP_STA_DOWN) {
+    peerNoteDead();
+    if (peerUp) {
+      peerServer.end();
+      peerUp = false;
+    }
+    Serial.println("[PF] WiFi Off");
+  }
+  if (ev & ESP_STA_KICK) {
+    peerNoteDead();
+    if (peerUp) {
+      peerServer.end();
+      peerUp = false;
+    }
+    const IPAddress ip(PF_STA_IP_0, PF_STA_IP_1, PF_STA_IP_2, PF_STA_IP_3);
+    const IPAddress gw(STA_GW_0, STA_GW_1, STA_GW_2, STA_GW_3);
+    const IPAddress mask(STA_MASK_0, STA_MASK_1, STA_MASK_2, STA_MASK_3);
+    if (!espStaKick(staLink, PF_OTA_HOST, WIFI_SSID, WIFI_PASS, ip, gw, mask, gw))
+      Serial.println("[PF] WiFi.config() fallo");
+    Serial.println("[PF] Reintentando STA...");
+  }
+  if (!staLink.wasUp || WiFi.status() != WL_CONNECTED) return;
+  if (!peerUp) {
     peerServer.begin();
     peerServer.setNoDelay(true);
-    up = true;
+    peerUp = true;
   }
-  if (!peerClient.connected() && peerServer.hasClient()) {
-    peerClient = peerServer.available();
-    peerClient.setNoDelay(true);
-    peerTx(String("{\"ver\":1,\"type\":\"hello\",\"role\":\"") + PF_ROLE + "\",\"side\":\""
-           + PF_SIDE_TAG + "\"}");
+  if (peerServer.hasClient()) {
+    WiFiClient incoming = peerServer.available();
+    if (incoming) {
+      peerNoteDead();
+      peerClient = incoming;
+      peerClient.setNoDelay(true);
+      espTcpKeepAlive(peerClient);
+      espTcpHoldClear(peerHold);
+      peerTx(String("{\"ver\":1,\"type\":\"hello\",\"role\":\"") + PF_ROLE + "\",\"side\":\""
+             + PF_SIDE_TAG + "\"}");
+    }
   }
+  if (peerHold.len && peerClient.connected() &&
+      !espTcpHoldFlush(peerClient, peerHold) && !peerClient.connected())
+    peerNoteDead();
   peerLinkOk = peerClient.connected();
 }
 
@@ -1160,13 +1216,12 @@ static void handleRefill() {
 
 void pfNetworkInit(Params* params) {
   P = params;
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.config(IPAddress(PF_STA_IP_0, PF_STA_IP_1, PF_STA_IP_2, PF_STA_IP_3),
-              IPAddress(STA_GW_0, STA_GW_1, STA_GW_2, STA_GW_3),
-              IPAddress(STA_MASK_0, STA_MASK_1, STA_MASK_2, STA_MASK_3),
-              IPAddress(STA_GW_0, STA_GW_1, STA_GW_2, STA_GW_3));
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  espStaClear(staLink);
+  const IPAddress ip(PF_STA_IP_0, PF_STA_IP_1, PF_STA_IP_2, PF_STA_IP_3);
+  const IPAddress gw(STA_GW_0, STA_GW_1, STA_GW_2, STA_GW_3);
+  const IPAddress mask(STA_MASK_0, STA_MASK_1, STA_MASK_2, STA_MASK_3);
+  if (!espStaKick(staLink, PF_OTA_HOST, WIFI_SSID, WIFI_PASS, ip, gw, mask, gw))
+    Serial.println("[PF] WiFi.config() fallo");
 
   server.on("/", []() {
     server.sendHeader("Cache-Control", "no-store");
@@ -1195,7 +1250,7 @@ void pfNetworkTick(uint32_t nowMs) {
   ensurePeerServer();
   MachineStatus c = machineStatus();
   const SensorSnapshot& s = machineSensors();
-  if (peerClient.connected()) {
+  if (peerClient) {
     static String line;
     while (peerClient.available()) {
       char ch = (char)peerClient.read();
@@ -1205,10 +1260,15 @@ void pfNetworkTick(uint32_t nowMs) {
       } else if (ch != '\r' && line.length() < 900)
         line += ch;
     }
-    uint32_t iv = (c.feederActive || c.bufferActive) ? PEER_STATUS_FAST_MS : PEER_STATUS_MS;
-    if (nowMs - peerLastStatusMs >= iv) {
-      peerTx(buildPeerStatus(c, s));
-      peerLastStatusMs = nowMs;
+    if (!peerClient.connected()) {
+      line = "";
+      peerNoteDead();
+    } else {
+      uint32_t iv = (c.feederActive || c.bufferActive) ? PEER_STATUS_FAST_MS : PEER_STATUS_MS;
+      if (nowMs - peerLastStatusMs >= iv) {
+        peerTx(buildPeerStatus(c, s));
+        peerLastStatusMs = nowMs;
+      }
     }
   }
 }

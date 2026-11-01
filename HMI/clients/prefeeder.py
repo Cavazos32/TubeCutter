@@ -87,12 +87,6 @@ class PreFeederClient(ModuleTcpClient):
     ) -> None:
         super().__init__(DEFAULT_HOST, DEFAULT_PORT, on_message, on_connection)
 
-    def _send_probe(self) -> bool:
-        # El Master en planta no reconoce "ping" y contesta
-        # "Falta byte o command valido"; la HMI lo pintaba como fallo.
-        # 0x3A es solo consulta: el firmware responde el estado real y no lo cambia.
-        return self.cmd_status()
-
     def cmd_byte(self, byte_code: int, **extra: Any) -> bool:
         return self.send_command(byte=byte_code, **extra)
 

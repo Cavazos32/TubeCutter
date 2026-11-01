@@ -6,6 +6,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include "../common/EspLink.h"
 #include <WebServer.h>
 #include <ArduinoOTA.h>
 #include <Preferences.h>
@@ -18,7 +19,6 @@
 #include "Asda.h"
 #include "Encoder.h"
 #include "Servo_Feed.h"
-#include "Stage2.h"
 
 struct OvHit {
   float targetMm;
@@ -470,7 +470,6 @@ String configJson() {
            cfgCalProg1Mm, cfgCalMeas1Mm,
            cfgCalProg2Mm, cfgCalMeas2Mm);
   String j = String(buf);
-  stage2AppendConfigJson(j);
   j += "}";
   return j;
 }
@@ -1170,7 +1169,6 @@ void motionCooperateDuringWait() {
   serviceCANRx();
   if (motionNestedServiceDepth == 0) {
     feedLoop();
-    stage2Loop();
   }
   yield();
 }
@@ -2533,8 +2531,6 @@ void handleConfigPost() {
     changed = true;
   }
 
-  (void)stage2ApplyConfigFromJson(body, changed);
-
   if (jsonBool(body, "resetCal", false)) {
     resetCalFactory();
     changed = true;
@@ -2569,7 +2565,7 @@ void handleConfigPost() {
   }
 
   if (!changed) {
-    sendJson(400, errJson("Nada que guardar (moveRpm, stage2*, 2 puntos o resetCal)"));
+    sendJson(400, errJson("Nada que guardar (moveRpm, 2 puntos o resetCal)"));
     return;
   }
 
@@ -2768,19 +2764,31 @@ static bool asdaTcpSocketUp() {
   return asdaTcpClient && asdaTcpClient.connected();
 }
 
-static bool asdaTcpTxNow(const String& m) {
+static char asdaHoldBuf[960];
+static EspTcpHold asdaHold = {asdaHoldBuf, sizeof(asdaHoldBuf), 0};
+static volatile bool motionStaUp = false;
+
+static void asdaTcpNoteDead() {
+  espTcpStop(asdaTcpClient);
+  asdaTcpLinked = false;
+  espTcpHoldClear(asdaHold);
+}
+
+static bool asdaTcpFlushHold() {
+  if (!asdaHold.len) return true;
   if (!asdaTcpSocketUp()) {
-    asdaTcpLinked = false;
+    asdaTcpNoteDead();
     return false;
   }
-  bool ok = asdaTcpClient.print(m) > 0;
-  if (!m.endsWith("\n"))
-    ok = (asdaTcpClient.print("\n") > 0) && ok;
-  if (!ok) {
-    asdaTcpClient.stop();
-    asdaTcpLinked = false;
-  }
-  return ok;
+  if (espTcpHoldFlush(asdaTcpClient, asdaHold)) return true;
+  if (!asdaTcpClient.connected()) asdaTcpNoteDead();
+  return false;
+}
+
+static bool asdaTcpTxNow(const String& m) {
+  if (!asdaTcpFlushHold()) return false;
+  if (!m.length() || !espTcpHoldPut(asdaHold, m.c_str())) return false;
+  return asdaTcpFlushHold();
 }
 
 static bool asdaTcpQueueTx(const String& m) {
@@ -2803,10 +2811,12 @@ static bool asdaTcpTx(const String& m) {
 }
 
 static void asdaTcpDrainTx() {
-  if (!asdaTcpTxQ) return;
+  if (!asdaTcpFlushHold() || !asdaTcpTxQ) return;
   AsdaTcpTxMsg msg;
-  while (xQueueReceive(asdaTcpTxQ, &msg, 0) == pdTRUE)
-    asdaTcpTxNow(String(msg.line));
+  while (xQueueReceive(asdaTcpTxQ, &msg, 0) == pdTRUE) {
+    if (!espTcpHoldPut(asdaHold, msg.line)) break;
+    if (!asdaTcpFlushHold()) return;
+  }
 }
 
 static int asdaTcpJInt(const char* j, const char* k, int d) {
@@ -3240,7 +3250,8 @@ static void asdaTcpOnLine(const char* line) {
   const String cmd = asdaTcpJStr(line, "command");
   if (cmd == "ping") {
     // Keepalive de enlace (regla C1): ack mínimo, sin Modbus/status.
-    asdaTcpTxNow("{\"type\":\"pong\"}");
+    asdaTcpTxNow(String("{\"ver\":") + MOTION_PROTO_VER
+                 + ",\"type\":\"pong\",\"actuator\":\"motion\"}");
     return;
   }
   if (cmd == "resetAll" || cmd == "ResetMotion") {
@@ -3306,6 +3317,8 @@ static void asdaTcpRxDrain() {
 
 static void asdaTcpOnClientAccepted() {
   asdaTcpClient.setNoDelay(true);
+  espTcpKeepAlive(asdaTcpClient);
+  espTcpHoldClear(asdaHold);
   asdaTcpRxLen = 0;
   asdaTcpNeedInit = true;
 #if MOT_IO_SENSOR_EVENTS
@@ -3327,9 +3340,8 @@ static bool asdaTcpAcceptIncoming() {
   // Un solo maestro. Si hay cliente previo (a menudo zombie WiFi con
   // connected()==true), sustituirlo — rechazar al nuevo dejaba el puerto
   // muerto hasta reset del ESP.
-  if (asdaTcpClient) {
-    asdaTcpClient.stop();
-  }
+  if (asdaTcpClient)
+    espTcpStop(asdaTcpClient);
   asdaTcpClient = incoming;
   asdaTcpOnClientAccepted();
   return true;
@@ -3396,9 +3408,7 @@ static void asdaTcpEnsureServices() {
 }
 
 static void asdaTcpStopServices() {
-  // Invalidar siempre el socket (también zombies con connected()==false).
-  if (asdaTcpClient) asdaTcpClient.stop();
-  asdaTcpLinked = false;
+  asdaTcpNoteDead();
   asdaTcpWasConnected = false;
   asdaTcpRxLen = 0;
   if (!asdaTcpServicesUp) return;
@@ -3502,7 +3512,7 @@ static void motionTcpTxIoSensorStatus() {
   if (!asdaTcpLinkOk()) return;
   char buf[200];
   snprintf(buf, sizeof(buf),
-           "{\"ver\":%u,\"type\":\"status\",\"actuator\":\"motion\","
+           "{\"ver\":%u,\"type\":\"event\",\"actuator\":\"motion\","
            "\"laserR\":%s,\"laserL\":%s,\"safetyExhaust\":%s}",
            (unsigned)MOTION_PROTO_VER,
            ioLaserRActive ? "true" : "false",
@@ -3588,7 +3598,7 @@ static void asdaTcpPollEvents() {
 }
 
 static void serviceAsdaTcp() {
-  if (WiFi.status() != WL_CONNECTED) {
+  if (!motionStaUp) {
     asdaTcpStopServices();
     return;
   }
@@ -3599,11 +3609,12 @@ static void serviceAsdaTcp() {
     return;
 
   if (!asdaTcpSocketUp()) {
-    asdaTcpLinked = false;
+    if (asdaTcpClient.available()) asdaTcpRxDrain();
     if (asdaTcpWasConnected) {
       Serial.println("[ASDA-TCP] Off");
       asdaTcpWasConnected = false;
     }
+    if (asdaTcpClient) asdaTcpNoteDead();
     return;
   }
 
@@ -3640,71 +3651,28 @@ static void asdaTcpStartTask() {
 }
 
 // --- WIFI — reconexión no bloqueante (millis / estados; sin delay en loop) ---
-static bool wifiStaWasConnected = false;
-static uint32_t wifiConnectStartedMs = 0;
-static uint32_t wifiLastKickMs = 0;
-
-static void wifiKickConnect(bool isRetry) {
-  if (isRetry) {
-    // Sin delay: el loop debe seguir atendiendo ASDA/encoder/CAN/TCP teardown.
-    WiFi.disconnect(false);
-  }
-
-  WiFi.mode(WIFI_STA);
-  WiFi.setHostname(OTA_HOSTNAME);
-  WiFi.setSleep(false);
-
-  if (!WiFi.config(STA_IP, STA_GW, STA_MASK, STA_DNS)) {
-    Serial.println("WiFi.config() fallo (IP estatica)");
-  }
-
-  const uint32_t now = millis();
-  wifiConnectStartedMs = now;
-  wifiLastKickMs = now;
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  if (isRetry)
-    Serial.println("[WiFi] Reintentando STA...");
-  else
-    Serial.printf("Conectando a WiFi '%s'...\n", WIFI_SSID);
-}
+static EspSta staLink;
 
 static void serviceWifi() {
-  const wl_status_t st = WiFi.status();
-
-  if (st == WL_CONNECTED) {
-    if (!wifiStaWasConnected) {
-      wifiStaWasConnected = true;
-      wifiConnectStartedMs = 0;
-      Serial.printf("WiFi OK  IP=%s  RSSI=%d dBm\n",
-                    WiFi.localIP().toString().c_str(),
-                    WiFi.RSSI());
-    }
-    return;
+  const uint8_t ev = espStaPoll(staLink);
+  if (ev & ESP_STA_UP) {
+    motionStaUp = true;
+    Serial.printf("WiFi OK  IP=%s  RSSI=%d dBm\n",
+                  WiFi.localIP().toString().c_str(),
+                  WiFi.RSSI());
   }
-
-  // STA caído: el task TCP invalida el socket (asdaTcpStopServices).
-  if (wifiStaWasConnected) {
-    wifiStaWasConnected = false;
-    wifiConnectStartedMs = 0;
-    wifiLastKickMs = 0;  // permitir reintento inmediato
-    Serial.println("WiFi perdido — reconectando...");
+  if (ev & ESP_STA_BLIP)
+    Serial.println("[WiFi] blip — esperando auto-reconexion");
+  if (ev & ESP_STA_DOWN) {
+    motionStaUp = false;
+    Serial.println("[WiFi] Off");
   }
-
-  const uint32_t now = millis();
-  if (wifiLastKickMs != 0 && (now - wifiLastKickMs) < WIFI_RETRY_INTERVAL_MS)
-    return;
-
-  const bool attemptExpired =
-      wifiConnectStartedMs != 0 &&
-      (now - wifiConnectStartedMs) >= WIFI_CONNECT_TIMEOUT_MS;
-  const bool hardFail =
-      (st == WL_NO_SSID_AVAIL || st == WL_CONNECT_FAILED || st == WL_CONNECTION_LOST);
-  const bool idle =
-      (wifiConnectStartedMs == 0);
-
-  if (idle || attemptExpired || hardFail)
-    wifiKickConnect(/*isRetry=*/true);
+  if (ev & ESP_STA_KICK) {
+    if (!espStaKick(staLink, OTA_HOSTNAME, WIFI_SSID, WIFI_PASS,
+                    STA_IP, STA_GW, STA_MASK, STA_DNS))
+      Serial.println("WiFi.config() fallo (IP estatica)");
+    Serial.println("[WiFi] Reintentando STA...");
+  }
 }
 
 // --- SETUP / LOOP ---
@@ -3747,7 +3715,11 @@ void setup() {
 
   overviewStart(100.0f, OV_EXTRA_MM_DEFAULT, OV_TOL_MM_DEFAULT, true, true);
 
-  wifiKickConnect(/*isRetry=*/false);
+  espStaClear(staLink);
+  Serial.printf("Conectando a WiFi '%s'...\n", WIFI_SSID);
+  if (!espStaKick(staLink, OTA_HOSTNAME, WIFI_SSID, WIFI_PASS,
+                  STA_IP, STA_GW, STA_MASK, STA_DNS))
+    Serial.println("WiFi.config() fallo (IP estatica)");
   if (WiFi.status() != WL_CONNECTED)
     Serial.println("WiFi pendiente — reconexion no bloqueante en loop...");
   asdaTcpStartTask();
@@ -3770,7 +3742,6 @@ void setup() {
   server.on("/api/overview/start", HTTP_POST, handleOverviewStart);
   server.on("/api/overview/mark", HTTP_POST, handleOverviewMark);
   feedRegisterHttpRoutes(server);
-  stage2RegisterHttpRoutes(server);
   server.on("/feed", HTTP_GET, []() {
     server.send_P(200, "text/html", feed_index_html);
   });
@@ -3780,16 +3751,13 @@ void setup() {
   Serial.printf("API lista en http://%s/\n", STA_IP.toString().c_str());
   Serial.printf("ASDA TCP maestro en %s:%u\n",
                 STA_IP.toString().c_str(), (unsigned)MOTION_TCP_PORT);
-  Serial.println("UI Motion: Vista general | ASDA B3 | OM | Alimentacion (/feed) | Stage2");
+  Serial.println("UI Motion: Vista general | ASDA B3 | OM | Alimentacion (/feed)");
 
   servoCanInitMutex();
   delay(SERVO_POWERUP_MS);
   (void)feedCanStartup();
   feedInit();
-  stage2Init();
   Serial.printf("Motion CAN: can=%d servo=%d\n", (int)canInitialized, (int)servoCanReady);
-  Serial.printf("STAGE2 apPct=%.0f fastRpm=%.0f fineRpm=%.0f\n",
-                (double)stage2ApproachPct, (double)stage2FastRpm, (double)stage2FineRpm);
   Serial.printf("Firmware v%s · OTA red local hostname=%s\n", FW_VERSION, OTA_HOSTNAME);
 }
 
@@ -3812,51 +3780,16 @@ void loop() {
   motionPrepPollOnce();
   if (motionJobActive) pollMotionOnce();
   updateEncoderMotion(millis());
-  // CAN / alimentación y Stage2 (sin reinicio automático del bus)
+  // CAN / alimentación (sin reinicio automático del bus)
   serviceCANRx();
   feedLoop();
-  stage2Loop();
 }
 
-// --- Stage2 — puentes ASDA (sin tocar Communication Core) ---
 bool motionHostTcpLinked() {
   return asdaTcpLinkOk();
 }
 
 bool motionHostIsOccupied() {
   return motionIsOccupied();
-}
-
-bool stage2HostIsOccupied() {
-  return motionIsOccupied();
-}
-
-bool stage2HostStartAbsMm(float mmAbs, float rpm, String& err) {
-  if (mmAbs < 0.0f) mmAbs = 0.0f;
-  const int32_t puu = mmToWorkPuu(mmAbs, false);
-  return asdaStartMove(puu, rpm, err);
-}
-
-bool stage2HostCurrentMm(float* mmOut) {
-  if (!mmOut) return false;
-  if (cachedPosOk) {
-    *mmOut = puuToMm(cachedPosPuu, false);
-    return true;
-  }
-  int32_t pos = 0;
-  if (!read32(REG_P5_016, pos))
-    return false;
-  cachedPosPuu = pos;
-  cachedPosOk = true;
-  *mmOut = puuToMm(pos, false);
-  return true;
-}
-
-bool stage2HostStop(String& err) {
-  return asdaExecStop(err);
-}
-
-bool stage2HostLastJobOk() {
-  return motionJobOk;
 }
 

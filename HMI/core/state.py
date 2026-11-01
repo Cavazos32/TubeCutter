@@ -38,6 +38,9 @@ MOTION_MOVE_TX_ATTEMPTS = 3  # 1 envío + 2 reintentos máx.
 MOTION_MOVE_ACK_PEEK_S = 0.02
 MOTION_MOVE_ACK_TIMEOUT_S = 6.0  # solo recuperación de transporte / boot
 MOTION_MOVE_LINK_WAIT_S = 5.0
+# Comprobación de enlace al abrir el lote. El ping no actúa: se puede repetir.
+LOT_LINK_PING_ATTEMPTS = 3
+LOT_LINK_PING_TIMEOUT_S = 1.0
 # SSE/poll: cola interna 400; al aire solo cola reciente (UI no reparsea 2000).
 SSE_LOG_TAIL = 48
 
@@ -94,8 +97,6 @@ from clients.motion import (
     motion_http_asda_status,
     motion_http_feed_can_init,
     motion_http_feed_status,
-    motion_http_stage2_start,
-    motion_http_stage2_status,
     TX_REACHED,
     TX_RETURN,
     TX_STOP_STATE,
@@ -110,6 +111,7 @@ from clients.plc import (
     CMD_ENCODER,
     CMD_GRIPPER,
     CMD_HOLDER,
+    CMD_CUTTERS,
     CMD_HOLDER_ENCODER,
     CMD_RESET,
     DEFAULT_HOST as PLC_HOST,
@@ -227,6 +229,17 @@ PLC_VALVES = (
     ("Encoder", CMD_ENCODER, TX_ENCODER_ERR, "sensorTray"),
     ("Blower", CMD_BLOWER, None, None),
 )
+
+# Órdenes cuyo firmware responde con ACK TCP.
+_PLC_ACK_WATCH_LABELS = {
+    CMD_CUTTER_R: "Cortador R",
+    CMD_CUTTER_L: "Cortador L",
+    CMD_CUTTERS: "Cortadores",
+    CMD_GRIPPER: "Pinzas",
+    CMD_HOLDER: "Holder",
+    CMD_ENCODER: "Encoder",
+    CMD_HOLDER_ENCODER: "Holder+Encoder",
+}
 
 PF_ERRORS = (
     ("L", (
@@ -456,9 +469,7 @@ class HmiState:
         # Motivo del último LengthNG por lado (láser E004/E005, ventana, etc.)
         self._feed_fault_l = ""
         self._feed_fault_r = ""
-        # Stage2: operación única (no Reached ASDA; no Feed L/R)
-        self._stage2_armed = False
-        self._stage2_gen = 0
+        # Último fallo del arranque CAN del alimentador (checklist e Init CAN).
         self._stage2_fault = ""
         # ACK ASDA pendiente (CMD_MOVE recovery — no reenviar a ciegas)
         self._pending_asda_ack: _PendingAsdaAck | None = None
@@ -856,6 +867,61 @@ class HmiState:
 
     def cycle_notify(self) -> None:
         self._notify()
+
+    def confirm_lot_links(self) -> tuple[bool, str, str]:
+        """Ping simultáneo a Motion, PLC, PreFeeder y Andon. Espera el pong de todos.
+
+        Solo al abrir el lote. Durante las piezas no hay ping: la supervisión es
+        el ACK de cada orden. El ping se puede repetir; una válvula no.
+        """
+        modules = (
+            ("Motion", self._client, "E065"),
+            ("PLC", self._plc_client, "E066"),
+            ("PreFeeder", self._pf_client, "E067"),
+            ("Andon", self._andon_client, "E064"),
+        )
+        results: dict[str, str | None] = {}
+        lock = threading.Lock()
+
+        def check(name: str, client: Any, code: str) -> None:
+            ok = False
+            try:
+                ok = bool(
+                    client.ping_confirmed(
+                        attempts=LOT_LINK_PING_ATTEMPTS,
+                        timeout_s=LOT_LINK_PING_TIMEOUT_S,
+                    )
+                )
+            except Exception:
+                ok = False
+            with lock:
+                results[name] = None if ok else code
+
+        threads = [
+            threading.Thread(
+                target=check,
+                args=item,
+                daemon=True,
+                name=f"lot-ping-{item[0]}",
+            )
+            for item in modules
+        ]
+        for thread in threads:
+            thread.start()
+        join_s = LOT_LINK_PING_ATTEMPTS * (LOT_LINK_PING_TIMEOUT_S + 2.5) + 1.0
+        for thread, (name, _client, code) in zip(threads, modules):
+            thread.join(join_s)
+            if name not in results:
+                with lock:
+                    results[name] = code
+        failed = [(name, code) for name, _client, code in modules if results.get(name)]
+        if not failed:
+            return True, "", ""
+        names = ", ".join(name for name, _code in failed)
+        detail = (
+            f"Enlace: sin pong de {names} tras {LOT_LINK_PING_ATTEMPTS} intentos"
+        )
+        return False, failed[0][1], detail
 
     def motion_connected(self) -> bool:
         return self._client.connected
@@ -1267,8 +1333,6 @@ class HmiState:
         self._feed_armed_r = False
         self._feed_fault_l = ""
         self._feed_fault_r = ""
-        self._stage2_armed = False
-        self._stage2_gen = 0
         self._stage2_fault = ""
 
     def clear_motion_reached_flag(self) -> None:
@@ -1277,86 +1341,6 @@ class HmiState:
 
     def wait_motion_idle_or_reached(self, timeout_s: float) -> bool:
         return self._motion_idle_or_reached.wait(timeout=timeout_s)
-
-    def arm_stage2(self) -> None:
-        """CLEAR/ARM Stage2 — descarta resultado previo; no usa flags Feed/Reached."""
-        self._stage2_armed = True
-        self._stage2_gen = 0
-        self._stage2_fault = ""
-
-    def cmd_motion_stage2_start(
-        self, piece_mm: float | None = None, sides: str = "LR", *, target_abs_mm: float | None = None
-    ) -> bool:
-        """START Stage2. CYCLE pasa target_abs_mm=abs(model.mm)+cutOffsetMm."""
-        if not self._stage2_armed:
-            self.arm_stage2()
-        host = getattr(self._client, "_host", DEFAULT_HOST)
-        try:
-            data = motion_http_stage2_start(
-                piece_mm if target_abs_mm is None else None,
-                sides=str(sides or "LR"),
-                host=str(host),
-                target_abs_mm=target_abs_mm,
-            )
-        except Exception as exc:  # noqa: BLE001 — enlace HTTP Motion
-            self._stage2_fault = f"Stage2 start: {exc}"
-            self._stage2_armed = False
-            return False
-        if not data.get("ok"):
-            self._stage2_fault = str(data.get("error") or "Stage2 start rechazado")
-            self._stage2_armed = False
-            return False
-        self._stage2_gen = int(data.get("gen", 0) or 0)
-        if self._stage2_gen <= 0:
-            self._stage2_fault = "Stage2 start sin gen"
-            self._stage2_armed = False
-            return False
-        return True
-
-    def wait_stage2_result(
-        self,
-        timeout_s: float,
-        *,
-        abort_event: threading.Event | None = None,
-    ) -> str:
-        """Espera resultado final Stage2 (OK/NG). Ignora ASDA Reached intermedios.
-
-        Returns: ok | ng | timeout | aborted
-        """
-        host = getattr(self._client, "_host", DEFAULT_HOST)
-        deadline = time.monotonic() + float(timeout_s)
-        last_phase = ""
-        while time.monotonic() < deadline:
-            if abort_event is not None and abort_event.is_set():
-                self._stage2_armed = False
-                return "aborted"
-            if not self._stage2_armed:
-                return "aborted"
-            try:
-                st = motion_http_stage2_status(host=str(host))
-            except Exception as exc:  # noqa: BLE001
-                self._stage2_fault = f"Stage2 status: {exc}"
-                time.sleep(0.1)
-                continue
-            gen = int(st.get("gen", 0) or 0)
-            result = str(st.get("result") or "NONE")
-            phase = str(st.get("phase") or "")
-            if phase and phase != last_phase:
-                last_phase = phase
-                self.cycle_log(f"Stage2 phase={phase} gen={gen}")
-            if self._stage2_gen and gen == self._stage2_gen:
-                if result == "OK":
-                    self._stage2_armed = False
-                    self._log_stage2_snapshot(st, "OK")
-                    return "ok"
-                if result == "NG":
-                    fault = str(st.get("fault") or "").strip()
-                    self._stage2_fault = fault or "Stage2 NG"
-                    self._stage2_armed = False
-                    self._log_stage2_snapshot(st, "NG")
-                    return "ng"
-            time.sleep(0.05)
-        return "timeout"
 
     def stage2_fault(self) -> str:
         return self._stage2_fault
@@ -1442,28 +1426,6 @@ class HmiState:
                 return "ng"
             time.sleep(0.25)
         return "timeout"
-
-    def _log_stage2_snapshot(self, st: dict[str, Any], result: str) -> None:
-        self.cycle_log(
-            "Stage2 {res} gen={gen} piece={piece} target={tgt} "
-            "apPct={ap} apMm={apMm} fast={fast} fine={fine} "
-            "asda={asda} omL={omL} omR={omR} omAvg={omAvg} "
-            "fault={fault}".format(
-                res=result,
-                gen=st.get("gen"),
-                piece=st.get("pieceMm"),
-                tgt=st.get("targetMm"),
-                ap=st.get("stage2ApproachPct"),
-                apMm=st.get("approachMm"),
-                fast=st.get("stage2FastRpm"),
-                fine=st.get("stage2FineRpm"),
-                asda=st.get("asdaMm"),
-                omL=st.get("omL"),
-                omR=st.get("omR"),
-                omAvg=st.get("omAvg") or st.get("finalAverageMm"),
-                fault=st.get("fault") or "",
-            )
-        )
 
     def wait_feed_length_ok(self, timeout_s: float) -> bool:
         # OK en ambos lados; NG en cualquiera = fallo. No OK global por un solo lado.
@@ -1752,6 +1714,18 @@ class HmiState:
                 return None
             return bool(on)
 
+    def _arm_cycle_plc_ack(self, byte_code: int) -> int | None:
+        """Vigilancia de 1 s solo si el ciclo está activo y ese byte tiene ACK TCP."""
+        label = _PLC_ACK_WATCH_LABELS.get(int(byte_code))
+        if not label or not self._cycle.is_active():
+            return None
+        return self._cycle.arm_plc_ack_watch(int(byte_code), label)
+
+    def _cancel_cycle_plc_ack(self, order_id: int | None) -> None:
+        if order_id is None:
+            return
+        self._cycle.cancel_plc_ack_watch(order_id)
+
     def _cmd_plc_valve_desired(
         self, byte_code: int, on: bool, send, *, force: bool = False
     ) -> bool:
@@ -1759,18 +1733,24 @@ class HmiState:
 
         force=True: siempre TX (p.ej. par Set→Res del cortador en ciclo). El PLC
         sigue sin pulsar si su ``st`` ya coincide — no invertimos el KEEP ahí.
+        No se reenvía el pulso si el ACK no llega: el MCU no deduplica la orden
+        y un segundo TX puede ejecutarla otra vez. Silencio y ok:false los
+        separa la vigilancia de 1 s.
         """
         if not force:
             cur = self.plc_valve_is_on(byte_code)
             if cur is not None and cur == on:
                 return True
+        watch = self._arm_cycle_plc_ack(byte_code)
         ok = bool(send(on))
-        if ok:
-            with self._lock:
-                key = str(byte_code)
-                if key in self._plc["valves"]:
-                    self._plc["valves"][key]["on"] = on
-        return ok
+        if not ok:
+            self._cancel_cycle_plc_ack(watch)
+            return False
+        with self._lock:
+            key = str(byte_code)
+            if key in self._plc["valves"]:
+                self._plc["valves"][key]["on"] = on
+        return True
 
     def cmd_plc_holder(self, on: bool) -> bool:
         return self._cmd_plc_valve_desired(
@@ -1788,16 +1768,23 @@ class HmiState:
         cur_e = self.plc_valve_is_on(CMD_ENCODER)
         if cur_h is not None and cur_e is not None and cur_h == on and cur_e == on:
             return True
+        watch = self._arm_cycle_plc_ack(CMD_HOLDER_ENCODER)
         ok = bool(self._plc_client.cmd_holder_encoder(on))
-        if ok:
-            with self._lock:
-                for key in (str(CMD_HOLDER), str(CMD_ENCODER)):
-                    if key in self._plc["valves"]:
-                        self._plc["valves"][key]["on"] = on
-        return ok
+        if not ok:
+            self._cancel_cycle_plc_ack(watch)
+            return False
+        with self._lock:
+            for key in (str(CMD_HOLDER), str(CMD_ENCODER)):
+                if key in self._plc["valves"]:
+                    self._plc["valves"][key]["on"] = on
+        return True
 
     def cmd_plc_gripper(self, on: bool) -> bool:
-        return self._plc_client.cmd_gripper(on)
+        watch = self._arm_cycle_plc_ack(CMD_GRIPPER)
+        ok = bool(self._plc_client.cmd_gripper(on))
+        if not ok:
+            self._cancel_cycle_plc_ack(watch)
+        return ok
 
     def plc_ack_seq(self) -> int:
         """Marca global de ACK del PLC. El ciclo la toma antes de enviar."""
@@ -1807,11 +1794,15 @@ class HmiState:
     def _plc_record_ack(self, byte_code: int, ok: bool) -> None:
         with self._plc_ack_lock:
             self._plc_ack_seq += 1
+            seq = self._plc_ack_seq
             self._plc_ack_by_byte[int(byte_code)] = (
-                self._plc_ack_seq,
+                seq,
                 bool(ok),
             )
             self._plc_ack_wait.notify_all()
+        cycle = getattr(self, "_cycle", None)
+        if cycle is not None:
+            cycle.on_plc_ack(int(byte_code), seq, bool(ok))
 
     def wait_plc_ack(
         self, byte_code: int, since_seq: int, timeout_s: float
@@ -1866,7 +1857,9 @@ class HmiState:
         """Pulso KEEP de cortadores.
 
         sides: ``L`` | ``R`` | ``LR``. ``None`` = ambos (safe / manual).
-        Con LR usa un solo setOut CUTTERS (PLC pulsa R+L en paralelo).
+        Con LR usa un solo setOut CUTTERS (PLC pulsa R+L en paralelo)
+        y confirma con un ACK 0x2B al terminar el pulso.
+        L o R sueltos confirman con su byte (0x1A / 0x19).
         force: no omitir por caché HMI (ciclo Set→Res).
         """
         mode = "LR" if not sides else CycleConfig.normalize_feed_sides(sides)
@@ -1881,14 +1874,17 @@ class HmiState:
                     and cur_l == on
                 ):
                     return True
+            watch = self._arm_cycle_plc_ack(CMD_CUTTERS)
             ok = self._plc_client.cmd_set_out("CUTTERS", on)
-            if ok:
-                with self._lock:
-                    for code in (CMD_CUTTER_R, CMD_CUTTER_L):
-                        key = str(code)
-                        if key in self._plc["valves"]:
-                            self._plc["valves"][key]["on"] = on
-            return ok
+            if not ok:
+                self._cancel_cycle_plc_ack(watch)
+                return False
+            with self._lock:
+                for code in (CMD_CUTTER_R, CMD_CUTTER_L):
+                    key = str(code)
+                    if key in self._plc["valves"]:
+                        self._plc["valves"][key]["on"] = on
+            return True
         if mode == "L":
             return self._cmd_plc_valve_desired(
                 CMD_CUTTER_L, on, self._plc_client.cmd_cutter_l, force=force
@@ -4139,6 +4135,15 @@ class HmiState:
                 self._apply_state_byte(byte_code)
                 return True
             if mtype == "event":
+                if "laserR" in msg or "laserL" in msg or "safetyExhaust" in msg:
+                    if "laserR" in msg:
+                        self._motion["laserR"] = bool(msg["laserR"])
+                    if "laserL" in msg:
+                        self._motion["laserL"] = bool(msg["laserL"])
+                    if "safetyExhaust" in msg:
+                        self._motion["safetyExhaust"] = bool(msg["safetyExhaust"])
+                    if "byte" not in msg:
+                        return True
                 byte_code = int(msg.get("byte", 0))
                 if byte_code in (CMD_ENC_MEASURE_R, CMD_ENC_MEASURE_L):
                     side = msg.get(
@@ -4397,10 +4402,12 @@ class HmiState:
                 byte_code = int(msg.get("byte", 0))
                 if msg.get("actuator") == "plc":
                     if byte_code in PLC_ERROR_BYTES:
-                        self._apply_detail_error(byte_code, source="plc")
-                        for label, cmd, err_b, _ in PLC_VALVES:
+                        level_on = bool(msg["on"]) if "on" in msg else True
+                        for _label, cmd, err_b, _sf in PLC_VALVES:
                             if err_b == byte_code:
-                                self._plc["valves"][str(cmd)]["error"] = True
+                                self._plc["valves"][str(cmd)]["error"] = level_on
+                        if level_on:
+                            self._apply_detail_error(byte_code, source="plc")
                         return True
                     if "on" in msg:
                         cmd_b = byte_code
@@ -4446,7 +4453,9 @@ class HmiState:
                     )
                     return True
                 return False
-            if mtype == "status" and msg.get("role") == "plca":
+            if mtype == "status" and (
+                msg.get("actuator") == "plc" or msg.get("role") in ("plc", "plca")
+            ):
                 self._plc_sync_valves_from_status(msg)
                 for _label, cmd, _err_b, sf in PLC_VALVES:
                     if sf and sf in msg:

@@ -1,6 +1,5 @@
 #include "Servo_Feed.h"
 #include "FeederCan.h"
-#include "Stage2.h"
 #include "MotionStates.h"
 #include "driver/twai.h"
 #include <Preferences.h>
@@ -44,7 +43,7 @@ static bool feedCanBootSequence()
 static void feedCanServiceInitRequest(bool feedActive)
 {
   if (!feedCanInitPending || feedCanInitBusy) return;
-  if (feedActive || motionHostIsOccupied() || stage2IsActive()) return;
+  if (feedActive || motionHostIsOccupied()) return;
 
   feedCanInitPending = false;
   (void)feedCanBootSequence();
@@ -382,7 +381,7 @@ bool feedCanBootInit()
 bool feedCanInitRequest()
 {
   if (feedCanInitPending || feedCanInitBusy) return false;
-  if (feedPhaseIsActive() || motionHostIsOccupied() || stage2IsActive()) return false;
+  if (feedPhaseIsActive() || motionHostIsOccupied()) return false;
   feedCanInitPending = true;
   return true;
 }
@@ -2560,7 +2559,7 @@ static void handleFeedStatus() { sendJson(200, feedStatusJson()); }
 static void handleFeedCanInit()
 {
   // Handler corto: encola Init; feedLoop() ejecuta la secuencia cuando no hay conflicto.
-  if (feedPhaseIsActive() || motionHostIsOccupied() || stage2IsActive()) {
+  if (feedPhaseIsActive() || motionHostIsOccupied()) {
     sendJson(409, "{\"ok\":false,\"error\":\"Alimentador ocupado\"}");
     return;
   }

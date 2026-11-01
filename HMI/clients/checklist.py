@@ -1099,26 +1099,12 @@ class ChecklistManager:
         if can_result != "ok":
             fault = host.stage2_fault() or can_result
             raise RuntimeError(f"Arranque del alimentador: {fault}")
-        self._log("Checklist: alimentador arrancado (servo listo)")
-
-        self._set_phase("feeder:stage2")
-        host.arm_stage2()
-        piece = abs(float(host._mm))
-        if not host.cmd_motion_stage2_start(piece_mm=piece, sides="LR"):
-            fault = host.stage2_fault() or "Stage2 start falló"
-            raise RuntimeError(fault)
-        result = host.wait_stage2_result(120.0, abort_event=self._worker_cancel)
-        if result == "aborted":
-            raise _ChecklistCancelled()
-        if result != "ok":
-            fault = host.stage2_fault() or result
-            raise RuntimeError(f"CAN/Stage2: {fault}")
 
         with self._lock:
             if self._session:
                 self._session["stage2Ok"] = True
                 self._reset_purge_flags_locked()
-        self._log("Checklist: CAN/Stage2 init OK — iniciar purga manual")
+        self._log("Checklist: alimentador listo — iniciar purga manual")
         self._set_phase("")
 
     def _action_start_purge(self, host: Any) -> dict[str, Any]:

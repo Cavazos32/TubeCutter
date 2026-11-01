@@ -175,19 +175,6 @@ def motion_http_feed_can_init(
     return data
 
 
-def motion_http_stage2_status(
-    host: str = DEFAULT_HOST,
-    port: int = MOTION_HTTP_PORT,
-    timeout: float = 3.0,
-) -> dict[str, Any]:
-    url = f"http://{host}:{port}/api/stage2/status"
-    with urllib.request.urlopen(url, timeout=timeout) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError("Respuesta stage2/status invalida")
-    return data
-
-
 def motion_http_asda_status(
     host: str = DEFAULT_HOST,
     port: int = MOTION_HTTP_PORT,
@@ -231,62 +218,6 @@ def motion_http_asda_position_mm(
         return None
 
 
-def motion_http_stage2_start(
-    piece_mm: float | None = None,
-    sides: str = "LR",
-    host: str = DEFAULT_HOST,
-    port: int = MOTION_HTTP_PORT,
-    timeout: float = 5.0,
-    *,
-    target_abs_mm: float | None = None,
-) -> dict[str, Any]:
-    """Inicia Stage2 en Motion (FSM local).
-
-    - target_abs_mm: carrera ABS del lineal (contrato CYCLE). Preferido.
-    - piece_mm: longitud de pieza L (test Motion HTML); target = L−55.
-    Compat: si solo hay abs, también envía pieceMm=abs+55 por si firmware
-    aún no entiende targetAbsMm.
-    """
-    payload: dict[str, Any] = {"sides": str(sides or "LR")}
-    if target_abs_mm is not None:
-        abs_mm = abs(float(target_abs_mm))
-        payload["targetAbsMm"] = abs_mm
-        # Compat firmware previo: pieceMm = abs + 55 → Motion target = abs
-        payload["pieceMm"] = abs_mm + 55.0
-    elif piece_mm is not None:
-        payload["pieceMm"] = float(piece_mm)
-    else:
-        raise ValueError("stage2/start requiere target_abs_mm o piece_mm")
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        f"http://{host}:{port}/api/stage2/start",
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            raw = exc.read().decode("utf-8", errors="replace")
-            parsed = json.loads(raw) if raw else {}
-            if isinstance(parsed, dict):
-                detail = str(parsed.get("error") or raw or "").strip()
-            else:
-                detail = raw.strip()
-        except Exception:  # noqa: BLE001
-            detail = ""
-        msg = f"HTTP Error {exc.code}: {exc.reason}"
-        if detail:
-            msg = f"{msg} — {detail}"
-        raise RuntimeError(msg) from exc
-    if not isinstance(data, dict):
-        raise ValueError("Respuesta stage2/start invalida")
-    return data
-
-
 class MotionClient(ModuleTcpClient):
     """Cliente TCP al esclavo Motion. Maneja enlace y reconexion en segundo plano."""
 
@@ -296,10 +227,6 @@ class MotionClient(ModuleTcpClient):
         on_connection: Optional[Callable[[bool], None]] = None,
     ) -> None:
         super().__init__(DEFAULT_HOST, DEFAULT_PORT, on_message, on_connection)
-
-    def _send_probe(self) -> bool:
-        # Keepalive de enlace (tcp_link), no GetStatus/Modbus (regla C1).
-        return self.send_command(command="ping")
 
     def cmd_byte(self, byte_code: int, **extra: Any) -> bool:
         return self.send_command(byte=byte_code, **extra)

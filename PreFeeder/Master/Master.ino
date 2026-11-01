@@ -1,6 +1,7 @@
 // PreFeeder Master — L/R + TCP HMI (protocol.h).
 #include <WiFi.h>
 #include <WebServer.h>
+#include "../../common/EspLink.h"
 #include "../protocol.h"
 #include "pf_status_mode.h"
 #include "config.h"
@@ -20,8 +21,13 @@ static const uint32_t RECONNECT_MS = 2500;
 static const uint32_t CONNECT_TIMEOUT_MS = 2000;
 static const uint32_t HEARTBEAT_WARN_MS = 8000;
 static const uint32_t STALE_LINK_MS = 30000;
-static const uint32_t KEEPALIVE_PING_MS = 4000;
-static const uint32_t WIFI_RETRY_MS = 8000;
+static EspSta staLink;
+static char pfTcpHoldBuf[1600];
+static EspTcpHold pfTcpHold = {pfTcpHoldBuf, sizeof(pfTcpHoldBuf), 0};
+static char pfHoldBufL[640];
+static char pfHoldBufR[640];
+static EspTcpHold pfHoldL = {pfHoldBufL, sizeof(pfHoldBufL), 0};
+static EspTcpHold pfHoldR = {pfHoldBufR, sizeof(pfHoldBufR), 0};
 static const uint8_t  HTTP_SERVICE_PASSES = 12;
 static const uint8_t PROTO_VER = PF_MASTER_PROTO_VER;
 
@@ -50,13 +56,8 @@ static uint32_t lastRxMsL = 0;
 static uint32_t lastRxMsR = 0;
 static uint32_t connectMsL = 0;
 static uint32_t connectMsR = 0;
-static uint32_t lastKeepaliveMsL = 0;
-static uint32_t lastKeepaliveMsR = 0;
-static uint32_t lastWifiRetryMs = 0;
 static uint8_t failCountL = 0;
 static uint8_t failCountR = 0;
-static bool wifiReconnecting = false;
-static uint32_t wifiReconnectStartedMs = 0;
 static uint16_t cmdId = 1;
 
 struct SideView {
@@ -158,11 +159,31 @@ static char jSideChar(const char* j, char fallback)
   return fallback;
 }
 
+static EspTcpHold& pfHoldFor(WiFiClient& client)
+{
+  return (&client == &pfClientR) ? pfHoldR : pfHoldL;
+}
+
+static void pfNoteDead(WiFiClient& client)
+{
+  espTcpStop(client);
+  espTcpHoldClear(pfHoldFor(client));
+}
+
 static void pfTx(WiFiClient& client, const String& m)
 {
-  if (!client.connected()) return;
-  client.print(m);
-  if (!m.endsWith("\n")) client.print("\n");
+  EspTcpHold& hold = pfHoldFor(client);
+  if (!client.connected()) {
+    if (client) pfNoteDead(client);
+    return;
+  }
+  if (hold.len && !espTcpHoldFlush(client, hold)) {
+    if (!client.connected()) pfNoteDead(client);
+    return;
+  }
+  if (!m.length() || !espTcpHoldPut(hold, m.c_str())) return;
+  if (!espTcpHoldFlush(client, hold) && !client.connected())
+    pfNoteDead(client);
 }
 
 static void pfSendCmd(WiFiClient& client, const String& cmd, const String& val)
@@ -480,13 +501,13 @@ static void pfTryConnect(WiFiClient& client, const IPAddress& ip, uint32_t& last
   client.setTimeout(CONNECT_TIMEOUT_MS);
   if (client.connect(ip, PF_PORT, CONNECT_TIMEOUT_MS))
   {
+    espTcpKeepAlive(client);
+    espTcpHoldClear(pfHoldFor(client));
     rxLen = 0;
     rxLine[0] = 0;
     connectMs = millis();
     lastRxMs = 0;
     failCount = 0;
-    if (sideTag == 'L') lastKeepaliveMsL = millis();
-    else lastKeepaliveMsR = millis();
     pfSendCmd(client, "ping", "");
     Serial.printf("[MASTER] TCP %c OK -> %s:%u\n", sideTag, ip.toString().c_str(), PF_PORT);
     return;
@@ -506,8 +527,14 @@ static void pfWatchLink(WiFiClient& client, uint32_t& lastRxMs, uint32_t& connec
 {
   if (!client.connected())
   {
+    if (client) pfNoteDead(client);
     connectMs = 0;
     return;
+  }
+  {
+    EspTcpHold& hold = pfHoldFor(client);
+    if (hold.len && !espTcpHoldFlush(client, hold) && !client.connected())
+      pfNoteDead(client);
   }
   if (!connectMs) connectMs = millis();
 
@@ -515,19 +542,11 @@ static void pfWatchLink(WiFiClient& client, uint32_t& lastRxMs, uint32_t& connec
   if (ago <= STALE_LINK_MS) return;
 
   Serial.printf("[MASTER] TCP %c sin datos %ums — reconectando\n", sideTag, (unsigned)ago);
-  client.stop();
+  pfNoteDead(client);
   connectMs = 0;
   lastRxMs = 0;
   // Esperar RECONNECT_MS (no inmediato): evita flapping connect/disconnect.
   lastReconnectMs = millis();
-}
-
-static void pfKeepalive(WiFiClient& client, uint32_t& lastKeepaliveMs)
-{
-  if (!client.connected()) return;
-  if (millis() - lastKeepaliveMs < KEEPALIVE_PING_MS) return;
-  lastKeepaliveMs = millis();
-  pfSendCmd(client, "ping", "");
 }
 
 static void masterServiceHttp()
@@ -541,42 +560,40 @@ static void masterServiceHttp()
 
 static void masterServiceWiFi()
 {
-  if (WiFi.status() == WL_CONNECTED)
+  const uint8_t ev = espStaPoll(staLink);
+  if (ev & ESP_STA_UP)
   {
-    wifiReconnecting = false;
-    return;
+    Serial.printf("[MASTER] WiFi OK %s\n", WiFi.localIP().toString().c_str());
+    if (WiFi.localIP() != STA_IP)
+    {
+      Serial.printf("[MASTER] AVISO: IP real %s != fija %s\n",
+                    WiFi.localIP().toString().c_str(), STA_IP.toString().c_str());
+    }
   }
-
-  if (!wifiReconnecting)
+  if (ev & ESP_STA_BLIP)
+    Serial.println("[MASTER] WiFi blip — esperando auto-reconexion");
+  if (ev & ESP_STA_DOWN)
   {
-    if (millis() - lastWifiRetryMs < WIFI_RETRY_MS) return;
-    lastWifiRetryMs = millis();
-    wifiReconnecting = true;
-    wifiReconnectStartedMs = millis();
-    Serial.println("[MASTER] WiFi perdido — reintentando (no bloquea HTTP)…");
-    WiFi.disconnect(true);
-    delay(50);
-    WiFi.config(STA_IP, STA_GW, STA_MASK, STA_GW);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    return;
+    pfTcpStopServices();
+    Serial.println("[MASTER] WiFi Off");
   }
-
-  if (millis() - wifiReconnectStartedMs > 15000)
+  if (ev & ESP_STA_KICK)
   {
-    Serial.println("[MASTER] WiFi sigue OFF — otro intento en breve");
-    wifiReconnecting = false;
+    pfTcpStopServices();
+    if (!espStaKick(staLink, OTA_HOSTNAME, WIFI_SSID, WIFI_PASS,
+                    STA_IP, STA_GW, STA_MASK, STA_GW))
+      Serial.println("[MASTER] WiFi.config() fallo");
+    Serial.println("[MASTER] WiFi reintentando STA...");
   }
 }
 
 static void pfServiceSide(WiFiClient& client, const IPAddress& ip, uint32_t& lastReconnectMs,
                           char* rxLine, uint16_t& rxLen, char sideTag,
-                          uint32_t& connectMs, uint32_t& lastRxMs, uint8_t& failCount,
-                          uint32_t& lastKeepaliveMs)
+                          uint32_t& connectMs, uint32_t& lastRxMs, uint8_t& failCount)
 {
   if (client.connected())
   {
     pfRx(client, rxLine, rxLen, sideTag);
-    pfKeepalive(client, lastKeepaliveMs);
     pfWatchLink(client, lastRxMs, connectMs, lastReconnectMs, sideTag);
     return;
   }
@@ -892,15 +909,26 @@ static bool pfTcpLinkOk()
   return pfTcpClient && pfTcpClient.connected();
 }
 
+static void pfTcpNoteDead()
+{
+  espTcpStop(pfTcpClient);
+  espTcpHoldClear(pfTcpHold);
+}
+
 static bool pfTcpTx(const String& m)
 {
-  if (!pfTcpLinkOk()) return false;
-  bool ok = pfTcpClient.print(m) > 0;
-  if (!m.endsWith("\n"))
-    ok = (pfTcpClient.print("\n") > 0) && ok;
-  if (!ok)
-    pfTcpClient.stop();
-  return ok;
+  if (!m.length() || pfTcpHold.len || !pfTcpLinkOk()) return false;
+  if (!espTcpHoldPut(pfTcpHold, m.c_str())) return false;
+  if (espTcpHoldFlush(pfTcpClient, pfTcpHold)) return true;
+  if (!pfTcpClient.connected()) pfTcpNoteDead();
+  return false;
+}
+
+static void pfTcpTxPump()
+{
+  if (!pfTcpLinkOk() || !pfTcpHold.len) return;
+  if (!espTcpHoldFlush(pfTcpClient, pfTcpHold) && !pfTcpClient.connected())
+    pfTcpNoteDead();
 }
 
 static String pfTcpJsonEscape(const String& in)
@@ -1238,6 +1266,8 @@ static void pfTcpOnLine(const char* line)
   }
   if (cmdName == "ping") {
     pfTcpTx(String("{\"ver\":") + PF_MASTER_PROTO_VER + ",\"type\":\"pong\"}");
+    // Mismo ping hacia L y R: la HMI lo manda al conectar y al inicio de cada pieza.
+    pfBroadcastCmd("ping", "");
     return;
   }
 
@@ -1281,6 +1311,8 @@ static void pfTcpRxDrain()
 static void pfTcpOnClientAccepted()
 {
   pfTcpClient.setNoDelay(true);
+  espTcpKeepAlive(pfTcpClient);
+  espTcpHoldClear(pfTcpHold);
   pfTcpRxLen = 0;
   pfTcpLastStateByte = 0;
   pfTcpNeedInit = true;
@@ -1310,7 +1342,7 @@ static bool pfTcpAcceptIncoming()
 
   // Igual que Motion/PLC: sustituir siempre (zombies LWIP).
   if (pfTcpClient)
-    pfTcpClient.stop();
+    espTcpStop(pfTcpClient);
   pfTcpClient = incoming;
   pfTcpOnClientAccepted();
   return true;
@@ -1332,9 +1364,9 @@ static void pfTcpEnsureServices()
 
 static void pfTcpStopServices()
 {
-  if (pfTcpClient.connected())
-    pfTcpClient.stop();
+  pfTcpNoteDead();
   pfTcpWasConnected = false;
+  pfTcpRxLen = 0;
   if (!pfTcpServicesUp) return;
   pfTcpServer.end();
   pfTcpServicesUp = false;
@@ -1358,24 +1390,24 @@ static void masterServiceTcpHmi()
 {
   // Mismo ciclo de vida que Motion/PLCA: el listener solo vive con WiFi OK.
   // Arrancar :8768 antes de STA deja el puerto sordo y la HMI no conecta.
-  if (WiFi.status() != WL_CONNECTED)
-  {
-    pfTcpStopServices();
-    return;
-  }
+  if (!staLink.wasUp) return;
 
   pfTcpEnsureServices();
+  pfTcpTxPump();
 
   if (pfTcpAcceptIncoming())
     return;
 
   if (!pfTcpLinkOk())
   {
+    if (pfTcpClient.available()) pfTcpRxDrain();
     if (pfTcpWasConnected)
     {
       Serial.println("[MASTER] TCP HMI desconectado");
       pfTcpWasConnected = false;
+      pfTcpRxLen = 0;
     }
+    if (pfTcpClient) pfTcpNoteDead();
     return;
   }
 
@@ -1386,12 +1418,11 @@ static void masterServiceTcpHmi()
 
 static void setupWiFiBegin()
 {
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.setAutoReconnect(true);
-  WiFi.config(STA_IP, STA_GW, STA_MASK, STA_GW);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  espStaClear(staLink);
   Serial.printf("[MASTER] WiFi iniciado \"%s\" -> %s\n", WIFI_SSID, STA_IP.toString().c_str());
+  if (!espStaKick(staLink, OTA_HOSTNAME, WIFI_SSID, WIFI_PASS,
+                  STA_IP, STA_GW, STA_MASK, STA_GW))
+    Serial.println("[MASTER] WiFi.config() fallo");
 }
 
 static void masterLogWifiOnce()
@@ -1399,12 +1430,6 @@ static void masterLogWifiOnce()
   static bool logged = false;
   if (logged || WiFi.status() != WL_CONNECTED) return;
   logged = true;
-  Serial.printf("[MASTER] WiFi OK %s\n", WiFi.localIP().toString().c_str());
-  if (WiFi.localIP() != STA_IP)
-  {
-    Serial.printf("[MASTER] AVISO: IP real %s != fija %s\n",
-                  WiFi.localIP().toString().c_str(), STA_IP.toString().c_str());
-  }
   Serial.printf("[MASTER] Esclavos L=%s R=%s puerto %u\n",
                 PF_L_IP.toString().c_str(), PF_R_IP.toString().c_str(), PF_PORT);
 }
@@ -1437,7 +1462,6 @@ void setup()
   const uint32_t now = millis();
   lastReconnectMsL = now - RECONNECT_MS;
   lastReconnectMsR = now - RECONNECT_MS;
-  lastWifiRetryMs = now;
 }
 
 void loop()
@@ -1448,11 +1472,11 @@ void loop()
   masterServiceTcpHmi();
 
   pfServiceSide(pfClientL, PF_L_IP, lastReconnectMsL, rxLineL, rxLenL, 'L',
-                connectMsL, lastRxMsL, failCountL, lastKeepaliveMsL);
+                connectMsL, lastRxMsL, failCountL);
   masterServiceHttp();
 
   pfServiceSide(pfClientR, PF_R_IP, lastReconnectMsR, rxLineR, rxLenR, 'R',
-                connectMsR, lastRxMsR, failCountR, lastKeepaliveMsR);
+                connectMsR, lastRxMsR, failCountR);
 
   masterServiceHttp();
 }
