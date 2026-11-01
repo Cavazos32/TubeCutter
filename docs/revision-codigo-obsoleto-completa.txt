@@ -487,5 +487,147 @@ Docs:
 
 
 ================================================================================
+17. VALIDACIÓN — HALLAZGOS MENCIONADOS POR CLAUDE (revisado en repo)
+================================================================================
+
+Metodología: grep + script heurístico (función estática con ≤1 referencia al
+nombre en el mismo árbol de archivos; excluye handlers HTTP registrados con
+server.on). Los conteos exactos "49 funciones" dependen de criterio (static vs
+inline vs handlers); las tendencias sí coinciden.
+
+
+17.1 "49 funciones que nadie llama" (Motion 32, PreFeeder 12, PLC 4, Andon 1)
+────────────────────────────────────────────────────────────────────────────
+Veredicto: DIRECTIONALLY CORRECT (orden de magnitud), conteo exacto no reproducido.
+
+  Motion.ino
+    ~160 funciones static; ~13 claramente huérfanas tras excluir handlers HTTP
+    (decAsdaPrDone*, decFeedOmAtTarget/Overshoot, decBusyMotion, decFeedBusy,
+    decMotionAlarm, decServoCanReady, decFeedCycleOk, asdaTcpTxEvent, encAnyHwOk,
+    clearEncoderCount, readEncoderCount, …).
+    Más muertos en Servo_Feed.cpp: feedNotifyTcpResult (solo definición, cuerpo vacío
+    "Compat"), runFeedCycle (camino bloqueante legacy: 0 llamadas fuera de su propia
+    definición — el ciclo usa feedQueueTestSide vía TCP).
+
+  Motion/MotionStates.h
+    motIsState, motIsAsdaCmd, motIsEncByte, motIsFeedByte, motIsDetailError:
+    SOLO definidos en el header; cero usos en .ino/.cpp.
+
+  PLC/PlcStates.h
+    plcIsCmdByte, plcIsState, plcIsError (+ helper que usa plcIsError):
+    SOLO en header; cero usos en PLC.ino.
+
+  Andon
+    Conteo bajo en .ino con heurística (setup/loop falsos positivos). andonIs*
+    sí se usan en Andon.ino.
+
+  PreFeeder/Master/pf_status_mode.h
+    23 helpers inline pf*; 11 nunca referenciados fuera del header:
+      pfErrorWireCodeFromFault, pfErrorTagFromFault, pfErrorSlugFromFault,
+      pfErrorDescFromFault, pfErrorExxxFromFault, pfErrorFormatUiFromFault,
+      pfErrorLevelFromFault, pfAutoPhaseFromFault, pfAutoPhaseName,
+      pfMachineStateResolve, pfMachineStateName.
+    Master.ino usa sobre todo pfErrorIdFromWireCode, pfErrorExxxFromWireCode,
+    pfErrorFormatUi, pfErrorTagFromWireCode, pfErrorLevelFromWireCode.
+
+  Nota: pfIsCmdByte / pfStateName / pfErrorName en protocol.h no se llaman
+  directamente; Master usa pfTcpIs* y pfTcpErrorName.
+
+
+17.2 Mismo concepto, otro nombre
+────────────────────────────────
+CONFIRMADO.
+
+  Motion JSON duplicado
+    HTTP body: jsonFloat, jsonLong, jsonBool, jsonString (Motion.ino ~262+).
+    TCP ASDA: asdaTcpJInt, asdaTcpJFloat, asdaTcpJBool, asdaTcpJStr (~2839+).
+    Mismo patrón indexOf/substring; dos familias paralelas.
+
+  PreFeeder protocol.h
+    pfTcpErrorName y pfErrorName: switch idéntico (L59-76 vs L92-109).
+    pfTcpStateName → pfStateName; pfTcpIs* → pfIs* (wrappers).
+    Solo pfTcp* consumido en Master.ino.
+
+  Tablas *Is* / *StateName* por módulo
+    motIs*, plcIs*, andonIsMachineByte (Andon sí usa), pfIs* (solo vía pfTcp*).
+    Mismo molde: rango de bytes + clasificación cmd/state/error. Candidato a
+    macro/plantilla común o generación, no copiar a mano.
+
+
+17.3 Parámetros / modos que ya no hacen nada
+────────────────────────────────────────────
+CONFIRMADO (feedMode) y PARCIAL (resto).
+
+  feedMode / clampFeedControlMode (Servo_Feed.cpp ~831-834):
+    if (mode == FEED_MODE_VELOCITY_SENSOR) return FEED_MODE_VELOCITY_SENSOR;
+    return FEED_MODE_VELOCITY_SENSOR;
+    → BYPASS (0) y STEPS_SENSOR/Position (2) nunca persisten; siempre velocity.
+    Aun así: NVS feedMode, feedStatusJson, 3 handlers HTTP con arg feedMode,
+    UI index.html/Index.h aún muestra botones Position/Velocity (Velocity forzado
+    en varios fetch con FEED_MODE_VELOCITY).
+
+  FEED_OM_TARGET_TOL_MM (FeederCan.h ~126, comentario "legacy overview")
+    Solo referenciado por decFeedOmAtTarget y decFeedOmOvershoot en Motion.ino,
+    y esas dos funciones NO tienen call sites → cadena muerta. CORRECTO Claude.
+
+  Servo_Feed "legacy"
+    Comentarios legacy/Compat en feedTestReq, runFeedCycle, feedNotifyTcpResult,
+    snapshot OM, decRampMs unificado, etc. (~6 marcadores "legacy" en .cpp).
+    feedNotifyTcpResult: stub vacío, nunca invocado.
+
+
+17.4 Dos caminos para lo mismo (feed HTTP vs TCP)
+──────────────────────────────────────────────────
+CONFIRMADO como raíz probable de parches.
+
+  TCP / ciclo HMI: feedQueueTestSide desde Motion.ino (~3010+) — no bloqueante.
+  HTTP cal/local: feedQueueTest en handlers (~2546); runFeedCycle bloqueante
+    (~2292-2312) existe pero NADIE lo llama (código muerto listo para borrar).
+  feedTestReq: rama legacy en feedLoop (~2126) pero feedQueueTest pone
+    pending=false de inmediato (~2257-2258); cola real feedSides[].pending.
+
+  /api/pos
+    Registrado Motion.ino ~3732; handlePos definido ~2392.
+    Sin referencias en Motion/index.html, Index.h, ni HMI Python/clients.
+    → Endpoint huérfano salvo llamada manual. CORRECTO Claude.
+
+  Rutas HTTP Motion
+    HMI clients/motion.py usa: /api/status, /api/feed/status, /api/feed/can-init.
+    Ciclo TCP :8767 para comandos de producción.
+    Casi todo server.on en Motion.ino + Servo_Feed registerFeedRoutes sirve la
+    página embebida / calibración local (/, /api/config, /api/overview, /feed, …).
+    Si ya no calibras con la web del ESP, gran parte del HTTP es deuda opcional.
+
+
+17.5 FeederCan.h — constantes sobrantes
+───────────────────────────────────────
+CONFIRMADO en espíritu (~12 vs ~18 según criterio).
+
+  Heurística: #define en FeederCan.h con ≤1 mención en todo Motion/ → 18 nombres,
+  incluyendo FEED_LASER_SEEK_DIST_MARGIN (comentario "legacy; seek ya no usa…"),
+  FEED_TEST_CHUNK_DEFAULT, FEED_CONTROL_TOL_MM, FEED_GOOD_TOL_MM, varios SERVO_OD_*.
+  Algunos pueden ser reserva documental; otros claramente restos de overview viejo.
+
+  PIN_ETH_* en PLC/Config.h y Motion/Config.h: sin uso fuera del header.
+  Andon sí configura pines ETH en setup.
+
+
+17.6 Fuera del firmware (coincide con secciones 12–13)
+──────────────────────────────────────────────────────
+  arduino-cli.exe duplicado (tools/arduino-cli + tools/ac) + zip ≈ 92–93 MB.
+  dos iniciar_hmi.py: scripts/ delega a raíz (no duplica lógica).
+  README HMI desactualizado (rutas state.py, motion.py, nombres config).
+
+
+17.7 Matiz importante (no contradice, aclara)
+─────────────────────────────────────────────
+  - decWithinTol / decFeedLengthMet SÍ se usan en overview (~2143+).
+  - runFeedCycle muerto ≠ feedQueueTestSide (vivo, producción).
+  - UI local Motion aún envía feedMode=2|3 en HTML aunque clamp lo anula en ESP.
+  - Conteo "32 Motion" de Claude probablemente incluye Motion.ino + Servo_Feed +
+    helpers inline muertos; reproducción estricta da ~13–40 según alcance.
+
+
+================================================================================
 FIN DEL INFORME
 ================================================================================
