@@ -141,7 +141,7 @@ static const UBaseType_t ASDA_TCP_TASK_CORE = 1;
 static const UBaseType_t ASDA_TCP_TASK_PRIO = 2;  // loopTask Arduino = 1
 static const uint32_t ASDA_TCP_TASK_STACK = 8192;
 static const UBaseType_t ASDA_TCP_CMD_Q_LEN = 4;
-static const UBaseType_t ASDA_TCP_TX_Q_LEN = 8;
+static const UBaseType_t ASDA_TCP_TX_Q_LEN = 16;
 static const uint8_t ASDA_TCP_CMD_BUDGET_PER_LOOP = 2;
 
 static TaskHandle_t asdaTcpTaskHandle = nullptr;
@@ -2799,7 +2799,7 @@ static bool asdaTcpQueueTx(const String& m) {
   const unsigned len = m.length();
   if (len >= sizeof(msg.line)) return false;
   memcpy(msg.line, m.c_str(), len + 1);
-  if (xQueueSend(asdaTcpTxQ, &msg, pdMS_TO_TICKS(20)) != pdTRUE)
+  if (xQueueSend(asdaTcpTxQ, &msg, 0) != pdTRUE)
     return false;
   return true;
 }
@@ -2812,10 +2812,14 @@ static bool asdaTcpTx(const String& m) {
 }
 
 static void asdaTcpDrainTx() {
-  if (!asdaTcpFlushHold() || !asdaTcpTxQ) return;
+  if (!asdaTcpTxQ) return;
+  if (!asdaTcpFlushHold()) return;
   AsdaTcpTxMsg msg;
   while (xQueueReceive(asdaTcpTxQ, &msg, 0) == pdTRUE) {
-    if (!espTcpHoldPut(asdaHold, msg.line)) break;
+    if (!espTcpHoldPut(asdaHold, msg.line)) {
+      xQueueSendToFront(asdaTcpTxQ, &msg, 0);
+      break;
+    }
     if (!asdaTcpFlushHold()) return;
   }
 }
@@ -2853,16 +2857,17 @@ static String asdaTcpJStr(const char* j, const char* k) {
   return b < 0 ? "" : s.substring(a, b);
 }
 
-static void asdaTcpTxState(uint8_t byteCode, const char* name) {
+static bool asdaTcpTxState(uint8_t byteCode, const char* name) {
   char buf[96];
   snprintf(buf, sizeof(buf),
            "{\"ver\":%u,\"type\":\"state\",\"actuator\":\"motion\",\"byte\":%u,\"name\":\"%s\"}",
            (unsigned)MOTION_PROTO_VER, (unsigned)byteCode, name);
-  asdaTcpTx(String(buf));
+  if (!asdaTcpTx(String(buf))) return false;
   asdaTcpLastStateByte = byteCode;
+  return true;
 }
 
-static void motionTcpTxEvent(const char* actuator, uint8_t byteCode, const char* name,
+static bool motionTcpTxEvent(const char* actuator, uint8_t byteCode, const char* name,
                              int32_t extra = INT32_MIN) {
   char buf[192];
   if (extra != INT32_MIN) {
@@ -2875,7 +2880,7 @@ static void motionTcpTxEvent(const char* actuator, uint8_t byteCode, const char*
              "{\"ver\":%u,\"type\":\"event\",\"actuator\":\"%s\",\"byte\":%u,\"name\":\"%s\"}",
              (unsigned)MOTION_PROTO_VER, actuator, (unsigned)byteCode, name);
   }
-  asdaTcpTx(String(buf));
+  return asdaTcpTx(String(buf));
 }
 
 static void asdaTcpTxEvent(uint8_t byteCode, const char* name, int32_t posPuu) {
@@ -2936,8 +2941,8 @@ void motionTcpClearFeedSidePending(bool sideR) {
   }
 }
 
-static void motionTcpTxMeasured(uint8_t byteCode, bool sideR,
-                                  float mmOfficial, float mmSigned, bool settled) {
+static bool motionTcpTxMeasured(uint8_t byteCode, bool sideR,
+                                float mmOfficial, float mmSigned, bool settled) {
   char buf[240];
   snprintf(buf, sizeof(buf),
            "{\"ver\":%u,\"type\":\"event\",\"actuator\":\"encoder\",\"byte\":%u,"
@@ -2945,7 +2950,7 @@ static void motionTcpTxMeasured(uint8_t byteCode, bool sideR,
            "\"mm\":%.3f,\"settled\":%s}",
            (unsigned)MOTION_PROTO_VER, (unsigned)byteCode, sideR ? 'R' : 'L',
            (double)mmOfficial, (double)mmSigned, settled ? "true" : "false");
-  asdaTcpTx(String(buf));
+  return asdaTcpTx(String(buf));
 }
 
 static bool encoderTcpDoByte(uint8_t cmdByte, const char* line) {
@@ -3092,8 +3097,7 @@ static const char* asdaTcpStateName(uint8_t byteCode) {
 static void asdaTcpPushStateIfChanged() {
   const uint8_t st = asdaTcpResolveStateByte();
   if (st == asdaTcpLastStateByte) return;
-  asdaTcpTxState(st, asdaTcpStateName(st));
-  if (st == ASDA_TX_RETURN)
+  if (asdaTcpTxState(st, asdaTcpStateName(st)) && st == ASDA_TX_RETURN)
     asdaTcpStopPending = false;
 }
 
@@ -3422,25 +3426,31 @@ static void motionTcpPollMeasureEvents() {
   if (!asdaTcpLinkOk()) return;
 
   if (motionTcpNotifyMeasureR) {
-    motionTcpNotifyMeasureR = false;
     float mmOff = 0.0f, mmSigned = 0.0f;
     bool settled = false;
     String err;
-    if (motionExecGetMeasured(true, mmOff, mmSigned, settled, err)
-        && (fabsf(mmOff - motionTcpLastPushMmR) >= 0.05f || settled)) {
-      motionTcpLastPushMmR = mmOff;
-      motionTcpTxMeasured(ENC_CMD_MEASURE_R, true, mmOff, mmSigned, settled);
+    if (motionExecGetMeasured(true, mmOff, mmSigned, settled, err)) {
+      if (fabsf(mmOff - motionTcpLastPushMmR) < 0.05f && !settled) {
+        motionTcpNotifyMeasureR = false;
+      } else {
+        motionTcpLastPushMmR = mmOff;
+        if (motionTcpTxMeasured(ENC_CMD_MEASURE_R, true, mmOff, mmSigned, settled))
+          motionTcpNotifyMeasureR = false;
+      }
     }
   }
   if (motionTcpNotifyMeasureL) {
-    motionTcpNotifyMeasureL = false;
     float mmOff = 0.0f, mmSigned = 0.0f;
     bool settled = false;
     String err;
-    if (motionExecGetMeasured(false, mmOff, mmSigned, settled, err)
-        && (fabsf(mmOff - motionTcpLastPushMmL) >= 0.05f || settled)) {
-      motionTcpLastPushMmL = mmOff;
-      motionTcpTxMeasured(ENC_CMD_MEASURE_L, false, mmOff, mmSigned, settled);
+    if (motionExecGetMeasured(false, mmOff, mmSigned, settled, err)) {
+      if (fabsf(mmOff - motionTcpLastPushMmL) < 0.05f && !settled) {
+        motionTcpNotifyMeasureL = false;
+      } else {
+        motionTcpLastPushMmL = mmOff;
+        if (motionTcpTxMeasured(ENC_CMD_MEASURE_L, false, mmOff, mmSigned, settled))
+          motionTcpNotifyMeasureL = false;
+      }
     }
   }
 }
@@ -3448,48 +3458,42 @@ static void motionTcpPollMeasureEvents() {
 static void motionTcpPollFeedEvents() {
   if (!asdaTcpLinkOk()) return;
 
-  if (motionTcpNotifyEncError) {
+  if (motionTcpNotifyEncError
+      && motionTcpTxEvent("encoder", ENC_TX_ERROR_R, "ErrorER"))
     motionTcpNotifyEncError = false;
-    motionTcpTxEvent("encoder", ENC_TX_ERROR_R, "ErrorER");
-  }
-  if (motionTcpNotifyEncErrorL) {
+  if (motionTcpNotifyEncErrorL
+      && motionTcpTxEvent("encoder", ENC_TX_ERROR_L, "ErrorEL"))
     motionTcpNotifyEncErrorL = false;
-    motionTcpTxEvent("encoder", ENC_TX_ERROR_L, "ErrorEL");
-  }
-  if (motionTcpNotifyFeedOkL) {
+  if (motionTcpNotifyFeedOkL
+      && motionTcpTxEvent("feeder", FEED_TX_LENGTH_OK_L, "LenghtOK_L"))
     motionTcpNotifyFeedOkL = false;
-    motionTcpTxEvent("feeder", FEED_TX_LENGTH_OK_L, "LenghtOK_L");
-  }
-  if (motionTcpNotifyFeedNgL) {
+  if (motionTcpNotifyFeedNgL
+      && motionTcpTxEvent("feeder", FEED_TX_LENGTH_NG_L, "LenghtNG_L"))
     motionTcpNotifyFeedNgL = false;
-    motionTcpTxEvent("feeder", FEED_TX_LENGTH_NG_L, "LenghtNG_L");
-  }
-  if (motionTcpNotifyFeedOkR) {
+  if (motionTcpNotifyFeedOkR
+      && motionTcpTxEvent("feeder", FEED_TX_LENGTH_OK_R, "LenghtOK_R"))
     motionTcpNotifyFeedOkR = false;
-    motionTcpTxEvent("feeder", FEED_TX_LENGTH_OK_R, "LenghtOK_R");
-  }
-  if (motionTcpNotifyFeedNgR) {
+  if (motionTcpNotifyFeedNgR
+      && motionTcpTxEvent("feeder", FEED_TX_LENGTH_NG_R, "LenghtNG_R"))
     motionTcpNotifyFeedNgR = false;
-    motionTcpTxEvent("feeder", FEED_TX_LENGTH_NG_R, "LenghtNG_R");
-  }
   // Detalles: global (ASDA/exhaust) + Feed L + Feed R — sin que un lado pise al otro.
   if (motionTcpPendingDetailErr != 0) {
     const uint8_t b = motionTcpPendingDetailErr;
-    motionTcpPendingDetailErr = 0;
     const char* n = motionTcpPendingDetailName[0] ? motionTcpPendingDetailName : "DetailErr";
-    motionTcpTxEvent("motion", b, n);
+    if (motionTcpTxEvent("motion", b, n))
+      motionTcpPendingDetailErr = 0;
   }
   if (motionTcpPendingDetailErrL != 0) {
     const uint8_t b = motionTcpPendingDetailErrL;
-    motionTcpPendingDetailErrL = 0;
     const char* n = motionTcpPendingDetailNameL[0] ? motionTcpPendingDetailNameL : "FeedL";
-    motionTcpTxEvent("motion", b, n);
+    if (motionTcpTxEvent("motion", b, n))
+      motionTcpPendingDetailErrL = 0;
   }
   if (motionTcpPendingDetailErrR != 0) {
     const uint8_t b = motionTcpPendingDetailErrR;
-    motionTcpPendingDetailErrR = 0;
     const char* n = motionTcpPendingDetailNameR[0] ? motionTcpPendingDetailNameR : "FeedR";
-    motionTcpTxEvent("motion", b, n);
+    if (motionTcpTxEvent("motion", b, n))
+      motionTcpPendingDetailErrR = 0;
   }
 }
 
@@ -3509,8 +3513,8 @@ static bool motionSensorActiveSafety() {
 #endif
 }
 
-static void motionTcpTxIoSensorStatus() {
-  if (!asdaTcpLinkOk()) return;
+static bool motionTcpTxIoSensorStatus() {
+  if (!asdaTcpLinkOk()) return false;
   char buf[200];
   snprintf(buf, sizeof(buf),
            "{\"ver\":%u,\"type\":\"event\",\"actuator\":\"motion\","
@@ -3519,7 +3523,7 @@ static void motionTcpTxIoSensorStatus() {
            ioLaserRActive ? "true" : "false",
            ioLaserLActive ? "true" : "false",
            ioSafetyActive ? "true" : "false");
-  asdaTcpTx(String(buf));
+  return asdaTcpTx(String(buf));
 }
 
 void motionPollIoSensors() {
@@ -3567,21 +3571,18 @@ static void motionTcpPollIoSensorEvents() {
 #else
   if (!asdaTcpLinkOk()) return;
   if (!motionTcpNotifyIoStatus) return;
-  motionTcpNotifyIoStatus = false;
-  motionTcpTxIoSensorStatus();
+  if (motionTcpTxIoSensorStatus())
+    motionTcpNotifyIoStatus = false;
 #endif
 }
 
 static void asdaTcpPollEvents() {
   if (!asdaTcpLinkOk()) return;
 
-  if (asdaTcpNeedInit) {
-    asdaTcpTxState(ASDA_TX_INIT, "InitState");
+  if (asdaTcpNeedInit && asdaTcpTxState(ASDA_TX_INIT, "InitState"))
     asdaTcpNeedInit = false;
-  }
 
   if (asdaTcpNotifyReached) {
-    asdaTcpNotifyReached = false;
     const float reachedMm = puuToMm(asdaTcpReachedPos, false);
     char buf[240];
     snprintf(buf, sizeof(buf),
@@ -3589,7 +3590,8 @@ static void asdaTcpPollEvents() {
              "\"name\":\"ReachedASDA\",\"positionPuu\":%ld,\"positionMm\":%.2f}",
              (unsigned)MOTION_PROTO_VER, (unsigned)ASDA_TX_REACHED,
              (long)asdaTcpReachedPos, (double)reachedMm);
-    asdaTcpTx(String(buf));
+    if (asdaTcpTx(String(buf)))
+      asdaTcpNotifyReached = false;
   }
 
   asdaTcpPushStateIfChanged();
