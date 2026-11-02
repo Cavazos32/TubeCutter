@@ -277,6 +277,8 @@ static bool autoOn = false;
 static bool idleMode = false;
 static bool inProcess = false;
 static bool benchInProcess = false;
+// In process OFF pedido: no cortar todavía. Idle real = full ON y holgura ON.
+static bool releaseToIdlePending = false;
 
 enum FeederMode : uint8_t {
   FEED_NONE = 0,
@@ -463,7 +465,16 @@ static void serviceHolguraFeed(uint32_t nowMs) {
   feederDemand = !on;
 }
 
+// Idle solo con buffer full estable, holgura ON y el ciclo de asentamiento cerrado.
+// Cortar en el flanco (settle / n s / Tfeed) deja el feeder a medias.
+static bool settledForIdle() {
+  if (!gSnap.bufFullStable || !holguraOkStable()) return false;
+  if (feederDemand || feederMode != FEED_NONE) return false;
+  return holguraPhase == HOLG_IDLE;
+}
+
 static void stopAutoOutputs() {
+  releaseToIdlePending = false;
   stopFeederDemand();
   midBoostUntil = highBoostUntil = 0;
   highReverseActive = false;
@@ -526,6 +537,24 @@ static void syncOutputs() {
     o.servoRun = false;
   }
   outputsSetIntent(o);
+}
+
+// In process OFF: seguir sensores hasta full ON y holgura ON; ahí sí Idle.
+static void requestProcessIdle() {
+  benchInProcess = false;
+  if (!inProcess) {
+    stopAutoOutputs();
+    return;
+  }
+  releaseToIdlePending = true;
+}
+
+static void serviceIdleRelease() {
+  if (!releaseToIdlePending || idleMode || fault != FAULT_NONE) return;
+  if (!settledForIdle()) return;
+  inProcess = false;
+  benchInProcess = false;
+  stopAutoOutputs();
 }
 
 // Tfeed por tiempo (trigger HMI con holgura ya ON).
@@ -650,19 +679,20 @@ void machineHandleCommand(const NetCommand& cmd) {
       pendingTriggerId = (uint16_t)cmd.id;
       pendingTriggerSec = cmd.arg.length() ? cmd.arg.toFloat() : 0.0f;
       break;
-    case NC_IN_PROCESS:  // TCM: sensores/buffer armados
-      inProcess = (cmd.arg == "1" || cmd.arg == "true" || cmd.arg == "on");
-      if (!inProcess) {
+    case NC_IN_PROCESS:  // OFF no corta: Idle = full ON + holgura ON
+      if (cmd.arg == "1" || cmd.arg == "true" || cmd.arg == "on") {
+        inProcess = true;
+        releaseToIdlePending = false;
         benchInProcess = false;
-        stopAutoOutputs();
       } else
-        benchInProcess = false;
+        requestProcessIdle();
       break;
     case NC_BENCH_IN_PROCESS:  // HTML local: simular En proceso (banco)
       benchInProcess = (cmd.arg == "1" || cmd.arg == "true" || cmd.arg == "on");
       if (benchInProcess) {
         idleMode = false;
         inProcess = true;
+        releaseToIdlePending = false;
         if (fault == FAULT_NONE) autoOn = true;
       } else {
         inProcess = false;
@@ -772,6 +802,7 @@ void machineTick(uint32_t nowMs) {
     serviceBufferTimeout(nowMs);  // espera llenado buffer
   }
 
+  serviceIdleRelease();  // Idle diferido: full ON + holgura ON y ciclo cerrado
   serviceHolguraOffFault(nowMs);  // Auto ON + holgura OFF > N s, con o sin in process
   syncOutputs();  // actualiza intención → outputTask mueve hardware
 }

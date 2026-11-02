@@ -78,6 +78,11 @@ static MotionPrepKind motionPrepKind = MOT_PREP_NONE;
 static uint8_t motionPrepStep = 0;
 static int32_t motionPrepTargetPuu = 0;
 static float motionPrepSpeed = 0.0f;
+// P5.060 y P6.002 no cambian entre MOVE del ciclo. Reescribirlos son dos
+// transacciones Modbus a 9600 en cada lineal, depósito, despeje y HOME.
+static bool motionPrSpeedLatched = false;
+static int32_t motionPrSpeed01 = 0;
+static bool motionPrAbsLatched = false;
 static bool motionPrepForward = true;
 static uint16_t motionPrepTorque = 0;
 static uint16_t motionPrepTimeMs = 0;
@@ -976,6 +981,17 @@ static bool motionPrepModbusWait = false;
 static uint8_t motionPrepModbusNext = 0;
 static uint16_t motionPrepCompleteJobCmd = 0;
 
+static int32_t motionPrepSpeed01(float rpm) {
+  if (rpm < 0) rpm = -rpm;
+  if (rpm > 7500.0f) rpm = 7500.0f;
+  return (int32_t)lroundf(rpm * 10.0f);
+}
+
+static void motionForgetPrSetup() {
+  motionPrSpeedLatched = false;
+  motionPrAbsLatched = false;
+}
+
 static void motionPrepAbort(const String& err, uint8_t errByte = MOT_ERR_ASDA_MODBUS) {
   motionPrepModbusWait = false;
   modbusAbort();
@@ -983,6 +999,8 @@ static void motionPrepAbort(const String& err, uint8_t errByte = MOT_ERR_ASDA_MO
   motionPrepStep = 0;
   busyMotion = false;
   motionJobActive = false;
+  // La escritura pudo no haber entrado al drive.
+  motionForgetPrSetup();
   if (err.length()) raiseMotionAlarm(err, errByte);
   asdaTcpPushStateIfChanged();
 }
@@ -1017,6 +1035,12 @@ static void motionPrepPollOnce() {
                       home ? MOT_ERR_ACTUATOR_HOME : MOT_ERR_ASDA_MODBUS);
       return;
     }
+    if (motionPrepKind == MOT_PREP_MOVE && motionPrepStep == 0) {
+      motionPrSpeed01 = motionPrepSpeed01(motionPrepSpeed);
+      motionPrSpeedLatched = true;
+    } else if (motionPrepKind == MOT_PREP_MOVE && motionPrepStep == 1) {
+      motionPrAbsLatched = true;
+    }
     if (motionPrepModbusNext == MOTION_PREP_MB_DONE) {
       motionPrepComplete(motionPrepCompleteJobCmd);
       return;
@@ -1032,24 +1056,31 @@ static void motionPrepPollOnce() {
     case MOT_PREP_MOVE:
       switch (motionPrepStep) {
         case 0: {
-          float rpm = motionPrepSpeed;
-          if (rpm < 0) rpm = -rpm;
-          if (rpm > 7500.0f) rpm = 7500.0f;
-          const int32_t speed01rpm = (int32_t)lroundf(rpm * 10.0f);
-          if (!modbusBeginWrite32(REG_P5_060, speed01rpm)) {
-            motionPrepAbort("Fallo Modbus preparando MOVE");
+          const int32_t speed01rpm = motionPrepSpeed01(motionPrepSpeed);
+          if (motionPrSpeedLatched && motionPrSpeed01 == speed01rpm) {
+            motionPrepStep = 1;
+          } else {
+            if (!modbusBeginWrite32(REG_P5_060, speed01rpm)) {
+              motionPrepAbort("Fallo Modbus preparando MOVE");
+              return;
+            }
+            motionPrepStartModbus(1);
             return;
           }
-          motionPrepStartModbus(1);
-          return;
         }
+        // fall through
         case 1:
-          if (!modbusBeginWrite32(REG_P6_002, (int32_t)PR1_ABSOLUTE_DEF)) {
-            motionPrepAbort("Fallo Modbus preparando MOVE");
+          if (motionPrAbsLatched) {
+            motionPrepStep = 2;
+          } else {
+            if (!modbusBeginWrite32(REG_P6_002, (int32_t)PR1_ABSOLUTE_DEF)) {
+              motionPrepAbort("Fallo Modbus preparando MOVE");
+              return;
+            }
+            motionPrepStartModbus(2);
             return;
           }
-          motionPrepStartModbus(2);
-          return;
+        // fall through
         case 2:
           if (!modbusBeginWrite32(REG_P6_003, motionPrepTargetPuu)) {
             motionPrepAbort("Fallo Modbus preparando MOVE");
@@ -1068,6 +1099,7 @@ static void motionPrepPollOnce() {
           motionPrepAbort("Prep MOVE paso invalido");
           return;
       }
+      break;
 
     case MOT_PREP_HOME: {
       const uint16_t homingMethod = motionPrepForward ? 0x0029 : 0x002A;
@@ -1202,6 +1234,7 @@ bool servoOff() {
   if (!write16(REG_P2_030, 0xFFFF)) return false;
   const uint32_t until = millis() + 20;
   while (millis() < until) motionCooperateDuringWait();
+  motionForgetPrSetup();
   return write16(REG_P2_030, 0);
 }
 
@@ -1210,10 +1243,14 @@ bool stopMotion() {
 }
 
 bool setMoveSpeed(float rpm) {
-  if (rpm < 0) rpm = -rpm;
-  if (rpm > 7500.0f) rpm = 7500.0f;
-  int32_t speed01rpm = (int32_t)lroundf(rpm * 10.0f);
-  return write32(REG_P5_060, speed01rpm);
+  const int32_t speed01rpm = motionPrepSpeed01(rpm);
+  if (!write32(REG_P5_060, speed01rpm)) {
+    motionPrSpeedLatched = false;
+    return false;
+  }
+  motionPrSpeed01 = speed01rpm;
+  motionPrSpeedLatched = true;
+  return true;
 }
 
 bool communicationTest(String& detail) {

@@ -35,6 +35,8 @@ MOTION_MOVE_TX_ATTEMPTS = 3  # 1 envío + 2 reintentos máx.
 # Peek corto: si el ACK ya está, se usa. Si no, el ciclo sigue a Reached
 # (como HOME). Esperar 6 s aquí congelaba lineal/depósito/despeje 0.4–0.9 s.
 MOTION_MOVE_ACK_PEEK_S = 0.02
+# Otro movimiento (p. ej. MOVE_ZERO) rechazó este CMD. Esperar a que suelte.
+MOTION_MOVE_BUSY_WAIT_S = 8.0
 MOTION_MOVE_ACK_TIMEOUT_S = 6.0  # solo recuperación de transporte / boot
 MOTION_MOVE_LINK_WAIT_S = 5.0
 # Comprobación de enlace al abrir el lote. El ping no actúa: se puede repetir.
@@ -881,7 +883,7 @@ class HmiState:
             ("Motion", self._client, "E065"),
             ("PLC", self._plc_client, "E066"),
             ("PreFeeder", self._pf_client, "E067"),
-            ("Andon", self._andon_client, "E064"),
+            ("Andon", self._andon_client, "E070"),
         )
         results: dict[str, str | None] = {}
         lock = threading.Lock()
@@ -1452,9 +1454,11 @@ class HmiState:
         need = {s for s in sides if s in ("R", "L")}
         if not need:
             return {}
-        deadline = time.monotonic() + timeout_s
+        # timeout 0 consulta una vez y vuelve. Lo usa el prefetch del ciclo,
+        # que se llama desde delays y _wait_motion y no puede dormirse.
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
         done: dict[str, str] = {}
-        while time.monotonic() < deadline and len(done) < len(need):
+        while True:
             if abort_event is not None and abort_event.is_set():
                 break
             if "L" in need and "L" not in done:
@@ -1469,7 +1473,10 @@ class HmiState:
                     done["R"] = "ok"
             if len(done) >= len(need):
                 break
-            time.sleep(0.05)
+            remain = deadline - time.monotonic()
+            if remain <= 0:
+                break
+            time.sleep(min(0.05, remain))
         aborted = abort_event is not None and abort_event.is_set()
         for s in need:
             if s not in done:
@@ -1556,11 +1563,11 @@ class HmiState:
         No usa Idle genérico: tras reconnect Motion emite Idle y eso no prueba
         que el CMD_MOVE haya llegado (ni debe satisfacer wait_motion).
         """
-        ok, msg = self._asda_ack_snapshot(gen)
+        ok, _msg = self._asda_ack_snapshot(gen)
         if ok is True:
             return True
-        if ok is False and "ocupado" in (msg or "").lower():
-            return True
+        # ok false + «ocupado» = este CMD no entró (otro movimiento sigue).
+        # No es evidencia del MOVE pedido: reenviar cuando el eje quede libre.
         with self._lock:
             if self._last_state_byte == TX_BUSY:
                 return True
@@ -1580,6 +1587,7 @@ class HmiState:
 
     def _cmd_motion_move_with_recovery(self, mm: float, rpm: float) -> bool:
         """Envía CMD_MOVE; reintenta solo si no hay evidencia de recepción."""
+        rejected_busy = False
         for attempt in range(1, MOTION_MOVE_TX_ATTEMPTS + 1):
             if not self._wait_motion_link(MOTION_MOVE_LINK_WAIT_S):
                 self.cycle_log(
@@ -1629,11 +1637,20 @@ class HmiState:
                 _, msg = self._asda_ack_snapshot(gen)
                 self._clear_asda_ack(gen)
                 if "ocupado" in (msg or "").lower():
-                    self._motion_idle_or_reached.clear()
+                    # Motion rechazó este MOVE (asdaStartMove no arrancó).
+                    # El busy es de otro comando — típicamente MOVE_ZERO aún
+                    # en curso. Asumirlo como «este MOVE va» deja el eje en 0
+                    # y la espera del destino dispara E015.
+                    rejected_busy = True
                     self.cycle_log(
-                        "CMD_MOVE: ACK ocupado — se asume movimiento en curso"
+                        "CMD_MOVE: ACK ocupado — MOVE no aceptado; "
+                        "esperar Idle y reenviar"
                     )
-                    return True
+                    self.wait_motion_lineal_idle(MOTION_MOVE_BUSY_WAIT_S)
+                    with self._lock:
+                        self._move_target_mm = mm
+                    self._motion_idle_or_reached.clear()
+                    continue
                 with self._lock:
                     self._last_move_fail_kind = "rejected"
                 self.cycle_log(
@@ -1662,6 +1679,11 @@ class HmiState:
                 return True
             self._clear_asda_ack(gen)
 
+        if rejected_busy:
+            with self._lock:
+                self._last_move_fail_kind = "rejected"
+            self.cycle_log("CMD_MOVE: Motion ocupado — no se aceptó el MOVE")
+            return False
         with self._lock:
             self._last_move_fail_kind = "transport"
         self.cycle_log("CMD_MOVE: transporte agotado — E065")
@@ -3646,6 +3668,8 @@ class HmiState:
             return bool(self._plc.get("connected"))
         if code == "E067":
             return bool(self._pf.get("connected"))
+        if code == "E070":
+            return bool(self._andon.get("connected"))
 
         # No module-specific health API is currently available for other
         # machine-level sources; a subsequent source event will re-latch EXXX.

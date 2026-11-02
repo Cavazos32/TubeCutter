@@ -103,7 +103,11 @@ MOTION_IDLE_NO_TARGET_S = 1.0
 PF_TFEED_DONE_TIMEOUT_S = 30.0
 PF_SETTLE_BEFORE_IDLE_S = 15.0
 PF_TFEED_CAPTURE_AFTER_PAUSE_S = 0.5
-ASDA_HOME_EPS_MM = 0.5
+# El ASDA cierra el HOME en ~0.4–0.6 mm. Con 0.5 mm esa parada lanzaba otro MOVE.
+ASDA_HOME_EPS_MM = 1.0
+# Espera del MOVE_ZERO, más estricta que la puerta de arriba: un Idle del HOME
+# anterior no debe dar por terminado un cero que todavía no se movió.
+ASDA_MOVE_ZERO_TOL_MM = 0.5
 MOTION_TARGET_TOL_MM = 3.0
 
 TIMING_LOG_DIR = HMI_ROOT / "logs" / "cycle_timing"
@@ -332,7 +336,7 @@ class CycleConfig:
     pf_tfeed_done_timeout_s: float = 30.0
     pf_settle_before_idle_s: float = 15.0
     pf_tfeed_capture_after_pause_s: float = 0.5
-    asda_home_eps_mm: float = 0.5
+    asda_home_eps_mm: float = 1.0
     motion_target_tol_mm: float = 3.0
     timing_gap_report_s: float = 0.050
     timing_delay_overshoot_ms: int = 15
@@ -937,6 +941,7 @@ class CycleRunner:
                 "lastPieceSec": float(self._last_piece_sec),
                 "avgPieceSec": float(self._avg_piece_sec),
                 "postLotPfSettle": self._post_lot_pf_settle,
+                "pfOperatorStartBlocked": self._operator_pf_start_blocked_locked(),
                 "completed": self._last_ok
                 and (not self._active or self._post_lot_pf_settle),
                 "lastOk": self._last_ok,
@@ -1005,6 +1010,23 @@ class CycleRunner:
     def is_active(self) -> bool:
         with self._lock:
             return self._active or self._post_lot_pf_settle
+
+    def _operator_pf_start_blocked_locked(self) -> bool:
+        """Producción en curso (lock ya tomado).
+
+        En pausa, purga o cierre de holgura el operador sí puede preparar
+        buffer y holgura con Iniciar del alimentador.
+        """
+        if not self._active or self._post_lot_pf_settle:
+            return False
+        if self._pause.is_set() or self._refill_mode:
+            return False
+        return True
+
+    def operator_pf_start_blocked(self) -> bool:
+        """True si hay un lote produciendo: el ciclo ya arma el alimentador."""
+        with self._lock:
+            return self._operator_pf_start_blocked_locked()
 
     def is_lot_alive(self) -> bool:
         """Lote con progreso vivo (corriendo, en pausa o interrumpido por error)."""
@@ -1797,12 +1819,17 @@ class CycleRunner:
         return self._host.pf_connected()
 
     def _pf_idle_for_hold(self, reason: str) -> None:
-        """Pause/Error máquina → In process OFF (Idle). No usa Stop 0x2B (PF-007)."""
+        """Pause/Error/fin → In process OFF. El esclavo entra a Idle solo con
+        buffer full ON y holgura ON (y el asentamiento ya cerrado). No usa Stop 0x2B.
+        """
         if not self._use_prefeeder() or self._pf_held_idle:
             return
         if self._host.cmd_pf_in_process(False):
             self._pf_held_idle = True
-            self._host.cycle_log(f"PreFeeder: In process OFF → Idle ({reason})")
+            self._host.cycle_log(
+                f"PreFeeder: In process OFF ({reason}) — "
+                "Idle cuando Full y holgura estén ON"
+            )
             if reason == "Pause":
                 self._pf_capture_tfeed_incomplete()
         else:
@@ -2473,12 +2500,20 @@ class CycleRunner:
         if not self._ensure_pf_buffer_full_after_resume():
             return True
         return bool(self._restart_piece)
-    def _asda_at_target(self, target_mm: float) -> bool | None:
-        """True/False según caché ASDA vs destino (magnitud). None = sin dato."""
+    def _asda_at_target(
+        self, target_mm: float, tol_mm: float | None = None
+    ) -> bool | None:
+        """True/False según caché ASDA vs destino (magnitud). None = sin dato.
+
+        tol_mm: la espera de corte/depósito usa MOTION_TARGET_TOL_MM (3 mm).
+        MOVE_ZERO usa ASDA_MOVE_ZERO_TOL_MM (0.5 mm): si no, una parada de
+        ~0.5 mm parece «ya en 0» y la espera cierra con el Idle del HOME anterior.
+        """
         pos = self._host.asda_position_mm()
         if pos is None:
             return None
-        return abs(abs(float(pos)) - abs(float(target_mm))) <= MOTION_TARGET_TOL_MM
+        tol = MOTION_TARGET_TOL_MM if tol_mm is None else float(tol_mm)
+        return abs(abs(float(pos)) - abs(float(target_mm))) <= tol
 
     def _fmt_asda_pos(self) -> str:
         pos = self._host.asda_position_mm()
@@ -2488,6 +2523,7 @@ class CycleRunner:
         self,
         target_mm: float | None = None,
         reissue: Callable[[], bool] | None = None,
+        tol_mm: float | None = None,
     ) -> bool:
         """Espera Idle/Reached. El caller debe limpiar flags ANTES del comando
         (clear_motion_wait_flags / clear_motion_reached_flag) — no limpiar aquí
@@ -2524,7 +2560,7 @@ class CycleRunner:
                 if (
                     target_mm is not None
                     and reissue is not None
-                    and self._asda_at_target(target_mm) is False
+                    and self._asda_at_target(target_mm, tol_mm) is False
                 ):
                     self._host.cycle_log(
                         f"Resume: ASDA pos={self._fmt_asda_pos()} mm ≠ destino "
@@ -2559,7 +2595,7 @@ class CycleRunner:
             if self._host.wait_motion_idle_or_reached(0.1):
                 if target_mm is None:
                     return True
-                at = self._asda_at_target(target_mm)
+                at = self._asda_at_target(target_mm, tol_mm)
                 if at is True:
                     return True
                 # Sin posición en caché (None) no cuenta como llegada — seguir esperando.
@@ -2572,7 +2608,7 @@ class CycleRunner:
                 # Reached puede actualizar la posición después del Idle que
                 # arrancó este conteo (home: el PUU se cierra en 0 un instante
                 # después). Si ya está en destino, no es E015.
-                if self._asda_at_target(target_mm) is True:
+                if self._asda_at_target(target_mm, tol_mm) is True:
                     return True
                 if self._host.motion_busy():
                     idle_off_target_since = None
@@ -2583,7 +2619,7 @@ class CycleRunner:
                     refresh = getattr(self._host, "refresh_asda_position_mm", None)
                     if callable(refresh):
                         refresh()
-                    if self._asda_at_target(target_mm) is True:
+                    if self._asda_at_target(target_mm, tol_mm) is True:
                         return True
                     self._host.cycle_log(
                         f"MOVE sin llegar a destino: ASDA pos={self._fmt_asda_pos()} mm, "
@@ -3611,9 +3647,15 @@ class CycleRunner:
         if not self._host.cmd_motion_move_zero(self._lot_rpm):
             self._raise_fault("home_cmd")
             return False
+        # Más estricto que la puerta de 1 mm y que la tolerancia de corte
+        # (3 mm). Con ~0.5 mm el Idle del HOME anterior cae dentro de 3 mm
+        # y esta espera volvía en el acto, con el MOVE_ZERO todavía en el
+        # drive. El lineal siguiente recibía «ocupado» y el Idle en 0
+        # disparaba E015.
         if not self._wait_motion(
             target_mm=0.0,
             reissue=lambda: self._host.cmd_motion_move_zero(self._lot_rpm),
+            tol_mm=min(ASDA_MOVE_ZERO_TOL_MM, float(ASDA_HOME_EPS_MM)),
         ):
             return False
         return not self._should_abort()
@@ -3726,9 +3768,9 @@ class CycleRunner:
         """Avanza wait de feed en prefetch (no bloqueante). False = fallo."""
         if not self._prefetch_active or self._prefetch_feed_ok:
             return True
-        return self._prefetch_advance_feed_slice()
+        return self._prefetch_advance_feed_slice(0.0)
 
-    def _prefetch_advance_feed_slice(self) -> bool:
+    def _prefetch_advance_feed_slice(self, timeout_s: float = 0.0) -> bool:
         if self._prefetch_feed_op is None:
             if self._prefetch_active and not self._prefetch_feed_ok:
                 self._host.cycle_log(
@@ -3753,7 +3795,7 @@ class CycleRunner:
             return False
         outcomes = self._host.wait_feed_length_ok_for(
             sides,
-            0.08,
+            max(0.0, float(timeout_s)),
             abort_event=self._feed_abort_event(),  # type: ignore[arg-type]
         )
         if self._should_abort() or self._restart_piece:
@@ -3810,7 +3852,7 @@ class CycleRunner:
                 if not self._prefetch_tick():
                     return False
                 continue
-            if not self._prefetch_advance_feed_slice():
+            if not self._prefetch_advance_feed_slice(0.08):
                 return False
         return True
 

@@ -66,6 +66,7 @@ _ROWS: tuple[tuple[str, str, int, str, str], ...] = (
     ("E066", "Maquina / Main", 0x7A, "MAIN_ERR_PLC_ESP_DISCONNECTED", "Socket caido con PLC ESP (:8766) / Sin conexion TCP"),
     ("E067", "Maquina / Main", 0x7B, "MAIN_ERR_PF_MASTER_DISCONNECTED", "Socket caido con PF Master (:8768) / Sin conexion TCP"),
     ("E068", "Maquina / Main", 0x7C, "MAIN_ERR_CYCLE_ABORTED", "Ciclo abortado"),
+    ("E070", "Maquina / Main", 0x7E, "MAIN_ERR_ANDON_ESP_DISCONNECTED", "Socket caido con Andon ESP (:8769) / Sin conexion TCP"),
  )
 
 BY_CODE: dict[str, dict[str, Any]] = {}
