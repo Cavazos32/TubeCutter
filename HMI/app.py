@@ -375,6 +375,11 @@ def api_cycle_refill():
     )
 
 
+@app.post("/api/cycle/clear")
+def api_cycle_clear():
+    return jsonify(get_state().cmd_cycle_clear())
+
+
 @app.post("/api/cycle/refill/confirm")
 def api_cycle_refill_confirm():
     body = request.get_json(silent=True) or {}

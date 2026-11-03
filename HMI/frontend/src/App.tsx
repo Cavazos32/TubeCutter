@@ -288,6 +288,9 @@ function AppMain() {
             onRefill={() => {
               void hmi.startRefill();
             }}
+            onClear={() => {
+              void hmi.startClear();
+            }}
             onRefillConfirm={(ok) => {
               void hmi.confirmRefill(ok);
             }}

@@ -1900,6 +1900,14 @@ static bool motionExecResetErrors(String& err) {
   }
   clearMotionAlarm();
   asdaTcpStopPending = false;
+  // Si el detalle ya estaba encolado, no reenviarlo después del ack: la HMI
+  // acabaría de soltar el EXXX y lo volvería a enganchar.
+  motionTcpClearFeedSidePending(false);
+  motionTcpClearFeedSidePending(true);
+  motionTcpPendingDetailErr = 0;
+  motionTcpPendingDetailName[0] = '\0';
+  motionTcpNotifyEncError = false;
+  motionTcpNotifyEncErrorL = false;
   err = "Errores limpiados";
   return true;
 }

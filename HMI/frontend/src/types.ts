@@ -113,6 +113,7 @@ export interface MachineState {
   cycleMaterialist: boolean;
   cycleBusy: boolean;
   refillActive: boolean;
+  clearActive: boolean;
   refillAwaitingConfirm: boolean;
   /** working | await_feed | after_feed | "" (after_cut ya no existe en la purga nueva) */
   refillPrompt: string;

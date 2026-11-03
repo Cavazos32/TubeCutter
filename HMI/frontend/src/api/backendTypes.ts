@@ -48,6 +48,7 @@ export interface BackendCycleSnapshot {
   busy?: boolean;
   stepByStep: boolean;
   refillActive?: boolean;
+  clearActive?: boolean;
   refillAwaitingConfirm?: boolean;
   refillPrompt?: string;
   step: number;

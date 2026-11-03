@@ -20,6 +20,7 @@ struct Params {
   uint16_t holguraSettleMs = HOLGURA_SETTLE_MS_DEFAULT;
   float holguraOnFeedSec = 2.0f;
   float holguraOffFaultSec = 5.0f;
+  float holguraStallFaultSec = 2.0f;
   bool hmiTfeedEnabled = false;
 };
 

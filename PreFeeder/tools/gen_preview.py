@@ -19,7 +19,7 @@ mock = (
     "mid_boost_rpm:55,mid_boost_s:1.2,mid_servo_delta_us:80,"
     "high_boost_rpm:70,high_boost_s:0.8,high_servo_delta_us:120,high_reverse_s:3.0},"
     "trigger2:{trigger_feed_s:1.5,m2_rpm:28,trigger_active:false,hmi_tfeed_enabled:true,"
-    "holgura_settle_ms:150,holgura_on_s:2,holgura_off_fault_s:5,holgura_on:true},"
+    "holgura_settle_ms:150,holgura_on_s:2,holgura_off_fault_s:5,holgura_stall_fault_s:2,holgura_on:true},"
     'refill:{pulse_s:1},actuators:{feeder:false,buffer:true}};\n'
     "function pull(){sync(MOCK);}"
 )

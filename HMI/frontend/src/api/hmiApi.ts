@@ -97,6 +97,10 @@ export function setCycleStepByStep(on: boolean) {
   );
 }
 
+export function startCycleClear() {
+  return post<{ ok: boolean; error?: string }>('/api/cycle/clear', {});
+}
+
 export function startCycleRefill(opts?: { mm?: number; asdaMm?: number }) {
   const body: Record<string, unknown> = {};
   if (opts?.mm != null) body.mm = opts.mm;

@@ -686,18 +686,26 @@ export const CycleTab: React.FC<CycleTabProps> = ({
         <div className="flex flex-wrap items-center gap-3 rounded-md border border-sky-300 dark:border-sky-700 bg-sky-50 dark:bg-sky-950/50 px-3 py-3 shadow-2xs">
           <div className="min-w-0 flex-1">
             <p className={`${hmiAssistTitle} text-sky-900 dark:text-sky-100`}>
-              {machineState.refillPrompt === 'working'
-                ? t('refill_confirm_title_working')
-                : machineState.refillPrompt === 'await_feed'
-                  ? t('refill_confirm_title_await')
-                  : t('refill_confirm_title_feed')}
+              {machineState.clearActive
+                ? machineState.refillPrompt === 'working'
+                  ? t('clear_working_title')
+                  : t('clear_decide_title')
+                : machineState.refillPrompt === 'working'
+                  ? t('refill_confirm_title_working')
+                  : machineState.refillPrompt === 'await_feed'
+                    ? t('refill_confirm_title_await')
+                    : t('refill_confirm_title_feed')}
             </p>
             <p className={`mt-1 ${hmiAssistHint} text-sky-800/80 dark:text-sky-200/80`}>
-              {machineState.refillPrompt === 'working'
-                ? t('refill_confirm_hint_working')
-                : machineState.refillPrompt === 'await_feed'
-                  ? t('refill_confirm_hint_await')
-                  : t('refill_confirm_hint_feed')}
+              {machineState.clearActive
+                ? machineState.refillPrompt === 'working'
+                  ? t('clear_working_hint')
+                  : t('clear_decide_hint')
+                : machineState.refillPrompt === 'working'
+                  ? t('refill_confirm_hint_working')
+                  : machineState.refillPrompt === 'await_feed'
+                    ? t('refill_confirm_hint_await')
+                    : t('refill_confirm_hint_feed')}
             </p>
           </div>
           {(machineState.refillPrompt === 'await_feed' ||
@@ -711,7 +719,7 @@ export const CycleTab: React.FC<CycleTabProps> = ({
               className={hmiModuleBtnWarning}
             >
               <RotateCcw className="h-3.5 w-3.5" />
-              {t('btn_refill_confirm_retry')}
+              {machineState.clearActive ? t('btn_clear_retry') : t('btn_refill_confirm_retry')}
             </button>
           )}
           {machineState.refillPrompt !== 'working' && (
@@ -723,7 +731,7 @@ export const CycleTab: React.FC<CycleTabProps> = ({
               className={hmiModuleBtnSuccess}
             >
               <Check className="h-3.5 w-3.5" />
-              {t('btn_refill_confirm_next_cut')}
+              {machineState.clearActive ? t('btn_clear_continue') : t('btn_refill_confirm_next_cut')}
             </button>
           )}
         </div>

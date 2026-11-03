@@ -74,6 +74,9 @@ struct SideView {
   bool error = false;
   uint8_t errorCode = 0;
   String errorReason = "none";
+  uint16_t faultEpoch = 0;
+  // Tras Reset: no aceptar error=true de un status con el epoch ya visto.
+  bool holdStaleError = false;
   bool idleMode = false;
   bool inProcess = false;
   bool sensorsArmed = false;
@@ -264,11 +267,21 @@ static void clearMasterFaultView()
   applyMasterErrorVar(cleared);
 }
 
+// next es posterior a prev (con vuelta de uint16). 0 = campo ausente.
+static bool epochIsNewer(uint16_t prev, uint16_t next)
+{
+  return next != 0 && next != prev && (uint16_t)(next - prev) < 0x8000;
+}
+
+static void armSideResetHold()
+{
+  resetGraceUntilMs = millis() + 4000;
+  sideL.holdStaleError = true;
+  sideR.holdStaleError = true;
+}
+
 static void recomputeMasterError()
 {
-  if (millis() < resetGraceUntilMs)
-    return;
-
   MasterErrorVar next;
   next.active = false;
   next.level = 0;
@@ -355,9 +368,36 @@ static void parseSideSnapshot(const char* j, SideView& s)
   if (s.refillPulseS > 10.0f) s.refillPulseS = 10.0f;
   String ms = jStr(j, "machineState");
   if (ms.length()) s.machineState = ms;
-  applySideError(s, jBool(j, "error", s.error),
-                 (uint8_t)jInt(j, "errorCode", s.errorCode),
-                 jStr(j, "errorReason").length() ? jStr(j, "errorReason") : s.errorReason);
+
+  // Status generado antes de aplicar el Reset (mismo faultEpoch) no puede
+  // volver a pintar el EXXX. El epoch nuevo sí, aunque la gracia siga.
+  const uint16_t ep = (uint16_t)jInt(j, "faultEpoch", 0);
+  bool dropFault = false;
+  bool keepFault = false;
+  if (s.holdStaleError) {
+    if (epochIsNewer(s.faultEpoch, ep)) {
+      s.holdStaleError = false;
+      s.faultEpoch = ep;
+    } else if (ep == 0 && resetGraceUntilMs
+               && (int32_t)(millis() - resetGraceUntilMs) >= 0) {
+      s.holdStaleError = false;
+    } else {
+      dropFault = true;
+    }
+  } else if (ep) {
+    // Mismo epoch: status periódico, sí actualiza. Solo se ignora uno más viejo.
+    if (s.faultEpoch && ep != s.faultEpoch && !epochIsNewer(s.faultEpoch, ep))
+      keepFault = true;
+    else
+      s.faultEpoch = ep;
+  }
+
+  if (dropFault)
+    applySideError(s, false, 0, String("none"));
+  else if (!keepFault)
+    applySideError(s, jBool(j, "error", s.error),
+                   (uint8_t)jInt(j, "errorCode", s.errorCode),
+                   jStr(j, "errorReason").length() ? jStr(j, "errorReason") : s.errorReason);
 }
 
 static void parseSideEvent(const char* line, SideView& s)
@@ -641,6 +681,7 @@ static void appendSideJson(String& j, const char* key, const SideView& s)
   j += ",\"machineState\":"; jsonAppendStr(j, s.machineState);
   j += ",\"error\":"; j += s.error ? "true" : "false";
   j += ",\"errorCode\":"; j += s.errorCode;
+  j += ",\"faultEpoch\":"; j += s.faultEpoch;
   j += ",\"errorReason\":"; jsonAppendStr(j, s.errorReason);
   j += "}";
 }
@@ -707,7 +748,7 @@ static bool pfBroadcastAutoFromQuery()
   if (server.hasArg("reset"))
   {
     pfBroadcastCmd("reset", "");
-    resetGraceUntilMs = millis() + 4000;
+    armSideResetHold();
     clearMasterFaultView();
   }
 
@@ -886,7 +927,7 @@ void handleApiCmd()
 
   if (cmd == "reset")
   {
-    resetGraceUntilMs = millis() + 4000;
+    armSideResetHold();
     clearMasterFaultView();
   }
 
@@ -1199,7 +1240,7 @@ static bool pfTcpDoByte(uint8_t cmdByte)
       } else {
         ok = pfDispatchCmd("reset", "", '-');
         if (ok) {
-          resetGraceUntilMs = millis() + 4000;
+          armSideResetHold();
           clearMasterFaultView();
           pfTcpStopPending = false;
         } else err = "Reset no enviado a L/R";

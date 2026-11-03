@@ -7,6 +7,7 @@ import {
   Clock,
   Pause,
   Droplets,
+  Eraser,
   Check,
   X,
   Home,
@@ -20,6 +21,7 @@ import {
   ClipboardCheck,
 } from 'lucide-react';
 import { MachineState, LogEntry, MotionState, PfRefillChannel, PlcState, PreFeederState } from '../types';
+import { CHECKLIST_PIECE_EXTRA_MM } from '../types/checklist';
 import { LogTerminal } from './LogTerminal';
 import { useApp } from '../context/AppContext';
 import { isGenericErrorText } from '../api/mappers';
@@ -76,6 +78,7 @@ interface MaquinaTabProps {
   onReset: () => void;
   onMachineHome?: () => void | Promise<void>;
   onRefill?: () => void;
+  onClear?: () => void;
   onRefillConfirm?: (ok: boolean) => void;
   onRefillRetry?: () => void;
   onRefillLongFeed?: () => void;
@@ -118,6 +121,7 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
   onReset,
   onMachineHome,
   onRefill,
+  onClear,
   onRefillConfirm,
   onRefillRetry,
   onRecoveryReview,
@@ -310,6 +314,37 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
   const pfConnected = preFeederState.connection.connected;
   const pfHasError = !!preFeederState.hasError && pfConnected;
   const pfStartReady = !!preFeederState.bufferReady;
+  const clearRun = !!machineState.clearActive;
+  const skipCut = !!machineState.refillSkipCut;
+  const manualTitle = clearRun
+    ? machineState.refillPrompt === 'working'
+      ? t('clear_working_title')
+      : t('clear_decide_title')
+    : machineState.refillPrompt === 'working'
+      ? t('refill_confirm_title_working')
+      : machineState.refillPrompt === 'await_feed'
+        ? t('refill_confirm_title_await')
+        : t('refill_confirm_title_feed');
+  const manualHint = clearRun
+    ? machineState.refillPrompt === 'working'
+      ? t('clear_working_hint')
+      : t('clear_decide_hint')
+    : machineState.refillPrompt === 'working'
+      ? t('refill_confirm_hint_working')
+      : machineState.refillPrompt === 'await_feed'
+        ? skipCut
+          ? t('refill_confirm_hint_await_nocut')
+          : t('refill_confirm_hint_await')
+        : skipCut
+          ? t('refill_confirm_hint_feed_nocut')
+          : t('refill_confirm_hint_feed');
+  const retryLabel = clearRun ? t('btn_clear_retry') : t('btn_refill_confirm_retry');
+  const continueLabel = clearRun ? t('btn_clear_continue') : t('btn_refill_confirm_next_cut');
+  const modelMm = Math.abs(Number(models[selectedModelIndex]?.mm ?? machineState.mm ?? 0));
+  const workLengthMm = modelMm + CHECKLIST_PIECE_EXTRA_MM;
+  const workLengthLabel = Number.isInteger(workLengthMm)
+    ? `${workLengthMm} mm`
+    : `${workLengthMm.toFixed(1)} mm`;
   const pfPrepBusy = !!preFeederState.manualPrepBusy || preFeederState.isRunning;
   const pfStartDisabled =
     !onPfStart ||
@@ -329,7 +364,6 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
   const trayFull = recoveryStage === 'tray_full';
   const showRecoveryTrack = !!recoveryStage && !trayFull;
   const e050Lot = !!machineState.e050Lot;
-  const skipCut = !!machineState.refillSkipCut;
 
   const processStep: string = e050Lot
     ? recoveryStage === 'e050_materialist'
@@ -730,7 +764,7 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
                 className={`h-4 w-4 shrink-0 rounded-full ${
                   hasFault || interlockError
                     ? 'bg-red-500'
-                    : machineState.isRunning
+                    : machineState.isRunning || pfPrepBusy
                     ? 'bg-emerald-500 animate-pulse'
                     : machineState.isPaused
                     ? 'bg-amber-500'
@@ -741,7 +775,7 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
                 className={`shrink-0 text-lg font-bold uppercase tracking-tight sm:text-xl ${
                   hasFault || interlockError
                     ? 'text-red-700 dark:text-red-300'
-                    : machineState.isRunning
+                    : machineState.isRunning || pfPrepBusy
                       ? 'text-emerald-800 dark:text-emerald-200'
                       : machineState.isPaused
                         ? 'text-amber-800 dark:text-amber-200'
@@ -756,7 +790,9 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
                       ? t('state_producing')
                       : machineState.isPaused
                         ? t('state_paused')
-                        : t('state_ready')}
+                        : pfPrepBusy
+                          ? t('status_in_process')
+                          : t('state_ready')}
               </span>
               {statusSubtitle && !hasFault && !interlockError && (
                 <>
@@ -776,17 +812,17 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
             </div>
           </div>
 
-          <div className="grid shrink-0 grid-cols-12 items-start gap-3">
-            <div className="col-span-12 min-w-0 md:col-span-5">
-              <label htmlFor="select-modelo" className={centerFieldLabel}>
-                {t('model')}
+          <div className="grid shrink-0 grid-cols-1 items-stretch gap-3 sm:grid-cols-3">
+            <div className="min-w-0">
+              <label htmlFor="select-modelo" className="block text-lg font-bold uppercase tracking-wide text-slate-800 dark:text-slate-100 sm:text-xl">
+                {t('op_model')}
               </label>
               <select
                 id="select-modelo"
                 value={selectedModelIndex}
                 onChange={(e) => onModelSelect(Number(e.target.value))}
                 disabled={machineState.isRunning}
-                className={`${centerFieldInput} mt-1.5 h-12 appearance-none truncate focus:border-sky-500 focus:ring-sky-400 disabled:opacity-50 sm:h-14`}
+                className={`${centerFieldInput} mt-1.5 h-16 truncate text-xl font-bold focus:border-sky-500 focus:ring-sky-400 disabled:opacity-50 sm:h-20 sm:text-2xl`}
               >
                 {models.map((m, i) => (
                   <option key={m.name} value={i}>
@@ -794,12 +830,36 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
                   </option>
                 ))}
               </select>
-              <p className="mt-1.5 min-h-[1.25rem] truncate text-sm leading-tight text-transparent select-none" aria-hidden="true">
-                {'\u00A0'}
+            </div>
+
+            <div className="min-w-0">
+              <p className="text-lg font-bold uppercase tracking-wide text-slate-800 dark:text-slate-100 sm:text-xl">
+                {t('op_length')}
+              </p>
+              <p className="mt-1.5 flex h-16 items-center rounded-md border border-slate-300 bg-slate-50 px-4 font-mono text-3xl font-bold tabular-nums text-slate-950 dark:border-slate-600 dark:bg-slate-800 dark:text-white sm:h-20 sm:text-4xl">
+                {workLengthLabel}
               </p>
             </div>
 
-            <div className="col-span-6 min-w-0 md:col-span-3">
+            <div className="min-w-0">
+              <label htmlFor="input-target-pieces" className="block text-lg font-bold uppercase tracking-wide text-slate-800 dark:text-slate-100 sm:text-xl">
+                {t('op_qty')}
+              </label>
+              <input
+                id="input-target-pieces"
+                type="number"
+                min={1}
+                step={1}
+                value={machineState.targetPieces || ''}
+                onChange={(e) => onTargetPiecesChange(Math.max(1, parseInt(e.target.value, 10) || 1))}
+                disabled={machineState.isRunning}
+                className={`${centerFieldInput} mt-1.5 h-16 font-mono text-3xl font-bold tabular-nums focus:border-sky-500 focus:ring-sky-400 disabled:opacity-50 sm:h-20 sm:text-4xl`}
+              />
+            </div>
+          </div>
+
+          <div className="grid shrink-0 grid-cols-12 items-start gap-3">
+            <div className="col-span-12 min-w-0 md:col-span-6">
               <label htmlFor="input-general-offset" className={centerFieldLabel}>
                 {t('cfg_cut_offset')}
               </label>
@@ -829,22 +889,8 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
                 {t('cfg_cut_offset_hint')}
               </p>
             </div>
-
-            <div className="col-span-6 min-w-0 md:col-span-4">
-              <label htmlFor="input-target-pieces" className={centerFieldLabel}>
-                {t('target_pieces')}
-              </label>
-              <input
-                id="input-target-pieces"
-                type="number"
-                min={1}
-                step={1}
-                value={machineState.targetPieces || ''}
-                onChange={(e) => onTargetPiecesChange(Math.max(1, parseInt(e.target.value, 10) || 1))}
-                disabled={machineState.isRunning}
-                className={`${centerFieldInput} mt-1.5 h-12 font-mono focus:border-sky-500 focus:ring-sky-400 disabled:opacity-50 sm:h-14`}
-              />
-              <p className="mt-1.5 min-h-[1.25rem] truncate text-sm leading-tight text-slate-500 dark:text-slate-400">
+            <div className="col-span-12 min-w-0 md:col-span-6">
+              <p className="mt-1.5 min-h-[1.25rem] truncate text-base font-semibold leading-tight text-slate-600 dark:text-slate-300 md:mt-9">
                 {feedSides === 'LR' && (machineState.targetPieces || 0) >= 1
                   ? (machineState.targetPieces || 0) % 2 === 0
                     ? t('target_pieces_mirror', {
@@ -1200,18 +1246,10 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
               >
                 <div className="min-w-0 flex-1 text-center sm:text-left">
                   <p className={`${hmiIndicationTitle} text-sky-900 dark:text-sky-100`}>
-                    {machineState.refillPrompt === 'working'
-                      ? t('refill_confirm_title_working')
-                      : machineState.refillPrompt === 'await_feed'
-                        ? t('refill_confirm_title_await')
-                        : t('refill_confirm_title_feed')}
+                    {manualTitle}
                   </p>
                   <p className={`${hmiIndicationHint} text-sky-800/80 dark:text-sky-200/80`}>
-                    {machineState.refillPrompt === 'working'
-                      ? t('refill_confirm_hint_working')
-                      : machineState.refillPrompt === 'await_feed'
-                        ? t('refill_confirm_hint_await')
-                        : t('refill_confirm_hint_feed')}
+                    {manualHint}
                   </p>
                 </div>
                 {(machineState.refillPrompt === 'await_feed' ||
@@ -1225,7 +1263,7 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
                     className={`${hmiIndicationBtn} bg-amber-500 text-white hover:bg-amber-600`}
                   >
                     <RotateCcw className={iconBtn} />
-                    {t('btn_refill_confirm_retry')}
+                    {retryLabel}
                   </button>
                 )}
                 {machineState.refillPrompt !== 'working' && (
@@ -1237,7 +1275,7 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
                     className={`${hmiIndicationBtn} bg-emerald-600 text-white hover:bg-emerald-700`}
                   >
                     <Check className={iconBtn} />
-                    {t('btn_refill_confirm_next_cut')}
+                    {continueLabel}
                   </button>
                 )}
               </div>
@@ -1255,10 +1293,10 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
                 id="btn-refill-maquina"
                 type="button"
                 onClick={onRefill}
-                disabled={!onRefill}
+                disabled={!onRefill || clearRun}
                 title={t('refill_helpers_subtitle')}
                 className={`${btnBase} ${btnText} ${
-                  !onRefill
+                  !onRefill || clearRun
                     ? 'border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 text-slate-400 cursor-not-allowed'
                     : machineState.refillActive
                       ? btnAuxOn
@@ -1267,6 +1305,22 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
               >
                 <Droplets className={iconBtn} />
                 <span>{t('btn_refill')}</span>
+              </button>
+              <button
+                id="btn-clear-maquina"
+                type="button"
+                onClick={onClear}
+                disabled={!onClear || (machineState.purgeBusy && !clearRun)}
+                className={`${btnBase} ${btnText} ${
+                  !onClear || (machineState.purgeBusy && !clearRun)
+                    ? 'border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 text-slate-400 cursor-not-allowed'
+                    : clearRun
+                      ? btnAuxOn
+                      : btnAuxIdle
+                }`}
+              >
+                <Eraser className={iconBtn} />
+                <span>{t('btn_clear')}</span>
               </button>
               <button
                 id="btn-home-maquina"
@@ -1299,6 +1353,12 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
                 <Home className={iconBtn} />
                 <span>{t('btn_machine_home')}</span>
               </button>
+            </div>
+          </section>
+
+          <section className={`flex shrink-0 flex-col p-3 ${panelCls}`}>
+            <h2 className={sectionTitle}>{t('section_alimentador')}</h2>
+            <div className="flex flex-col gap-2">
               <button
                 id="btn-main-pf-materialist"
                 type="button"
@@ -1324,12 +1384,6 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
                 <Package className={iconBtn} />
                 <span>{t('btn_materialist_cycle')}</span>
               </button>
-            </div>
-          </section>
-
-          <section className={`flex shrink-0 flex-col p-3 ${panelCls}`}>
-            <h2 className={sectionTitle}>{t('section_alimentador')}</h2>
-            <div className="flex flex-col gap-2">
               <button
                 id="btn-main-pf-start"
                 type="button"

@@ -210,6 +210,7 @@ export function mapMachineState(
     cycleMaterialist: cycle.materialist ?? false,
     cycleBusy: !!(cycle.busy ?? false),
     refillActive: !!cycle.refillActive,
+    clearActive: !!cycle.clearActive,
     refillAwaitingConfirm: !!cycle.refillAwaitingConfirm,
     refillPrompt: String(cycle.refillPrompt || ''),
     recoveryPrompt: String(cycle.recoveryPrompt || ''),

@@ -17,6 +17,7 @@ void paramsValidate(Params& p) {
   clampF(p.highReverseSec, 0.1f, 60.0f);
   clampF(p.holguraOnFeedSec, 0.1f, 120.0f);
   clampF(p.holguraOffFaultSec, 0.5f, 300.0f);
+  clampF(p.holguraStallFaultSec, 0.5f, 60.0f);
   if (p.holguraSettleMs < HOLGURA_SETTLE_MS_MIN) p.holguraSettleMs = HOLGURA_SETTLE_MS_MIN;
   if (p.holguraSettleMs > HOLGURA_SETTLE_MS_MAX) p.holguraSettleMs = HOLGURA_SETTLE_MS_MAX;
   if (p.servoActiveUs < SERVO_MIN_US) p.servoActiveUs = SERVO_MIN_US;
@@ -48,6 +49,7 @@ void paramsLoad(Params& p) {
   p.holguraSettleMs = (uint16_t)prefs.getUInt("holg_set_ms", HOLGURA_SETTLE_MS_DEFAULT);
   p.holguraOnFeedSec = prefs.getFloat("holg_on_s", 2.0f);
   p.holguraOffFaultSec = prefs.getFloat("holg_off_s", 5.0f);
+  p.holguraStallFaultSec = prefs.getFloat("holg_stall_s", 2.0f);
   p.hmiTfeedEnabled = prefs.getBool("tfeed_en", false);
   prefs.end();
   paramsValidate(p);
@@ -74,6 +76,7 @@ void paramsSave(const Params& p) {
   prefs.putUInt("holg_set_ms", copy.holguraSettleMs);
   prefs.putFloat("holg_on_s", copy.holguraOnFeedSec);
   prefs.putFloat("holg_off_s", copy.holguraOffFaultSec);
+  prefs.putFloat("holg_stall_s", copy.holguraStallFaultSec);
   prefs.putBool("tfeed_en", copy.hmiTfeedEnabled);
   prefs.end();
 }
@@ -155,6 +158,10 @@ bool paramsApplyFromQuery(const String& query, Params& p, bool saveIfTouched) {
   }
   if (hasArg(query, "holgura_off_fault_s", v)) {
     p.holguraOffFaultSec = v.toFloat();
+    touched = true;
+  }
+  if (hasArg(query, "holgura_stall_fault_s", v)) {
+    p.holguraStallFaultSec = v.toFloat();
     touched = true;
   }
   if (hasArg(query, "hmi_tfeed_enabled", v)) {

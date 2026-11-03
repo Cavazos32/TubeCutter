@@ -41,7 +41,10 @@ button,.btn{padding:10px 8px;border-radius:8px;border:none;font-weight:600;font-
 .btn-save{background:rgba(88,166,255,.2);color:var(--blue);border:1px solid rgba(88,166,255,.4);width:100%;margin-top:10px;transition:background .15s,color .15s,border-color .15s}
 .btn-save.saved{background:rgba(63,185,80,.28);color:#aff5b4;border-color:rgba(63,185,80,.55)}
 .btn-save.err{background:rgba(248,81,73,.22);color:#ffa198;border-color:rgba(248,81,73,.45)}
-.btn-refill{background:var(--panel);color:var(--text);border:1px solid var(--border);transition:background .12s,border-color .12s,box-shadow .12s}
+.btn-refill{background:var(--panel);color:var(--text);border:1px solid var(--border);transition:background .12s,border-color .12s,box-shadow .12s;user-select:none;-webkit-user-select:none}
+.hold{position:relative;min-width:0}
+.hold .btn-refill{width:100%}
+.hold-cap{position:absolute;inset:0;z-index:2}
 .btn-refill.on{background:rgba(226,164,29,.35);color:#ffe8b3;border-color:rgba(226,164,29,.65);box-shadow:0 0 10px rgba(226,164,29,.35)}
 .btn-refill.flash{background:rgba(88,166,255,.35);border-color:rgba(88,166,255,.6)}
 .refill-bar.locked{opacity:.45;pointer-events:none}
@@ -112,10 +115,10 @@ input[type=number]{width:100%;padding:8px 10px;border-radius:6px;border:1px soli
 <div style="display:flex;align-items:flex-end"><button type="button" class="btn-save" id="saveRefill" style="margin-top:0">Guardar pulso</button></div>
 </div>
 <div class="btn-row refill-btns" style="grid-template-columns:repeat(4,1fr)">
-<button type="button" class="btn-refill" data-ref="material">Material</button>
-<button type="button" class="btn-refill" data-ref="dereeler">DeReeler</button>
-<button type="button" class="btn-refill" data-ref="servo">Servo</button>
-<button type="button" class="btn-refill" data-ref="feeder">Feeder</button>
+<div class="hold"><button type="button" class="btn-refill" data-ref="material">Material</button><div class="hold-cap"></div></div>
+<div class="hold"><button type="button" class="btn-refill" data-ref="dereeler">DeReeler</button><div class="hold-cap"></div></div>
+<div class="hold"><button type="button" class="btn-refill" data-ref="servo">Servo</button><div class="hold-cap"></div></div>
+<div class="hold"><button type="button" class="btn-refill" data-ref="feeder">Feeder</button><div class="hold-cap"></div></div>
 </div>
 </div>
 </section>
@@ -154,7 +157,7 @@ input[type=number]{width:100%;padding:8px 10px;border-radius:6px;border:1px soli
 <div class="col-stack">
 <section class="card">
 <h2>Feeder · holgura y Tfeed</h2>
-<p class="note">GPIO 22 OFF → alimenta hasta flanco ON; asentamiento tras flanco; luego n s de feeder (sin mirar el sensor). Con Auto ON, OFF sostenido &gt; N s → fallo (también esperando in process; no cuenta asentamiento ni los n s tras el flanco). Tfeed TCP solo si está permitido y holgura ON al pulso.</p>
+<p class="note">GPIO 22 OFF → alimenta hasta flanco ON; asentamiento tras flanco; luego n s de feeder (sin mirar el sensor). Con Auto ON, OFF sostenido &gt; N s → fallo (también esperando in process; no cuenta asentamiento ni los n s tras el flanco). En producción, OFF y feeder quieto (orden en freno y RPM en cero) &gt; T s → el mismo fallo. Tfeed TCP solo si está permitido y holgura ON al pulso.</p>
 <div class="f2">
 <div><label>RPM Feeder</label><input id="m2" type="number" min="1" max="600"></div>
 <div><label>Tfeed (s)</label><input id="trig" type="number" min="0.1" max="60" step="0.1"></div>
@@ -163,7 +166,10 @@ input[type=number]{width:100%;padding:8px 10px;border-radius:6px;border:1px soli
 <div><label>Asentamiento tras flanco (ms)</label><input id="holg_set" type="number" min="10" max="500" step="10"></div>
 <div><label>Tras flanco ON (s)</label><input id="holg_on" type="number" min="0.1" max="120" step="0.1"></div>
 </div>
+<div class="f2">
 <div><label>Fallo OFF tras ciclo (s)</label><input id="holg_off" type="number" min="0.5" max="300" step="0.5"></div>
+<div><label>Fallo OFF con feeder quieto (s)</label><input id="holg_stall" type="number" min="0.5" max="60" step="0.5"></div>
+</div>
 <label><input type="checkbox" id="tfeed_en"> Permitir Tfeed por trigger (como HMI)</label>
 <button type="button" class="btn-save" id="saveFeed">Guardar Feeder</button>
 </section>
@@ -238,7 +244,7 @@ function sync(j,opt){
     setInp('hi_rpm',a.high_boost_rpm);setInp('hi_s',a.high_boost_s);setInp('hi_dus',a.high_servo_delta_us);
     setInp('hi_rev',a.high_reverse_s);
     setInp('m2',t.m2_rpm);setInp('trig',t.trigger_feed_s);
-    setInp('holg_set',t.holgura_settle_ms);setInp('holg_on',t.holgura_on_s);setInp('holg_off',t.holgura_off_fault_s);
+    setInp('holg_set',t.holgura_settle_ms);setInp('holg_on',t.holgura_on_s);setInp('holg_off',t.holgura_off_fault_s);setInp('holg_stall',t.holgura_stall_fault_s);
     setChk('tfeed_en',t.hmi_tfeed_enabled!==false);
     setInp('refill_s',r.pulse_s);
   }
@@ -289,7 +295,7 @@ q('saveDer').onclick=function(){cfg('/api/config?rpm='+enc(q('rpm').value)+'&mid
 q('saveServo').onclick=function(){cfg('/api/config?servo_pwm_us='+enc(q('servo').value),this)};
 q('saveSys').onclick=function(){cfg('/api/config?buffer_refill_fault_s='+enc(q('buf_to').value),this)};
 q('saveFeed').onclick=function(){
-  cfg('/api/config?m2_rpm='+enc(q('m2').value)+'&trigger_feed_s='+enc(q('trig').value)+'&holgura_settle_ms='+enc(q('holg_set').value)+'&holgura_on_s='+enc(q('holg_on').value)+'&holgura_off_fault_s='+enc(q('holg_off').value)+'&hmi_tfeed_enabled='+(q('tfeed_en').checked?'1':'0'),this);
+  cfg('/api/config?m2_rpm='+enc(q('m2').value)+'&trigger_feed_s='+enc(q('trig').value)+'&holgura_settle_ms='+enc(q('holg_set').value)+'&holgura_on_s='+enc(q('holg_on').value)+'&holgura_off_fault_s='+enc(q('holg_off').value)+'&holgura_stall_fault_s='+enc(q('holg_stall').value)+'&hmi_tfeed_enabled='+(q('tfeed_en').checked?'1':'0'),this);
 };
 q('saveRefill').onclick=function(){
   var btn=this;
@@ -321,7 +327,10 @@ function refillChannel(ch,on){
     pull();
   });
 }
-document.querySelectorAll('[data-ref]').forEach(function(b){
+document.querySelectorAll('.hold').forEach(function(hold){
+  var b=hold.querySelector('[data-ref]');
+  var cap=hold.querySelector('.hold-cap');
+  if(!b||!cap)return;
   var ch=b.getAttribute('data-ref');
   function down(e){
     if(b.disabled)return;
@@ -334,10 +343,11 @@ document.querySelectorAll('[data-ref]').forEach(function(b){
     b.classList.remove('on','flash');
     if(!b.disabled)refillChannel(ch,false);
   }
-  b.addEventListener('pointerdown',down);
-  b.addEventListener('pointerup',up);
-  b.addEventListener('pointerleave',up);
-  b.addEventListener('pointercancel',up);
+  cap.addEventListener('pointerdown',down);
+  cap.addEventListener('pointerup',up);
+  cap.addEventListener('pointerleave',up);
+  cap.addEventListener('pointercancel',up);
+  cap.addEventListener('selectstart',function(e){e.preventDefault();});
 });
 pull();setInterval(pull,1500);
 </script>

@@ -273,6 +273,9 @@ static void outputsSetIntent(const OutputIntent& intent) {
 }
 
 static SystemFault fault = FAULT_NONE;
+// Sube en cada Reset ya aplicado. El Master ignora un status anterior (mismo epoch).
+static uint16_t faultEpoch = 1;
+static bool peerStatusForce = false;
 static bool autoOn = false;
 static bool idleMode = false;
 static bool inProcess = false;
@@ -303,6 +306,7 @@ static bool holguraLastOn = false;
 static bool holguraSawOn = false;
 static bool holguraPostCycleOffWatch = false;
 static uint32_t holguraOffSinceMs = 0;
+static uint32_t holguraStallSinceMs = 0;
 static uint16_t holguraActiveTriggerId = 0;
 static bool pendingTrigger = false;
 static float pendingTriggerSec = 0.0f;
@@ -353,6 +357,7 @@ static void resetHolguraFeedState() {
   holguraSawOn = false;
   holguraPostCycleOffWatch = false;
   holguraOffSinceMs = 0;
+  holguraStallSinceMs = 0;
   holguraActiveTriggerId = 0;
 }
 
@@ -429,6 +434,24 @@ static void serviceHolguraOffFault(uint32_t nowMs) {
   }
   if (!holguraOffSinceMs) holguraOffSinceMs = nowMs;
   if ((nowMs - holguraOffSinceMs) >= (uint32_t)(P->holguraOffFaultSec * 1000.0f))
+    enterFault(FAULT_HOLGURA);
+}
+
+// Orden aceptada o RPM real de la rampa. Cualquiera de las dos cuenta como en marcha.
+static bool feederStepperMoving() {
+  if (commandedFeederRpm > 0.5f) return true;
+  return feeder && fabsf(feeder->currentRPM()) > 0.5f;
+}
+
+// Armado + holgura OFF estable + feeder quieto de verdad > T s → mismo fallo de holgura.
+// No corre fuera de producción: ahí el motor está quieto a propósito y vale el timer de OFF.
+static void serviceHolguraStallFault(uint32_t nowMs) {
+  if (!P || fault != FAULT_NONE || !motionArmed() || holguraOkStable() || feederStepperMoving()) {
+    holguraStallSinceMs = 0;
+    return;
+  }
+  if (!holguraStallSinceMs) holguraStallSinceMs = nowMs;
+  if ((nowMs - holguraStallSinceMs) >= (uint32_t)(P->holguraStallFaultSec * 1000.0f))
     enterFault(FAULT_HOLGURA);
 }
 
@@ -671,6 +694,10 @@ void machineHandleCommand(const NetCommand& cmd) {
       inProcess = false;
       benchInProcess = false;
       stopAutoOutputs();
+      // machineTick (mismo loop) puede reentrar si la causa sigue. El status
+      // forzado sale después, con este epoch y el fault ya definitivo.
+      faultEpoch = faultEpoch == 65535 ? 1 : (uint16_t)(faultEpoch + 1);
+      peerStatusForce = true;
       break;
     case NC_TRIGGER:  // encola Tfeed; machineTick → startFeederDemand
       if (fault != FAULT_NONE || !autoOn) break;
@@ -804,6 +831,7 @@ void machineTick(uint32_t nowMs) {
 
   serviceIdleRelease();  // Idle diferido: full ON + holgura ON y ciclo cerrado
   serviceHolguraOffFault(nowMs);  // Auto ON + holgura OFF > N s, con o sin in process
+  serviceHolguraStallFault(nowMs);  // Armado + OFF + feeder quieto > T s
   syncOutputs();  // actualiza intención → outputTask mueve hardware
 }
 
@@ -974,6 +1002,8 @@ static String buildPeerStatus(const MachineStatus& c, const SensorSnapshot& s) {
   j += c.fault != FAULT_NONE ? "true" : "false";
   j += ",\"errorCode\":";
   j += String(machineFaultWireCode());
+  j += ",\"faultEpoch\":";
+  j += String(faultEpoch);
   j += ",\"autoEnabled\":";
   j += c.autoEnabled ? "true" : "false";
   j += ",\"feederActive\":";
@@ -1106,6 +1136,8 @@ static void sendStatusJson(bool paramsSaved = false) {
   appendJsonFloat(json, P->holguraOnFeedSec, 2);
   json += ",\"holgura_off_fault_s\":";
   appendJsonFloat(json, P->holguraOffFaultSec, 2);
+  json += ",\"holgura_stall_fault_s\":";
+  appendJsonFloat(json, P->holguraStallFaultSec, 2);
   json += ",\"holgura_on\":";
   json += s.holguraOn ? "true" : "false";
   json += "},\"refill\":{\"pulse_s\":";
@@ -1296,9 +1328,10 @@ void pfNetworkTick(uint32_t nowMs) {
       peerNoteDead();
     } else {
       uint32_t iv = (c.feederActive || c.bufferActive) ? PEER_STATUS_FAST_MS : PEER_STATUS_MS;
-      if (nowMs - peerLastStatusMs >= iv) {
+      if (peerStatusForce || nowMs - peerLastStatusMs >= iv) {
         peerTx(buildPeerStatus(c, s));
         peerLastStatusMs = nowMs;
+        peerStatusForce = false;
       }
     }
   }

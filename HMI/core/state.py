@@ -324,6 +324,9 @@ class HmiState:
         self._progress = 0
 
         self._banner = {"text": "Listo.", "kind": "info"}
+        # Tras un Reset que ya confirmó el EXXX como ido: ignora la repetición
+        # que venía en camino. Una causa nueva, después de esta ventana, sí entra.
+        self._swallow_relatch: dict[str, float] = {}
         self._main_log: deque[str] = deque(maxlen=MAX_LOG_LINES)
         self._motion_log: deque[str] = deque(maxlen=MAX_LOG_LINES)
         self._plc_log: deque[str] = deque(maxlen=MAX_LOG_LINES)
@@ -1200,12 +1203,24 @@ class HmiState:
             return ["L", "R"]
         return [mode]
 
+    def _pf_side_settled(self, side: str) -> bool:
+        """Lado listo para salir de en proceso: Full, holgura OK, sin relleno ni Tfeed."""
+        if self.pf_buffer_full(side) is not True:
+            return False
+        if self.pf_holgura_present(side) is False:
+            return False
+        if self.pf_auto_filling(side) is True:
+            return False
+        if self.pf_trigger_active(side) is True:
+            return False
+        return True
+
     def pf_buffers_full_for_production(self) -> bool:
-        """Buffer Full en los lados que usa el ciclo (feedSides)."""
+        """Alimentador listo en los lados del ciclo (Full + holgura, quieto)."""
         if not self.pf_connected():
             return False
         for side in self.pf_feed_sides():
-            if self.pf_buffer_full(side) is not True:
+            if not self._pf_side_settled(side):
                 return False
         return True
 
@@ -1218,17 +1233,13 @@ class HmiState:
             if self.pf_has_fault():
                 return False
             fresh = self.pf_status_seq() > seq0
-            all_ok = fresh
-            for side in sides:
-                if self.pf_buffer_full(side) is not True:
-                    all_ok = False
-            if all_ok:
+            if fresh and all(self._pf_side_settled(side) for side in sides):
                 return True
             self.pf_request_status()
             time.sleep(0.1)
         _append_log(
             self._pf_log,
-            f"{reason}: timeout {timeout_s:.0f}s sin Buffer Full",
+            f"{reason}: timeout {timeout_s:.0f}s sin alimentador listo",
         )
         return False
 
@@ -1249,9 +1260,9 @@ class HmiState:
         detail = self.pf_fault_detail() if fault else ""
         with self._lock:
             if ok:
-                text = "Buffer listo."
+                text = "Alimentador listo."
                 kind = "ok"
-                _append_log(self._pf_log, "Iniciar alimentador: buffer listo")
+                _append_log(self._pf_log, "Iniciar alimentador: listo")
             elif fault:
                 text = detail or "Error en alimentador"
                 kind = "error"
@@ -1286,7 +1297,7 @@ class HmiState:
         if self.pf_buffers_full_for_production() and self.pf_is_ready():
             with self._lock:
                 self._pf["status"] = {
-                    "text": "Buffer listo.",
+                    "text": "Alimentador listo.",
                     "kind": "ok",
                 }
             self._notify()
@@ -1302,8 +1313,8 @@ class HmiState:
             return {"ok": False, "error": "PreFeeder no aceptó en proceso"}
         with self._lock:
             self._pf_manual_prep_busy = True
-            text = "PreFeeder ocupado — preparando buffer"
-            _append_log(self._pf_log, "Iniciar alimentador: Start (0x2A) + en proceso")
+            text = "En proceso — esperando alimentador listo"
+            _append_log(self._pf_log, "Iniciar alimentador: en proceso hasta que esté listo")
             self._pf["status"] = {"text": text, "kind": "info"}
         self._notify()
         self._pf_manual_prep_thread = threading.Thread(
@@ -2181,7 +2192,10 @@ class HmiState:
         if not latch.active:
             return {"ok": True, "cleared": False}
 
+        pf_epochs: dict[str, int] | None = None
         if self._pf_client.connected:
+            with self._lock:
+                pf_epochs = self._pf_fault_epochs()
             if not self._pf_send_reset():
                 self._notify()
                 return {
@@ -2235,6 +2249,8 @@ class HmiState:
                 self._pf_client.cmd_status()
             except Exception:
                 pass
+            if pf_epochs:
+                self._await_pf_fault_epoch(pf_epochs)
 
         healthy = True if source_is_software else self._latch_source_is_healthy()
         if not healthy:
@@ -2249,6 +2265,7 @@ class HmiState:
             }
 
         old = self._error_policy.clear()
+        self._arm_relatch_swallow(getattr(old, "code", ""))
         self._cycle.clear_fault_mirror()
         self._cycle.leave_error_state_after_clear()
         self._banner = {"text": "Error restablecido", "kind": "ok"}
@@ -2264,6 +2281,11 @@ class HmiState:
         # Una purga pedida que aún no arrancó no debe dejar la máquina trabada.
         self._cycle.cancel_unstarted_lot_purge()
         latch = self._error_policy.latch
+
+        pf_epochs: dict[str, int] | None = None
+        if self._pf_client.connected:
+            with self._lock:
+                pf_epochs = self._pf_fault_epochs()
 
         # Reset HMI siempre manda Reset PF (0x2C) si hay enlace — igual que Start manda 0x2A.
         if self._pf_client.connected:
@@ -2362,6 +2384,8 @@ class HmiState:
                 self._pf_client.cmd_status()
             except Exception:
                 pass
+            if pf_epochs:
+                self._await_pf_fault_epoch(pf_epochs)
 
         # Cycle errors are explicitly acknowledged by RESET; module errors
         # require the source cache to show the condition is gone.
@@ -2379,6 +2403,7 @@ class HmiState:
             }
 
         old = self._error_policy.clear()
+        self._arm_relatch_swallow(getattr(old, "code", ""))
         self._cycle.clear_fault_mirror()
 
         if active_lot:
@@ -2433,14 +2458,8 @@ class HmiState:
     def _apply_detail_error(self, code_or_byte: str | int, *, source: str = "") -> bool:
         """Latch one EXXX and enter the common ERROR hold."""
         entry = lookup(code_or_byte)
-        if (
-            entry is not None
-            and str(entry.get("code")) == "E050"
-            and self._cycle.is_e050_materialist_path()
-        ):
-            # Latch ya liberado para Materialista; el sensor PLC sigue activo.
-            return True
-
+        if entry is not None and self._relatch_swallowed(str(entry["code"])):
+            return False
         result = self._error_policy.set_error(code_or_byte)
         if result is None:
             return False
@@ -2468,15 +2487,7 @@ class HmiState:
 
         self._set_banner(ui, "error")
 
-        e050_lot = (
-            code == "E050"
-            and self._cycle.is_lot_alive()
-            and not self._cycle.is_refill_active()
-        )
-        if e050_lot:
-            self._cycle.apply_e050_policy(ui)
-        else:
-            self._cycle.apply_error_policy(ui)
+        self._cycle.apply_error_policy(ui)
 
         # 0x46 is the TCM/Andon machine state only. Healthy module states are not
         # converted to ERROR merely because the machine sequence stopped.
@@ -2652,9 +2663,14 @@ class HmiState:
         OFF: si no hay enlace PF, igual se sale del interlock HMI.
         Siempre accionable salvo purga en curso: con lote vivo pausa y re-arranca la pieza al Resume.
         """
-        if self._cycle.is_purge_busy():
+        if self._cycle.is_purge_busy() and not self._cycle.is_clear_active():
             return {"ok": False, "error": "Purga en curso"}
-        if on and self._cycle.is_active() and not self._cycle.is_e050_materialist_wait():
+        if (
+            on
+            and self._cycle.is_active()
+            and not self._cycle.is_clear_active()
+            and not self._cycle.is_e050_materialist_wait()
+        ):
             self._cycle.hold_lot_and_restart_piece(
                 "Materialista con lote vivo — Pause (progreso conservado)"
             )
@@ -2737,6 +2753,14 @@ class HmiState:
                 _append_log(self._main_log, "Purge dentro del lote (progreso conservado)")
             return res
         return self._cycle.request_refill(rpm, feed_mm=feed_mm, asda_mm=asda_mm)
+
+    def cmd_cycle_clear(self) -> dict:
+        """Clear: ASDA a su máximo, feeders 5 s, Retry o Continuar (ASDA a 0)."""
+        with self._lock:
+            rpm = self._rpm
+        if self._cycle.is_refill_active() or self._cycle.is_purge_busy():
+            return {"ok": False, "error": "Purga en curso"}
+        return self._cycle.request_clear(rpm)
 
     def cmd_cycle_refill_confirm(self, ok: bool = True) -> dict:
         return self._cycle.confirm_refill(ok)
@@ -3492,8 +3516,6 @@ class HmiState:
             code = str(entry["code"])
             if code in seen:
                 return
-            if code == "E050" and self._cycle.is_e050_materialist_path():
-                return
             seen.add(code)
             items.append(
                 {
@@ -3544,8 +3566,6 @@ class HmiState:
             return False
         primary = self._plc_primary_active_error_byte()
         if primary is None:
-            return False
-        if primary == TX_ENCODER_ERR and self._cycle.is_e050_materialist_path():
             return False
         return self._apply_detail_error(primary, source="plc")
 
@@ -3631,6 +3651,95 @@ class HmiState:
         if not self._pf.get("connected"):
             return False
         return not self._pf_cached_has_fault()
+
+    def _pf_fault_epochs(self) -> dict[str, int]:
+        """Epoch de fault ya visto por lado. 0 = el esclavo aún no lo publicó."""
+        out: dict[str, int] = {}
+        for sk in ("L", "R"):
+            runtime = (self._pf.get("sides") or {}).get(sk) or {}
+            try:
+                out[sk] = int(runtime.get("faultEpoch") or 0)
+            except (TypeError, ValueError):
+                out[sk] = 0
+        return out
+
+    def _note_pf_fault_epoch(self, side_key: str, side: dict) -> None:
+        if "faultEpoch" not in side:
+            return
+        try:
+            ep = int(side["faultEpoch"])
+        except (TypeError, ValueError):
+            return
+        runtime = self._pf.setdefault("sides", {}).setdefault(side_key, {})
+        runtime["faultEpoch"] = ep
+
+    def _pf_epochs_advanced(self, before: dict[str, int]) -> bool:
+        """True cuando cada lado que ya tenía epoch publica uno posterior al Reset."""
+        if not any(int(v or 0) > 0 for v in before.values()):
+            return False
+        for sk, prev in before.items():
+            prev_i = int(prev or 0)
+            if prev_i <= 0:
+                continue
+            cur = self._pf_fault_epochs().get(sk, 0)
+            if cur <= prev_i:
+                return False
+        return True
+
+    def _await_pf_fault_epoch(self, before: dict[str, int], timeout: float = 2.0) -> bool:
+        """Espera el status generado después de aplicar el Reset en el esclavo.
+
+        Sin ese epoch, la caché recién limpiada parece sana y el paquete que
+        salió antes del Reset vuelve a enclavar el mismo EXXX.
+        """
+        if not any(int(v or 0) > 0 for v in before.values()):
+            return False
+        deadline = time.monotonic() + timeout
+        last_req = 0.0
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self._pf_epochs_advanced(before):
+                    return True
+            now = time.monotonic()
+            if now - last_req >= 0.2 and self._pf_client.connected:
+                self._pf_client.cmd_status()
+                last_req = now
+            time.sleep(0.05)
+        return False
+
+    def _arm_relatch_swallow(self, code: str) -> None:
+        """Ignora una repetición del EXXX recién confirmado como ido.
+
+        Al cerrar la ventana, si la caché sigue mostrando la causa, se enclava:
+        era pertinente o se generó de nuevo. Si ya no está, no vuelve a salir.
+        """
+        code = str(code or "").strip().upper()
+        if not code or code in {"E065", "E066", "E067", "E070"}:
+            return
+        self._swallow_relatch[code] = time.monotonic() + 1.0
+
+        def release() -> None:
+            time.sleep(1.05)
+            notify = False
+            with self._lock:
+                self._swallow_relatch.pop(code, None)
+                if not self._error_policy.latch.active:
+                    notify = bool(self._pf_try_latch_once() or self._plc_try_latch_once())
+            if notify:
+                self._notify()
+
+        threading.Thread(
+            target=release, daemon=True, name="relatch-swallow"
+        ).start()
+
+    def _relatch_swallowed(self, code: str) -> bool:
+        until = self._swallow_relatch.get(code)
+        if until is None:
+            return False
+        if time.monotonic() >= until:
+            self._swallow_relatch.pop(code, None)
+            return False
+        return True
 
     def _latch_source_is_healthy(self) -> bool:
         """Validate cached source state after an explicit module RESET."""
@@ -4940,9 +5049,11 @@ class HmiState:
                 side_r = msg.get("r")
                 # Lados primero: el EXXX debe existir antes de pintar estado.
                 if isinstance(side_l, dict):
+                    self._note_pf_fault_epoch("L", side_l)
                     changed = self._apply_pf_side_sensors(side_l, True) or changed
                     changed = self._apply_pf_side_fault(side_l, True) or changed
                 if isinstance(side_r, dict):
+                    self._note_pf_fault_epoch("R", side_r)
                     changed = self._apply_pf_side_sensors(side_r, False) or changed
                     changed = self._apply_pf_side_fault(side_r, False) or changed
                 pf_idle = bool(
