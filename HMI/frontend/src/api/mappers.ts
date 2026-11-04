@@ -121,7 +121,7 @@ export function mergeLogTail(
   return next.length > MAX_UI_LOGS ? next.slice(next.length - MAX_UI_LOGS) : next;
 }
 
-/** Purga activa en cualquier fase de la rutina (señales reales del snapshot de ciclo). */
+/** Purga activa. Limpiar reutiliza el aviso de manos y no cuenta como purga. */
 export function isPurgeBusy(
   cycle:
     | Pick<
@@ -134,13 +134,12 @@ export function isPurgeBusy(
       >
     | undefined
 ): boolean {
+  if (!cycle || cycle.clearActive) return false;
   return (
-    !!cycle &&
-    (!!cycle.refillActive ||
-      !!cycle.clearActive ||
-      !!cycle.refillPrompt ||
-      !!cycle.purgeHandsWarning ||
-      !!cycle.asdaMoveWarning)
+    !!cycle.refillActive ||
+    !!cycle.refillPrompt ||
+    !!cycle.purgeHandsWarning ||
+    !!cycle.asdaMoveWarning
   );
 }
 
@@ -303,10 +302,10 @@ export function mapMotionState(snap: BackendSnapshot): MotionState {
       ip: snap.motionLink.host,
       port: snap.motionLink.port,
     },
-    targetPositionMm: snap.mm,
+    targetPositionMm: snap.manualMm ?? snap.mm,
     currentPositionMm: m.asdaPositionMm ?? 0,
-    rpm: snap.rpm,
-    actualRpm: isMoving ? snap.rpm : 0,
+    rpm: snap.manualRpm ?? snap.rpm,
+    actualRpm: isMoving ? (snap.manualRpm ?? snap.rpm) : 0,
     isMoving,
     hasError: m.status?.kind === 'error',
     inPosition: !isMoving && m.status?.kind !== 'error',

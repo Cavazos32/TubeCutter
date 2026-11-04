@@ -311,8 +311,12 @@ class HmiState:
 
         self._models: list[dict] = []
         self._selected_model_idx = 0
+        # Longitud y rpm del modelo (lote). El control manual no las escribe.
         self._mm = -45.0
         self._rpm = 1200.0
+        # Destino y velocidad del control manual (pestaña Motion).
+        self._manual_mm = -45.0
+        self._manual_rpm = 1200.0
 
         self._last_state_byte: int | None = None
         self._stopped_pending_resume = False
@@ -522,6 +526,10 @@ class HmiState:
         self._motion_boot_worker_launched = False
         self._motion_boot_on_fails = 0
         self._motion_boot_last_wait_log = 0.0
+        # Init CAN del alimentador: mismos reintentos que Servo ON.
+        self._motion_boot_can_done = False
+        self._motion_boot_can_fails = 0
+        self._motion_boot_can_last_wait_log = 0.0
 
         self._load_models()
         self._started = False
@@ -654,6 +662,8 @@ class HmiState:
                 "selectedModel": self._selected_model_idx,
                 "mm": self._mm,
                 "rpm": self._rpm,
+                "manualMm": self._manual_mm,
+                "manualRpm": self._manual_rpm,
                 "banner": dict(self._banner),
                 "error": self._error_snapshot(),
                 "progress": progress,
@@ -745,6 +755,9 @@ class HmiState:
         if not self._models:
             self._models = [{"name": "Default", "mm": -45.0, "rpm": 1200.0}]
         self._apply_model(0)
+        # Arranque: el manual parte del modelo cargado y después no se vuelve a copiar.
+        self._manual_mm = self._mm
+        self._manual_rpm = self._rpm
 
     def _load_register(self) -> None:
         self._register_entries = []
@@ -823,10 +836,21 @@ class HmiState:
             self._apply_model(idx)
         self._notify()
 
-    def set_mm_rpm(self, mm: float, rpm: float) -> None:
+    def _model_mm_rpm(self) -> tuple[float, float]:
+        """Longitud y rpm del modelo seleccionado. Independientes del control manual."""
         with self._lock:
-            self._mm = mm
-            self._rpm = rpm
+            if self._models:
+                idx = max(0, min(self._selected_model_idx, len(self._models) - 1))
+                m = self._models[idx]
+                return float(m.get("mm", self._mm)), float(m.get("rpm", self._rpm))
+            return float(self._mm), float(self._rpm)
+
+    def set_mm_rpm(self, mm: float, rpm: float) -> None:
+        """Destino del control manual. No modifica el modelo ni el lote."""
+        with self._lock:
+            self._manual_mm = float(mm)
+            self._manual_rpm = float(rpm)
+        self._notify()
         self._notify()
 
     def clear_log(self, target: str) -> None:
@@ -1408,7 +1432,17 @@ class HmiState:
                         "servo ya listo desde el encendido"
                     )
                     return True
-            self._stage2_fault = f"Arranque alimentador: {exc}"
+            detail = str(exc)
+            read = getattr(exc, "read", None)
+            if callable(read):
+                try:
+                    raw = read().decode("utf-8", errors="replace")
+                    body = json.loads(raw) if raw else {}
+                    if isinstance(body, dict) and body.get("error"):
+                        detail = str(body["error"])
+                except Exception:  # noqa: BLE001 — cuerpo HTTP no JSON
+                    pass
+            self._stage2_fault = f"Arranque alimentador: {detail}"
             return False
         if not data.get("ok"):
             self._stage2_fault = "Arranque del alimentador rechazado"
@@ -1726,7 +1760,7 @@ class HmiState:
         with self._lock:
             self._move_target_mm = 0.0
             self._move_start_mm = self._last_position_mm
-            use_rpm = float(rpm) if rpm is not None else self._rpm
+            use_rpm = float(rpm) if rpm is not None else self._manual_rpm
         return self._client.cmd_move_zero(use_rpm)
 
     def cmd_motion_stop(self) -> bool:
@@ -2049,7 +2083,7 @@ class HmiState:
                 return {"ok": False, "error": blocked}
             if self._cycle.is_purge_busy():
                 return {"ok": False, "error": "Purga en curso"}
-            mm, rpm = self._mm, self._rpm
+            mm, rpm = self._model_mm_rpm()
             model = self._models[self._selected_model_idx] if self._models else {}
             model_qty = int(model.get("qty", model.get("cantidad", 1)))
             use_qty = int(qty) if qty is not None and qty >= 1 else model_qty
@@ -2760,8 +2794,7 @@ class HmiState:
         Si hay EXXX, primero lo restablece (mismo Reset de módulo). Si la falla sigue, no arranca.
         Start/Resume/Pause/Materialist bloqueados durante la purga; Stop y posición inicial siguen.
         """
-        with self._lock:
-            rpm = self._rpm
+        _, rpm = self._model_mm_rpm()
         if self._cycle.is_refill_active() or self._cycle.is_purge_busy():
             return {"ok": False, "error": "Purga ya en curso"}
         if self.error_is_latched():
@@ -2776,9 +2809,15 @@ class HmiState:
         return self._cycle.request_refill(rpm, feed_mm=feed_mm, asda_mm=asda_mm)
 
     def cmd_cycle_clear(self) -> dict:
-        """Clear: ASDA a su máximo, feeders 5 s, Retry o Continuar (ASDA a 0)."""
-        with self._lock:
-            rpm = self._rpm
+        """Clear: ASDA al despeje, feeder 5 s, Retry o Continuar (ASDA a 0).
+
+        Si Limpiar ya está activo, este mismo comando lo apaga.
+        """
+        if self._cycle.is_clear_active():
+            if self._cycle.snapshot().get("refillAwaitingConfirm"):
+                return self._cycle.confirm_refill(False)
+            return self._cycle.request_stop()
+        _, rpm = self._model_mm_rpm()
         if self._cycle.is_refill_active() or self._cycle.is_purge_busy():
             return {"ok": False, "error": "Purga en curso"}
         return self._cycle.request_clear(rpm)
@@ -2802,8 +2841,8 @@ class HmiState:
     def cmd_motion(self, action: str, **kwargs) -> dict:
         handlers = {
             "move": lambda: self.cmd_motion_move_mm(
-                float(kwargs.get("mm", self._mm)),
-                float(kwargs.get("rpm", kwargs.get("speedRpm", self._rpm))),
+                float(kwargs.get("mm", self._manual_mm)),
+                float(kwargs.get("rpm", kwargs.get("speedRpm", self._manual_rpm))),
             ),
             "stop": lambda: self._client.cmd_stop(),
             "on": lambda: self._client.cmd_on(),
@@ -2812,7 +2851,7 @@ class HmiState:
                 str(kwargs.get("direction", "F")),
             ),
             "move_zero": lambda: self._client.cmd_move_zero(
-                float(kwargs.get("rpm", kwargs.get("speedRpm", self._rpm)))
+                float(kwargs.get("rpm", kwargs.get("speedRpm", self._manual_rpm)))
             ),
             "enc_poll": lambda: self._client.cmd_enc_poll_both(),
             "enc_set0_r": lambda: self._client.cmd_enc_set0_r(),
@@ -2832,7 +2871,7 @@ class HmiState:
             return {"ok": False, "error": err}
         if action == "move":
             with self._lock:
-                mm = abs(float(kwargs.get("mm", self._mm)))
+                mm = abs(float(kwargs.get("mm", self._manual_mm)))
                 self._move_target_mm = mm
                 self._move_start_mm = self._last_position_mm
                 self._progress = 0
@@ -3861,6 +3900,9 @@ class HmiState:
                     self._motion_boot_awaiting_on_ack = False
                     self._motion_boot_on_fails = 0
                     self._motion_boot_last_wait_log = 0.0
+                    self._motion_boot_can_done = False
+                    self._motion_boot_can_fails = 0
+                    self._motion_boot_can_last_wait_log = 0.0
             else:
                 self._last_state_byte = None
                 self._stopped_pending_resume = False
@@ -3880,6 +3922,9 @@ class HmiState:
                 self._motion_boot_worker_launched = False
                 self._motion_boot_on_fails = 0
                 self._motion_boot_last_wait_log = 0.0
+                self._motion_boot_can_done = False
+                self._motion_boot_can_fails = 0
+                self._motion_boot_can_last_wait_log = 0.0
                 self._banner = {
                     "text": f"Reconectando Motion ({DEFAULT_HOST}:{DEFAULT_PORT})…",
                     "kind": "warn",
@@ -3965,6 +4010,142 @@ class HmiState:
             name="motion-boot-retry",
         ).start()
 
+    def _motion_boot_can_stop(self, gen: int) -> bool:
+        """True si este arranque lineal ya no debe seguir con Init CAN."""
+        with self._lock:
+            if gen != self._motion_boot_prep_gen or self._motion_boot_can_done:
+                return True
+            if not self._motion["connected"]:
+                return True
+            if self._cycle.is_active():
+                self._motion_boot_can_done = True
+                return True
+        return False
+
+    def _motion_boot_wait_can(self, gen: int, timeout_s: float = 90.0) -> str:
+        """Espera el Init en curso. Aborta si cae el enlace o cambia el arranque.
+
+        Misma lectura que el botón: listo, o el arranque terminó y el servo
+        no quedó habilitado. El tope es por intento; luego se reintenta.
+        """
+        deadline = time.monotonic() + timeout_s
+        saw_busy = False
+        idle_since: float | None = None
+        while time.monotonic() < deadline:
+            if self._motion_boot_can_stop(gen):
+                return "aborted"
+            self.refresh_feed_can_status()
+            with self._lock:
+                pending = bool(self._motion.get("canInitPending"))
+                busy = bool(self._motion.get("canInitBusy"))
+                ready = bool(self._motion.get("servoCanReady"))
+            if pending or busy:
+                saw_busy = True
+                idle_since = None
+            elif saw_busy and ready:
+                return "ok"
+            elif saw_busy:
+                if idle_since is None:
+                    idle_since = time.monotonic()
+                elif time.monotonic() - idle_since > 2.0:
+                    return "ng"
+            time.sleep(0.35)
+        return "timeout"
+
+    def _motion_boot_can_succeeded(self) -> None:
+        with self._lock:
+            fails = self._motion_boot_can_fails
+            self._motion_boot_can_done = True
+            if fails:
+                msg = f"Arranque lineal: Init CAN OK tras {fails} intentos"
+            else:
+                msg = "Arranque lineal: Init CAN OK"
+            _append_log(self._motion_log, msg)
+            self._set_motion_status(msg, "ok")
+        self.refresh_feed_can_status()
+        self._notify()
+
+    def _motion_boot_can_attempt_failed(self, gen: int, reason: str) -> bool:
+        """Igual que Servo ON: anota el fallo, espera y deja reintentar.
+
+        Returns False si el arranque ya no aplica (no hay que volver a intentar).
+        """
+        notify = False
+        with self._lock:
+            if gen != self._motion_boot_prep_gen or self._motion_boot_can_done:
+                return False
+            if not self._motion["connected"] or self._cycle.is_active():
+                self._motion_boot_can_done = self._cycle.is_active() or self._motion_boot_can_done
+                return False
+            self._motion_boot_can_fails += 1
+            fails = self._motion_boot_can_fails
+            now = time.monotonic()
+            if (
+                fails == 1
+                or (now - self._motion_boot_can_last_wait_log) >= MOTION_BOOT_LOG_EVERY_SEC
+            ):
+                self._motion_boot_can_last_wait_log = now
+                _append_log(
+                    self._motion_log,
+                    f"Arranque lineal: esperando Init CAN — {reason} "
+                    f"(intento {fails})",
+                )
+                self._set_motion_status("Esperando Init CAN…", "warn")
+                notify = True
+        if notify:
+            self._notify()
+        time.sleep(MOTION_BOOT_RETRY_SEC)
+        return not self._motion_boot_can_stop(gen)
+
+    def _motion_boot_can_init_once(self, gen: int) -> str | None:
+        """Un intento de Init CAN. None = listo o abortado; str = motivo para reintentar."""
+        if self._motion_boot_can_stop(gen):
+            return None
+        ok = self.cmd_motion_feed_can_init()
+        fault = ""
+        wait_running = False
+        if not ok:
+            with self._lock:
+                fault = str(self._stage2_fault or "").strip()
+            low = fault.lower()
+            # Motion ya ejecuta un Init: ese intento es el nuestro, hay que esperarlo.
+            if "en curso" in low:
+                wait_running = True
+            else:
+                return fault or "Init CAN no encolado"
+        else:
+            with self._lock:
+                if self._motion_boot_can_fails == 0:
+                    _append_log(self._motion_log, "Arranque lineal: Init CAN encolado")
+                self._motion["canInitPending"] = True
+            self._notify()
+        if wait_running or ok:
+            result = self._motion_boot_wait_can(gen)
+            if result == "aborted":
+                return None
+            if result == "ok":
+                self._motion_boot_can_succeeded()
+                return None
+            if result == "ng":
+                with self._lock:
+                    fault = str(self._stage2_fault or "").strip()
+                return fault or "Init CAN: el servo no quedó listo"
+            return "Init CAN: tiempo agotado"
+        return fault or "Init CAN no encolado"
+
+    def _motion_boot_enqueue_can_init(self, gen: int) -> None:
+        """Init CAN con los mismos reintentos que el Servo ON del ASDA.
+
+        Sin tope: cada fallo espera MOTION_BOOT_RETRY_SEC y vuelve a pedir
+        el arranque del alimentador hasta que el servo CAN queda listo.
+        """
+        while True:
+            reason = self._motion_boot_can_init_once(gen)
+            if reason is None:
+                return
+            if not self._motion_boot_can_attempt_failed(gen, reason):
+                return
+
     def _motion_boot_prep_worker(self, gen: int) -> None:
         """TCP+Init/Idle → settle → Servo ON (sonda Modbus); Home al ack OK."""
         time.sleep(MOTION_BOOT_SETTLE_SEC)
@@ -3985,10 +4166,23 @@ class HmiState:
                     self._motion_log,
                     "Arranque lineal: TCP OK → Servo ON (0x004)…",
                 )
+                _append_log(
+                    self._motion_log,
+                    "Arranque lineal: Init CAN…",
+                )
                 self._set_motion_status("Arranque lineal: Servo ON (0x004)…", "info")
             self._motion_boot_awaiting_on_ack = True
         if first_try:
             self._notify()
+            # Mismo pedido que el botón Init CAN, con los reintentos del
+            # Servo ON. En otro hilo para no retrasar el 0x004. Una sola
+            # vez por enlace: el hilo se repite solo hasta que el CAN queda listo.
+            threading.Thread(
+                target=self._motion_boot_enqueue_can_init,
+                args=(gen,),
+                daemon=True,
+                name="motion-boot-can-init",
+            ).start()
         if not self._client.cmd_on():
             self._motion_boot_attempt_failed("Servo ON no enviado")
             return

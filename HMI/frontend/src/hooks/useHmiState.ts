@@ -603,7 +603,7 @@ export function useHmiState() {
 
   const motionMoveZero = useCallback(() => {
     const snap = snapRef.current;
-    const rpm = snap?.rpm ?? view.motionState.rpm;
+    const rpm = snap?.manualRpm ?? view.motionState.rpm;
     api.motionAction('move_zero', { rpm }).catch(() => {});
   }, [view.motionState.rpm]);
 
