@@ -51,6 +51,10 @@ static bool commandsPush(const NetCommand& cmd) {
 static SensorSnapshot gSnap;
 static uint32_t fullHighMs = 0, fullLowMs = 0;
 static bool fullStable = false;
+static uint32_t midHighMs = 0, midLowMs = 0;
+static bool midStable = false;
+static uint32_t highOnMs = 0, highOffMs = 0;
+static bool highStable = false;
 static uint32_t holgHighMs = 0, holgLowMs = 0;
 static bool holguraStableOn = false;
 
@@ -70,6 +74,19 @@ static bool holguraSensorRawOn() {
 
 static bool holguraOkStable() { return holguraStableOn; }
 
+// Misma espera que GPIO19: 50 ms ON, 100 ms OFF.
+static void debounceLevel(bool raw, uint32_t dt, uint32_t& onMs, uint32_t& offMs, bool& stable) {
+  if (raw) {
+    onMs += dt;
+    offMs = 0;
+    if (onMs >= BUF_FULL_ON_MS) stable = true;
+  } else {
+    offMs += dt;
+    onMs = 0;
+    if (offMs >= BUF_FULL_OFF_MS) stable = false;
+  }
+}
+
 // Lee GPIO de buffer, cilindro, manguera; filtra estabilidad GPIO19 (full)
 static void sensorsUpdate(uint32_t nowMs) {
   static uint32_t lastMs = 0;
@@ -80,6 +97,10 @@ static void sensorsUpdate(uint32_t nowMs) {
   gSnap.bufMidRaw = digitalRead(PIN_BUF_MID) == HIGH;
   gSnap.bufHighRaw = digitalRead(PIN_BUF_HIGH) == HIGH;
   gSnap.bufMaxRaw = digitalRead(PIN_BUF_MAX) == HIGH;
+  debounceLevel(gSnap.bufMidRaw, dt, midHighMs, midLowMs, midStable);
+  debounceLevel(gSnap.bufHighRaw, dt, highOnMs, highOffMs, highStable);
+  gSnap.bufMidStable = midStable;
+  gSnap.bufHighStable = highStable;
   gSnap.cylinderOpen = digitalRead(PIN_CYLINDER) == HIGH;
   gSnap.hoseAbsent = digitalRead(PIN_HOSE) == HIGH;
 
@@ -496,6 +517,12 @@ static bool settledForIdle() {
   return holguraPhase == HOLG_IDLE;
 }
 
+// Nivel ya filtrado: al reanudar, un sensor que sigue ON no es flanco nuevo.
+static void syncBoostEdgeBaseline() {
+  lastMid = gSnap.bufMidStable;
+  lastHigh = gSnap.bufHighStable;
+}
+
 static void stopAutoOutputs() {
   releaseToIdlePending = false;
   stopFeederDemand();
@@ -504,6 +531,7 @@ static void stopAutoOutputs() {
   highReverseUntilMs = 0;
   highReverseCanArm = true;
   midPassedBeforeHigh = false;
+  syncBoostEdgeBaseline();
   bufferEmptySinceMs = 0;
   OutputIntent o;
   outputsSetIntent(o);
@@ -604,9 +632,10 @@ static void serviceFeederDemand(uint32_t nowMs) {
     serviceHolguraFeed(nowMs);
 }
 
-// Buffer mid/high: boost en flanco. HIGH invierte DeReeler solo si hubo MID antes.
+// Buffer mid/high estables: boost en flanco. HIGH invierte DeReeler solo si hubo MID antes.
 // Secuencia: MID↑ (latch midPassedBeforeHigh), luego HIGH↑ → CCW durante high_reverse_s
-// o hasta buffer full estable. No rearmar otro pulso invertido hasta que HIGH haya estado OFF.
+// o hasta buffer full estable. MID se evalúa antes que HIGH en el mismo ciclo.
+// No rearmar otro pulso invertido hasta que HIGH haya estado OFF.
 static void serviceBoostEdges(uint32_t nowMs) {
   if (!P) return;
   if (!bufferWantsFill()) {
@@ -614,13 +643,16 @@ static void serviceBoostEdges(uint32_t nowMs) {
     highReverseUntilMs = 0;
     highReverseCanArm = true;
     midPassedBeforeHigh = false;
-    lastMid = gSnap.bufMidRaw;
-    lastHigh = gSnap.bufHighRaw;
+    syncBoostEdgeBaseline();
     return;
   }
-  if (!gSnap.bufHighRaw)
+  if (!gSnap.bufHighStable)
     highReverseCanArm = true;
-  if (gSnap.bufHighRaw && !lastHigh) {
+  if (gSnap.bufMidStable && !lastMid) {
+    midBoostUntil = nowMs + (uint32_t)(P->midBoostSec * 1000.0f);
+    midPassedBeforeHigh = true;
+  }
+  if (gSnap.bufHighStable && !lastHigh) {
     highBoostUntil = nowMs + (uint32_t)(P->highBoostSec * 1000.0f);
     if (midPassedBeforeHigh && highReverseCanArm && !highReverseActive) {
       highReverseActive = true;
@@ -628,10 +660,6 @@ static void serviceBoostEdges(uint32_t nowMs) {
       midPassedBeforeHigh = false;
       highReverseCanArm = false;
     }
-  }
-  if (gSnap.bufMidRaw && !lastMid) {
-    midBoostUntil = nowMs + (uint32_t)(P->midBoostSec * 1000.0f);
-    midPassedBeforeHigh = true;
   }
   if (highReverseActive) {
     const bool timerDone = highReverseUntilMs
@@ -641,8 +669,7 @@ static void serviceBoostEdges(uint32_t nowMs) {
       highReverseUntilMs = 0;
     }
   }
-  lastMid = gSnap.bufMidRaw;
-  lastHigh = gSnap.bufHighRaw;
+  syncBoostEdgeBaseline();
 }
 
 // Espera buffer_refill_fault_s sin ver GPIO19 estable lleno → falla timeout
@@ -827,6 +854,8 @@ void machineTick(uint32_t nowMs) {
     serviceFeederDemand(nowMs);
     serviceBoostEdges(nowMs);     // impulsos mid/high + inversión temporizada
     serviceBufferTimeout(nowMs);  // espera llenado buffer
+  } else {
+    syncBoostEdgeBaseline();  // sin proceso: seguir el nivel, no inventar flancos
   }
 
   serviceIdleRelease();  // Idle diferido: full ON + holgura ON y ciclo cerrado

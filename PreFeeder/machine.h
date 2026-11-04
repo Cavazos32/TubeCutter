@@ -8,7 +8,9 @@ struct SensorSnapshot {
   bool bufFullStable = false;
   bool holguraOn = false;
   bool bufMidRaw = false;
+  bool bufMidStable = false;
   bool bufHighRaw = false;
+  bool bufHighStable = false;
   bool bufMaxRaw = false;
   bool cylinderOpen = false;
   bool hoseAbsent = false;
