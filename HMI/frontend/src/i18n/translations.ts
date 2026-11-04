@@ -445,6 +445,7 @@ export const translations = {
     btn_trigger_both: 'Avanzar material (ambos)',
     btn_jog: 'Avance manual',
     btn_reset: 'Reiniciar',
+    btn_read_sensors: 'Leer sensores',
     channel_left: 'Canal izquierdo',
     channel_right: 'Canal derecho',
     side_l: 'Lado izquierdo',

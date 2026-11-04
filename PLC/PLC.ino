@@ -35,7 +35,7 @@ static unsigned long blowerStartMs = 0;
 static unsigned long blowerHoldMs = 0;
 
 char tcpRxLine[512];
-uint16_t tcpRxLen = 0;
+EspRxLine tcpRx = {tcpRxLine, sizeof(tcpRxLine), 0, false};
 static EspSta staLink;
 
 static bool lastPeerCutterR = false;
@@ -88,7 +88,7 @@ static bool updateDebouncedMask(uint8_t raw, uint8_t& stableOut, unsigned long n
 
 // --- Válvulas (pulso ON/OFF) ---
 static void blowerStop();
-static void plcSendAck(uint8_t cmdByte, bool ok, const char* message);
+static void plcSendAck(uint8_t cmdByte, bool ok, const char* message, uint16_t reqId);
 static bool plcDoHardwareReset(uint8_t ackByte, uint8_t flags, bool& deferred);
 
 static void valveWritePin(uint8_t pin, bool on)
@@ -124,6 +124,7 @@ struct ValveJob {
   uint8_t n;
   uint8_t ackByte;
   uint8_t flags;
+  uint16_t reqId;
 };
 
 static ValveJob valveJobs[VALVE_JOB_Q];
@@ -141,7 +142,10 @@ static uint8_t vpPins[4];
 static uint8_t vpN = 0;
 static uint8_t vpAckByte = 0;
 static uint8_t vpFlags = 0;
+static uint16_t vpReqId = 0;
 static unsigned long vpPhaseMs = 0;
+// id del comando que se está interpretando. El pulso lo copia a su job.
+static uint16_t tcpReqId = 0;
 
 static bool valveEnqueue(const uint8_t* pins, uint8_t n, uint8_t ackByte, uint8_t flags)
 {
@@ -153,6 +157,7 @@ static bool valveEnqueue(const uint8_t* pins, uint8_t n, uint8_t ackByte, uint8_
   j.n = n;
   j.ackByte = ackByte;
   j.flags = flags;
+  j.reqId = tcpReqId;
   valveJobCount++;
   return true;
 }
@@ -263,7 +268,7 @@ static bool setPlcOutputByName(const char* outName, bool state, bool& deferred)
       syncCuttersFlag();
       deferred = true;
     } else {
-      plcSendAck(PLC_CMD_CUTTERS, true, "");
+      plcSendAck(PLC_CMD_CUTTERS, true, "", tcpReqId);
     }
   }
   else if (nameEq(outName, "CUTTER_R") || nameEq(outName, "CUTTERS_R")) {
@@ -356,15 +361,21 @@ static bool tcpLinkOk()
 static char txHoldBuf[700];
 static EspTcpHold txHold = {txHoldBuf, sizeof(txHoldBuf), 0};
 
-static const uint8_t ACK_Q = 4;
+// Un ACK por comando encolado, por pulso en curso y uno libre para el rechazo.
+// No es un aumento ciego: es el tope de órdenes que el PLC ya puede aceptar.
+static const uint8_t ACK_Q = LINE_Q + VALVE_JOB_Q + 2;
 static char ackQ[ACK_Q][192];
 static uint8_t ackQHead = 0;
 static uint8_t ackQn = 0;
+// El más nuevo que no cupo en la cola. tcpTxPump lo mete cuando se libera un hueco.
+static char ackSpill[192];
+static bool ackSpillOn = false;
 
 static void ackReset()
 {
   ackQHead = 0;
   ackQn = 0;
+  ackSpillOn = false;
 }
 
 static void tcpNoteDead()
@@ -384,33 +395,43 @@ static bool tcpTx(const char* m)
   return false;
 }
 
+static bool ackCopyLine(char* dst, size_t cap, const char* line)
+{
+  if (!line || !line[0]) return false;
+  size_t n = strlen(line);
+  if (n + 2 >= cap) return false;
+  memcpy(dst, line, n);
+  if (line[n - 1] != '\n') dst[n++] = '\n';
+  dst[n] = 0;
+  return true;
+}
+
+static bool ackStore(const char* line)
+{
+  if (!line || !line[0] || ackQn >= ACK_Q) return false;
+  char* dst = ackQ[(ackQHead + ackQn) % ACK_Q];
+  if (!ackCopyLine(dst, sizeof(ackQ[0]), line)) return false;
+  ackQn++;
+  return true;
+}
+
+// El parcial vive solo en txHold. Otro TX no puede intercalarse.
+// Si el hold está ocupado, la línea completa entra a la cola. El
+// spill guarda el más nuevo si la cola ya está llena; no se descarta.
 static void ackPush(const char* line)
 {
-  if (!line || !line[0]) return;
-  char tmp[192];
-  size_t n = strlen(line);
-  if (n >= sizeof(tmp)) return;
-  memcpy(tmp, line, n + 1);
-  if (n && tmp[n - 1] != '\n') {
-    if (n + 1 >= sizeof(tmp)) return;
-    tmp[n++] = '\n';
-    tmp[n] = 0;
-  }
-  if (!txHold.len && tcpLinkOk()) {
-    if (espTcpWriteAll(tcpClient, tmp, &n)) return;
-    if (!tcpClient.connected()) {
+  if (!line || !line[0] || !tcpLinkOk()) return;
+  if (!txHold.len && espTcpHoldPut(txHold, line)) {
+    if (!espTcpHoldFlush(tcpClient, txHold) && !tcpClient.connected())
       tcpNoteDead();
-      return;
-    }
-  }
-  if (!tcpLinkOk()) return;
-  if (ackQn >= ACK_Q) {
-    Serial.println("[TCP] ACK no enviado");
     return;
   }
-  char* dst = ackQ[(ackQHead + ackQn) % ACK_Q];
-  memcpy(dst, tmp, n + 1);
-  ackQn++;
+  if (ackStore(line)) return;
+  if (!ackSpillOn && ackCopyLine(ackSpill, sizeof(ackSpill), line)) {
+    ackSpillOn = true;
+    return;
+  }
+  Serial.println("[TCP] ACK no enviado");
 }
 
 static void tcpTxPump()
@@ -432,16 +453,39 @@ static void tcpTxPump()
     ackQHead = (ackQHead + 1) % ACK_Q;
     ackQn--;
   }
+  if (ackSpillOn && ackStore(ackSpill))
+    ackSpillOn = false;
 }
 
-static void plcSendAck(uint8_t cmdByte, bool ok, const char* message)
+static uint8_t ackDebt()
+{
+  uint8_t n = (uint8_t)(lineQn + valveJobCount + ackQn + (ackSpillOn ? 1 : 0));
+  if (vpPhase != VP_IDLE && (vpFlags & JOB_ACK) && vpAckByte)
+    n++;
+  return n;
+}
+
+static bool ackCanAcceptCommand()
+{
+  return (uint16_t)ackDebt() + 1 < ACK_Q;
+}
+
+static void plcSendAck(uint8_t cmdByte, bool ok, const char* message, uint16_t reqId)
 {
   char buf[192];
-  snprintf(buf, sizeof(buf),
-           "{\"ver\":%u,\"type\":\"ack\",\"actuator\":\"plc\",\"byte\":%u,"
-           "\"ok\":%s,\"message\":\"%s\"}\n",
-           (unsigned)PLCA_PROTO_VER, (unsigned)cmdByte,
-           ok ? "true" : "false", message ? message : "");
+  if (reqId) {
+    snprintf(buf, sizeof(buf),
+             "{\"ver\":%u,\"type\":\"ack\",\"actuator\":\"plc\",\"byte\":%u,"
+             "\"id\":%u,\"ok\":%s,\"message\":\"%s\"}\n",
+             (unsigned)PLCA_PROTO_VER, (unsigned)cmdByte, (unsigned)reqId,
+             ok ? "true" : "false", message ? message : "");
+  } else {
+    snprintf(buf, sizeof(buf),
+             "{\"ver\":%u,\"type\":\"ack\",\"actuator\":\"plc\",\"byte\":%u,"
+             "\"ok\":%s,\"message\":\"%s\"}\n",
+             (unsigned)PLCA_PROTO_VER, (unsigned)cmdByte,
+             ok ? "true" : "false", message ? message : "");
+  }
   ackPush(buf);
 }
 
@@ -488,21 +532,22 @@ static const char* plcTcpStateName(uint8_t byteCode)
   }
 }
 
-static void plcTcpTxState(uint8_t byteCode, const char* name)
+static bool plcTcpTxState(uint8_t byteCode, const char* name)
 {
   char buf[128];
   snprintf(buf, sizeof(buf),
            "{\"ver\":%u,\"type\":\"state\",\"actuator\":\"plc\",\"byte\":%u,\"name\":\"%s\"}",
            (unsigned)PLCA_PROTO_VER, (unsigned)byteCode, name);
-  tcpTx(buf);
+  if (!tcpTx(buf)) return false;
   plcTcpLastStateByte = byteCode;
+  return true;
 }
 
 static void plcTcpPushStateIfChanged()
 {
   const uint8_t st = plcTcpResolveStateByte();
   if (st == plcTcpLastStateByte) return;
-  plcTcpTxState(st, plcTcpStateName(st));
+  if (!plcTcpTxState(st, plcTcpStateName(st))) return;
   if (st == PLC_TX_RETURN)
     plcTcpStopPending = false;
 }
@@ -511,10 +556,8 @@ static void plcTcpPollStateEvents()
 {
   if (!tcpLinkOk()) return;
 
-  if (plcTcpNeedInit) {
-    plcTcpTxState(PLC_TX_INIT, "InitState");
+  if (plcTcpNeedInit && plcTcpTxState(PLC_TX_INIT, "InitState"))
     plcTcpNeedInit = false;
-  }
 
   plcTcpPushStateIfChanged();
 }
@@ -552,7 +595,7 @@ static bool tcpTxStatus(const char* type)
 }
 
 // on < 0: evento sin nivel. on 0/1: el mismo evento, con el nivel que cambió.
-static void plcTcpTxEvent(uint8_t byteCode, const char* name, int on = -1)
+static bool plcTcpTxEvent(uint8_t byteCode, const char* name, int on = -1)
 {
   char buf[192];
   if (on < 0) {
@@ -565,10 +608,10 @@ static void plcTcpTxEvent(uint8_t byteCode, const char* name, int on = -1)
              "\"name\":\"%s\",\"on\":%s}",
              (unsigned)PLCA_PROTO_VER, (unsigned)byteCode, name, on ? "true" : "false");
   }
-  tcpTx(buf);
+  return tcpTx(buf);
 }
 
-static void peerTxSensorBitEvents(uint8_t prev, uint8_t now)
+static bool peerTxSensorBitEvents(uint8_t prev, uint8_t now)
 {
   struct { uint8_t bit; uint8_t byteCode; const char* name; } map[] = {
     { BIT_GRIPPER, PLC_TX_GRIPPER_ERR, "GripperE" },
@@ -576,27 +619,32 @@ static void peerTxSensorBitEvents(uint8_t prev, uint8_t now)
     { BIT_CUTTER,  PLC_TX_CUTTER_ERR,  "CutterE" },
     { BIT_ENCODER, PLC_TX_ENCODER_ERR, "EncoderE" },
   };
+  bool ok = true;
   for (unsigned i = 0; i < sizeof(map) / sizeof(map[0]); i++)
   {
     const bool was = (prev & map[i].bit) != 0;
     const bool nowOn = (now & map[i].bit) != 0;
     if (was == nowOn) continue;
-    plcTcpTxEvent(map[i].byteCode, map[i].name, nowOn ? 1 : 0);
+    if (!plcTcpTxEvent(map[i].byteCode, map[i].name, nowOn ? 1 : 0))
+      ok = false;
   }
+  return ok;
 }
 
 static void peerTxValveIfChanged(bool& last, bool now, uint8_t byteCode, const char* name)
 {
   if (now == last) return;
+  if (!plcTcpTxEvent(byteCode, name, now ? 1 : 0)) return;
   last = now;
-  plcTcpTxEvent(byteCode, name, now ? 1 : 0);
 }
 
 static void peerTxEvents()
 {
   const uint8_t mask = currentStableMask();
-  if (lastPeerMask != 0xFF && mask != lastPeerMask)
-    peerTxSensorBitEvents(lastPeerMask, mask);
+  if (lastPeerMask != 0xFF && mask != lastPeerMask) {
+    if (!peerTxSensorBitEvents(lastPeerMask, mask))
+      return;
+  }
   if (mask != lastPeerMask)
     lastPeerMask = mask;
   peerTxValveIfChanged(lastPeerCutterR, stCutterR, PLC_CMD_CUTTER_R, "CutterR");
@@ -638,7 +686,7 @@ static void valveFinishJob()
   vpN = 0;
   vpFlags = 0;
   if ((flags & JOB_ACK) && ackByte)
-    plcSendAck(ackByte, true, "");
+    plcSendAck(ackByte, true, "", vpReqId);
   if (flags & (JOB_ACK | JOB_STATUS)) {
     peerTxEvents();
     plcTcpPushStateIfChanged();
@@ -656,6 +704,7 @@ static void valveStartNext()
     vpPins[i] = j.pins[i];
   vpAckByte = j.ackByte;
   vpFlags = j.flags;
+  vpReqId = j.reqId;
   const unsigned long now = millis();
   if (lastValvePulseEndMs != 0 && (now - lastValvePulseEndMs) < VALVE_PULSE_GAP_MS) {
     vpPhase = VP_GAP;
@@ -832,12 +881,12 @@ static bool plcTcpDoByte(uint8_t cmdByte, const char* line)
   if (ok)
     plcTcpStopPending = false;
   if (!ok) {
-    plcSendAck(cmdByte, false, err);
+    plcSendAck(cmdByte, false, err, tcpReqId);
     return false;
   }
   // El ACK del pulso sale al bajar el GPIO. Si no hubo pulso, se confirma ya.
   if (!deferred) {
-    plcSendAck(cmdByte, true, "");
+    plcSendAck(cmdByte, true, "", tcpReqId);
     peerTxEvents();
     plcTcpPushStateIfChanged();
   }
@@ -865,6 +914,7 @@ static void tcpHandleLine(const char* line)
 {
   if (!line || !line[0]) return;
   if (!strstr(line, "\"type\":\"command\"")) return;
+  tcpReqId = (uint16_t)jInt(line, "id", 0);
 
   const int rawByte = jInt(line, "byte", -1);
   if (rawByte > 0) {
@@ -874,7 +924,7 @@ static void tcpHandleLine(const char* line)
       return;
     }
     if (cmdByte >= PLC_TX_CUTTER_ERR && cmdByte <= PLC_TX_ENCODER_ERR) {
-      plcSendAck(cmdByte, false, "byte error es solo TX (0x1F-0x22)");
+      plcSendAck(cmdByte, false, "byte error es solo TX (0x1F-0x22)", tcpReqId);
       return;
     }
     if (cmdByte >= PLC_TX_INIT && cmdByte <= PLC_TX_RETURN) {
@@ -882,7 +932,7 @@ static void tcpHandleLine(const char* line)
       plcTcpTxState(st, plcTcpStateName(st));
       return;
     }
-    plcSendAck(cmdByte, false, "byte/cmd PLC desconocido");
+    plcSendAck(cmdByte, false, "byte/cmd PLC desconocido", tcpReqId);
     return;
   }
 
@@ -976,11 +1026,11 @@ static void tcpOnLine(const char* line)
   // Ping/poll se responden ya. Válvulas esperan a que el pulso anterior termine
   // para no encimar KEEP ni congelar el ACK.
   if (plcLineBlocks(line)) {
-    if (!lineEnqueue(line)) {
+    if (!ackCanAcceptCommand() || !lineEnqueue(line)) {
       Serial.println("[TCP] cola de comandos llena");
       const int b = jInt(line, "byte", -1);
       if (b > 0)
-        plcSendAck((uint8_t)b, false, "PLC ocupado");
+        plcSendAck((uint8_t)b, false, "PLC ocupado", (uint16_t)jInt(line, "id", 0));
     }
     return;
   }
@@ -1001,18 +1051,9 @@ static void tcpRxDrain()
 {
   while (tcpClient.available())
   {
-    char c = (char)tcpClient.read();
-    if (c == '\n' || c == '\r')
-    {
-      if (tcpRxLen)
-      {
-        tcpRxLine[tcpRxLen] = 0;
-        tcpOnLine(tcpRxLine);
-        tcpRxLen = 0;
-      }
-    }
-    else if (tcpRxLen < sizeof(tcpRxLine) - 1)
-      tcpRxLine[tcpRxLen++] = c;
+    if (!espRxLinePush(tcpRx, (char)tcpClient.read())) continue;
+    tcpOnLine(tcpRx.buf);
+    tcpRx.len = 0;
   }
 }
 
@@ -1020,7 +1061,7 @@ static void tcpOnClientAccepted()
 {
   tcpClient.setNoDelay(true);
   espTcpKeepAlive(tcpClient);
-  tcpRxLen = 0;
+  espRxLineReset(tcpRx);
   lastPeerMask = 0xFF;
   lastPeerCutterR = stCutterR;
   lastPeerCutterL = stCutterL;
@@ -1129,7 +1170,7 @@ static void tcpStopServices()
 {
   tcpNoteDead();
   tcpWasConnected = false;
-  tcpRxLen = 0;
+  espRxLineReset(tcpRx);
   if (!tcpServicesUp) return;
   tcpServer.end();
   tcpServicesUp = false;
@@ -1176,7 +1217,7 @@ static void serviceTcp()
     {
       Serial.println("[TCP] Off");
       tcpWasConnected = false;
-      tcpRxLen = 0;
+      espRxLineReset(tcpRx);
       valveDropPending();
     }
     if (tcpClient) tcpNoteDead();

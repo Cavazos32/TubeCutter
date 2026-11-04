@@ -107,7 +107,7 @@ static bool pollMotionOnce();
 static WiFiServer asdaTcpServer(MOTION_TCP_PORT);
 static WiFiClient asdaTcpClient;
 static char asdaTcpRxLine[384];
-static uint16_t asdaTcpRxLen = 0;
+static EspRxLine asdaTcpRx = {asdaTcpRxLine, sizeof(asdaTcpRxLine), 0, false};
 static bool asdaTcpServicesUp = false;
 static bool asdaTcpWasConnected = false;
 static volatile bool asdaTcpLinked = false;
@@ -3352,16 +3352,9 @@ static void asdaTcpOnLine(const char* line) {
 
 static void asdaTcpRxDrain() {
   while (asdaTcpClient.available()) {
-    char c = (char)asdaTcpClient.read();
-    if (c == '\n' || c == '\r') {
-      if (asdaTcpRxLen) {
-        asdaTcpRxLine[asdaTcpRxLen] = 0;
-        asdaTcpOnLine(asdaTcpRxLine);
-        asdaTcpRxLen = 0;
-      }
-    } else if (asdaTcpRxLen < sizeof(asdaTcpRxLine) - 1) {
-      asdaTcpRxLine[asdaTcpRxLen++] = c;
-    }
+    if (!espRxLinePush(asdaTcpRx, (char)asdaTcpClient.read())) continue;
+    asdaTcpOnLine(asdaTcpRx.buf);
+    asdaTcpRx.len = 0;
   }
 }
 
@@ -3369,7 +3362,7 @@ static void asdaTcpOnClientAccepted() {
   asdaTcpClient.setNoDelay(true);
   espTcpKeepAlive(asdaTcpClient);
   espTcpHoldClear(asdaHold);
-  asdaTcpRxLen = 0;
+  espRxLineReset(asdaTcpRx);
   asdaTcpNeedInit = true;
 #if MOT_IO_SENSOR_EVENTS
   motionTcpNotifyIoStatus = true;  // sync inicial laser/safety al HMI
@@ -3460,7 +3453,7 @@ static void asdaTcpEnsureServices() {
 static void asdaTcpStopServices() {
   asdaTcpNoteDead();
   asdaTcpWasConnected = false;
-  asdaTcpRxLen = 0;
+  espRxLineReset(asdaTcpRx);
   if (!asdaTcpServicesUp) return;
   asdaTcpServer.end();
   asdaTcpServicesUp = false;
@@ -3477,10 +3470,9 @@ static void motionTcpPollMeasureEvents() {
     if (motionExecGetMeasured(true, mmOff, mmSigned, settled, err)) {
       if (fabsf(mmOff - motionTcpLastPushMmR) < 0.05f && !settled) {
         motionTcpNotifyMeasureR = false;
-      } else {
+      } else if (motionTcpTxMeasured(ENC_CMD_MEASURE_R, true, mmOff, mmSigned, settled)) {
         motionTcpLastPushMmR = mmOff;
-        if (motionTcpTxMeasured(ENC_CMD_MEASURE_R, true, mmOff, mmSigned, settled))
-          motionTcpNotifyMeasureR = false;
+        motionTcpNotifyMeasureR = false;
       }
     }
   }
@@ -3491,10 +3483,9 @@ static void motionTcpPollMeasureEvents() {
     if (motionExecGetMeasured(false, mmOff, mmSigned, settled, err)) {
       if (fabsf(mmOff - motionTcpLastPushMmL) < 0.05f && !settled) {
         motionTcpNotifyMeasureL = false;
-      } else {
+      } else if (motionTcpTxMeasured(ENC_CMD_MEASURE_L, false, mmOff, mmSigned, settled)) {
         motionTcpLastPushMmL = mmOff;
-        if (motionTcpTxMeasured(ENC_CMD_MEASURE_L, false, mmOff, mmSigned, settled))
-          motionTcpNotifyMeasureL = false;
+        motionTcpNotifyMeasureL = false;
       }
     }
   }

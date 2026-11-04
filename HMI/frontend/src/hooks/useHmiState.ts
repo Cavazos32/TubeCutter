@@ -755,6 +755,12 @@ export function useHmiState() {
     }).catch(() => {});
   }, []);
 
+  const pfReadSensors = useCallback(() => {
+    api.prefeederAction('read_sensors').then((res) => {
+      if (res.ok === false && res.error) window.alert(res.error);
+    }).catch(() => {});
+  }, []);
+
   const pfTriggerL = useCallback(() => {
     api.prefeederAction('trigger_l').then((res) => {
       if (res.ok === false && res.error) window.alert(res.error);
@@ -937,6 +943,7 @@ export function useHmiState() {
     pfMaterialist,
     pfTriggerR,
     pfTriggerL,
+    pfReadSensors,
     pfRefill,
     andonSetOut,
     andonAllOff,

@@ -23,6 +23,33 @@ RX_JOIN_TIMEOUT_SEC = 1.0
 RX_BUF_MAX = 65536
 
 
+def take_rx_lines(buf: str, overflow: bool, limit: int = RX_BUF_MAX) -> tuple[str, bool, list[str]]:
+    """Parte frames por newline.
+
+    Un frame mayor que ``limit`` se descarta entero. El resto del buffer
+    sigue válido. No se interpreta una línea cortada.
+    """
+    lines: list[str] = []
+    while True:
+        nl = buf.find("\n")
+        if nl < 0:
+            if overflow or len(buf) > limit:
+                return "", True, lines
+            return buf, overflow, lines
+        raw = buf[:nl]
+        buf = buf[nl + 1 :]
+        if raw.endswith("\r"):
+            raw = raw[:-1]
+        if overflow:
+            overflow = False
+            continue
+        if len(raw) > limit:
+            continue
+        text = raw.strip()
+        if text:
+            lines.append(text)
+
+
 def enable_tcp_keepalive(sock: socket.socket) -> None:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     if sys.platform == "win32":
@@ -292,6 +319,7 @@ class ModuleTcpClient:
 
     def _rx_loop(self, session: int, sock: socket.socket) -> None:
         buf = ""
+        overflow = False
         while not self._stop_rx.is_set() and session == self._session:
             try:
                 chunk = sock.recv(4096)
@@ -301,15 +329,11 @@ class ModuleTcpClient:
                     break
                 self._last_rx_mono = time.monotonic()
                 buf += chunk.decode("utf-8", errors="replace")
-                if len(buf) > RX_BUF_MAX and "\n" not in buf:
-                    buf = ""
+                was_overflow = overflow
+                buf, overflow, lines = take_rx_lines(buf, overflow)
+                if overflow and not was_overflow:
                     self._emit_error("RX descartado: linea sin fin")
-                    continue
-                while "\n" in buf:
-                    line, buf = buf.split("\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
+                for line in lines:
                     try:
                         msg = json.loads(line)
                     except json.JSONDecodeError:

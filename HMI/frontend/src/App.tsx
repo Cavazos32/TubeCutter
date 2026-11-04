@@ -415,6 +415,7 @@ function AppMain() {
             onBusy={hmi.toggleCycleBusy}
             onTriggerR={hmi.pfTriggerR}
             onTriggerL={hmi.pfTriggerL}
+            onReadSensors={hmi.pfReadSensors}
             showLogs={logsVisible}
             logs={logsVisible ? hmi.filterLogs('PREFEEDER') : []}
             onClearLogs={() => hmi.clearLogs('prefeeder')}

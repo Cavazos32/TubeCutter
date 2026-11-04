@@ -396,6 +396,12 @@ class HmiState:
                 for _, items in PF_ERRORS
                 for label, b in items
             },
+            # Panel: solo se copia al pulsar Leer sensores. El ciclo usa "errors".
+            "sensor_view": {
+                str(b): {"label": label, "active": None}
+                for _, items in PF_ERRORS
+                for label, b in items
+            },
             # Fallo enclavado para opcodes timeout-gated (Buffer/Holgura/Tensión).
             "fault_active": {
                 str(b): False for b in _PF_EXXX_VIA_FAULT
@@ -492,6 +498,8 @@ class HmiState:
         # Tras OFF anticipado: no re-ON hasta confirmación del esclavo.
         self._pf_refill_ignore_on_until: dict[str, float] = {}
         self._pf_manual_prep_busy = False
+        self._pf_status_req_mono = 0.0
+        self._pf_sensor_read_pending = False
         self._pf_manual_prep_thread: threading.Thread | None = None
 
         self._error_policy = ErrorPolicy()
@@ -709,7 +717,10 @@ class HmiState:
                 "prefeeder": {
                     **self._pf,
                     "connected": self.pf_connected(),
-                    "errors": {k: dict(v) for k, v in self._pf["errors"].items()},
+                    "errors": {
+                        k: dict(v)
+                        for k, v in self._pf["sensor_view"].items()
+                    },
                     "bufferReady": self.pf_buffers_full_for_production()
                     and self.pf_is_ready(),
                     "manualPrepBusy": self._pf_manual_prep_busy,
@@ -1195,7 +1206,15 @@ class HmiState:
 
     def pf_request_status(self) -> bool:
         """Sondea Master (byte Idle): responde con status L/R + holgura."""
+        self._pf_status_req_mono = time.monotonic()
         return self._manual_pf(self._pf_client.cmd_status)
+
+    def pf_keepalive_status(self, min_interval_s: float = 1.0) -> None:
+        """Reintento lento si el push de status no llegó. No es un poll de 100 ms."""
+        now = time.monotonic()
+        if now - float(self._pf_status_req_mono) < float(min_interval_s):
+            return
+        self.pf_request_status()
 
     def pf_feed_sides(self) -> list[str]:
         mode = CycleConfig.normalize_feed_sides(self._cycle.get_config().feed_sides)
@@ -1235,7 +1254,7 @@ class HmiState:
             fresh = self.pf_status_seq() > seq0
             if fresh and all(self._pf_side_settled(side) for side in sides):
                 return True
-            self.pf_request_status()
+            self.pf_keepalive_status()
             time.sleep(0.1)
         _append_log(
             self._pf_log,
@@ -1778,7 +1797,7 @@ class HmiState:
             if cur is not None and cur == on:
                 return True
         watch = self._arm_cycle_plc_ack(byte_code)
-        ok = bool(send(on))
+        ok = bool(send(on, ack_id=watch or 0))
         if not ok:
             self._cancel_cycle_plc_ack(watch)
             return False
@@ -1805,7 +1824,7 @@ class HmiState:
         if cur_h is not None and cur_e is not None and cur_h == on and cur_e == on:
             return True
         watch = self._arm_cycle_plc_ack(CMD_HOLDER_ENCODER)
-        ok = bool(self._plc_client.cmd_holder_encoder(on))
+        ok = bool(self._plc_client.cmd_holder_encoder(on, ack_id=watch or 0))
         if not ok:
             self._cancel_cycle_plc_ack(watch)
             return False
@@ -1817,7 +1836,7 @@ class HmiState:
 
     def cmd_plc_gripper(self, on: bool) -> bool:
         watch = self._arm_cycle_plc_ack(CMD_GRIPPER)
-        ok = bool(self._plc_client.cmd_gripper(on))
+        ok = bool(self._plc_client.cmd_gripper(on, ack_id=watch or 0))
         if not ok:
             self._cancel_cycle_plc_ack(watch)
         return ok
@@ -1827,7 +1846,7 @@ class HmiState:
         with self._plc_ack_lock:
             return self._plc_ack_seq
 
-    def _plc_record_ack(self, byte_code: int, ok: bool) -> None:
+    def _plc_record_ack(self, byte_code: int, ok: bool, req_id: int = 0) -> None:
         with self._plc_ack_lock:
             self._plc_ack_seq += 1
             seq = self._plc_ack_seq
@@ -1838,7 +1857,7 @@ class HmiState:
             self._plc_ack_wait.notify_all()
         cycle = getattr(self, "_cycle", None)
         if cycle is not None:
-            cycle.on_plc_ack(int(byte_code), seq, bool(ok))
+            cycle.on_plc_ack(int(byte_code), seq, bool(ok), int(req_id or 0))
 
     def wait_plc_ack(
         self, byte_code: int, since_seq: int, timeout_s: float
@@ -1911,7 +1930,7 @@ class HmiState:
                 ):
                     return True
             watch = self._arm_cycle_plc_ack(CMD_CUTTERS)
-            ok = self._plc_client.cmd_set_out("CUTTERS", on)
+            ok = self._plc_client.cmd_set_out("CUTTERS", on, ack_id=watch or 0)
             if not ok:
                 self._cancel_cycle_plc_ack(watch)
                 return False
@@ -3139,6 +3158,16 @@ class HmiState:
             )
         if action == "start":
             return self._cmd_pf_operator_start()
+        if action == "read_sensors":
+            if not self.pf_connected():
+                return {"ok": False, "error": "Sin enlace con el alimentador"}
+            with self._lock:
+                self._pf_sensor_read_pending = True
+            if not self.pf_request_status():
+                with self._lock:
+                    self._pf_sensor_read_pending = False
+                return {"ok": False, "error": "No se pudo leer los sensores"}
+            return {"ok": True}
         handlers = {
             "stop": self._pf_client.cmd_stop,
             "reset": self._pf_client.cmd_reset,
@@ -3306,7 +3335,11 @@ class HmiState:
             and msg.get("actuator") == "plc"
         ):
             byte_code = int(msg.get("byte", 0) or 0)
-            self._plc_record_ack(byte_code, bool(msg.get("ok", True)))
+            self._plc_record_ack(
+                byte_code,
+                bool(msg.get("ok", True)),
+                int(msg.get("id") or 0),
+            )
             msg["_ack_recorded"] = True
         with self._lock:
             self._msg_queue.append((source, msg))
@@ -5090,6 +5123,13 @@ class HmiState:
                     and not self._pf_cached_has_fault()
                 ):
                     self._refresh_pf_status_from_state()
+                    changed = True
+                if self._pf_sensor_read_pending:
+                    self._pf["sensor_view"] = {
+                        k: {"label": v.get("label"), "active": v.get("active")}
+                        for k, v in self._pf["errors"].items()
+                    }
+                    self._pf_sensor_read_pending = False
                     changed = True
                 return changed
             if mtype == "state" and msg.get("actuator") == "prefeeder":

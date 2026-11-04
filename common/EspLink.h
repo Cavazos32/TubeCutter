@@ -183,3 +183,45 @@ inline bool espTcpHoldFlush(WiFiClient& client, EspTcpHold& h)
   if (!h.len) return true;
   return espTcpWriteAll(client, h.buf, &h.len);
 }
+
+// Línea RX con tope fijo. Si el frame no cabe, se descarta entero hasta el
+// delimitador. El siguiente frame se procesa. Una línea truncada no sale.
+struct EspRxLine {
+  char* buf;
+  uint16_t cap;
+  uint16_t len;
+  bool overflow;
+};
+
+inline void espRxLineReset(EspRxLine& rx)
+{
+  rx.len = 0;
+  rx.overflow = false;
+  if (rx.buf && rx.cap) rx.buf[0] = 0;
+}
+
+// true = línea completa y dentro del tope, terminada en NUL.
+// Tras consumirla el caller pone len = 0 (no borra overflow).
+inline bool espRxLinePush(EspRxLine& rx, char c)
+{
+  if (c == '\n' || c == '\r') {
+    if (rx.overflow) {
+      rx.overflow = false;
+      rx.len = 0;
+      if (rx.buf && rx.cap) rx.buf[0] = 0;
+      return false;
+    }
+    if (!rx.len) return false;
+    rx.buf[rx.len] = 0;
+    return true;
+  }
+  if (rx.overflow || !rx.buf || rx.cap < 2) return false;
+  if ((uint16_t)(rx.len + 1) >= rx.cap) {
+    rx.overflow = true;
+    rx.len = 0;
+    rx.buf[0] = 0;
+    return false;
+  }
+  rx.buf[rx.len++] = c;
+  return false;
+}

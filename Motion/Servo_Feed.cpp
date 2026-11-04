@@ -4,6 +4,7 @@
 #include "driver/twai.h"
 #include <Preferences.h>
 #include <math.h>
+#include <stdarg.h>
 #include <WebServer.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -99,20 +100,19 @@ static bool canTwaiReceive(uint32_t& idOut, uint8_t& lenOut, byte* dataOut, uint
   return true;
 }
 
-bool sendCANMessage(unsigned long id, byte len, byte* data, const String& desc, bool logSuccess)
+bool sendCANMessage(unsigned long id, byte len, byte* data, const char* desc, bool logSuccess, char sideTag = 0)
 {
   if (!canInitialized) return false;
   if (canMutex) xSemaphoreTake(canMutex, portMAX_DELAY);
   const bool ok = canTwaiTransmit((uint32_t)id, len, data);
   if (canMutex) xSemaphoreGive(canMutex);
-  if (!ok)
-  {
-    Serial.printf("CAN TX FAIL 0x%lX (%s)\n", id, desc.c_str());
-    return false;
+  if (!ok || logSuccess) {
+    if (sideTag)
+      Serial.printf("CAN TX %s 0x%lX (%s %c)\n", ok ? "OK" : "FAIL", id, desc ? desc : "", sideTag);
+    else
+      Serial.printf("CAN TX %s 0x%lX (%s)\n", ok ? "OK" : "FAIL", id, desc ? desc : "");
   }
-  if (logSuccess)
-    Serial.printf("CAN TX OK 0x%lX (%s)\n", id, desc.c_str());
-  return true;
+  return ok;
 }
 
 bool sendCanHaltImmediate(bool sideR)
@@ -296,16 +296,17 @@ void feedCanSetVelAcc(uint32_t velL, uint32_t velR);
 static void setupServoNodeCiA402(uint32_t canId, const char* label)
 {
   unsigned char data3[] = {0x2B, 0x40, 0x60, 0x00, 0x06, 0x00, 0x00, 0x00};
-  sendCANMessage(canId, 8, data3, String("Shutdown ") + label, false);
+  const char side = (label && label[0]) ? label[0] : 0;
+  sendCANMessage(canId, 8, data3, "Shutdown", false, side);
   delay(CAN_CIA402_STEP_DELAY_MS);
   unsigned char data4[] = {0x2B, 0x40, 0x60, 0x00, 0x07, 0x00, 0x00, 0x00};
-  sendCANMessage(canId, 8, data4, String("Switch On ") + label, false);
+  sendCANMessage(canId, 8, data4, "Switch On", false, side);
   delay(CAN_CIA402_STEP_DELAY_MS);
   unsigned char data5[] = {0x2B, 0x40, 0x60, 0x00, 0x0F, 0x00, 0x00, 0x00};
-  sendCANMessage(canId, 8, data5, String("Enable Op ") + label, false);
+  sendCANMessage(canId, 8, data5, "Enable Op", false, side);
   delay(CAN_CIA402_STEP_DELAY_MS);
   unsigned char data6[] = {0x2F, 0x60, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00};
-  sendCANMessage(canId, 8, data6, String("Mode PP ") + label, false);
+  sendCANMessage(canId, 8, data6, "Mode PP", false, side);
   delay(CAN_CIA402_STEP_DELAY_MS);
   {
     uint32_t maxPps = SERVO_MAX_PPS;
@@ -314,34 +315,35 @@ static void setupServoNodeCiA402(uint32_t canId, const char* label)
       (byte)(maxPps & 0xFF), (byte)((maxPps >> 8) & 0xFF),
       (byte)((maxPps >> 16) & 0xFF), (byte)((maxPps >> 24) & 0xFF)
     };
-    sendCANMessage(canId, 8, maxVel, String("MaxVel ") + label, false);
+    sendCANMessage(canId, 8, maxVel, "MaxVel", false, side);
   }
   delay(CAN_CIA402_SHORT_DELAY_MS);
   {
     byte haltOpt[8] = {0x2B, 0x5D, 0x60, 0x00, (byte)FEED_HALT_OPTION_CODE, 0x00, 0x00, 0x00};
-    sendCANMessage(canId, 8, haltOpt, String("HaltOpt ") + label, false);
+    sendCANMessage(canId, 8, haltOpt, "HaltOpt", false, side);
     uint32_t hd = FEED_HALT_DECEL_PP;
     byte qdec[8] = {
       0x23, 0x85, 0x60, 0x00,
       (byte)(hd & 0xFF), (byte)((hd >> 8) & 0xFF),
       (byte)((hd >> 16) & 0xFF), (byte)((hd >> 24) & 0xFF)
     };
-    sendCANMessage(canId, 8, qdec, String("QSDec ") + label, false);
+    sendCANMessage(canId, 8, qdec, "QSDec", false, side);
   }
   delay(CAN_CIA402_MED_DELAY_MS);
 }
 
 static void setupServoNodeHome(uint32_t canId, const char* label, uint32_t homePp)
 {
+  const char side = (label && label[0]) ? label[0] : 0;
   unsigned char data10[] = {
     0x23, 0x7A, 0x60, 0x00,
     (byte)(homePp & 0xFF), (byte)((homePp >> 8) & 0xFF),
     (byte)((homePp >> 16) & 0xFF), (byte)((homePp >> 24) & 0xFF)
   };
-  sendCANMessage(canId, 8, data10, String("Pos ") + label, false);
+  sendCANMessage(canId, 8, data10, "Pos", false, side);
   delay(CAN_CIA402_STEP_DELAY_MS);
   unsigned char data11[] = {0x2B, 0x40, 0x60, 0x00, 0x2F, 0x00, 0x00, 0x00};
-  sendCANMessage(canId, 8, data11, String("Reset SP ") + label, false);
+  sendCANMessage(canId, 8, data11, "Reset SP", false, side);
   delay(CAN_CIA402_STEP_DELAY_MS);
 }
 
@@ -417,18 +419,18 @@ void serviceCANRx()
   }
 }
 
-static void canWriteU32BothNodes(uint16_t index, uint32_t valL, uint32_t valR, const String& desc)
+static void canWriteU32BothNodes(uint16_t index, uint32_t valL, uint32_t valR, const char* desc)
 {
   byte dataL[8] = {
     0x23, (byte)(index & 0xFF), (byte)((index >> 8) & 0xFF), 0x00,
     (byte)(valL & 0xFF), (byte)((valL >> 8) & 0xFF), (byte)((valL >> 16) & 0xFF), (byte)((valL >> 24) & 0xFF)
   };
-  sendCANMessage(SERVO_CAN_TX_L, 8, dataL, desc + " L", false);
+  sendCANMessage(SERVO_CAN_TX_L, 8, dataL, desc, false, 'L');
   byte dataR[8] = {
     0x23, (byte)(index & 0xFF), (byte)((index >> 8) & 0xFF), 0x00,
     (byte)(valR & 0xFF), (byte)((valR >> 8) & 0xFF), (byte)((valR >> 16) & 0xFF), (byte)((valR >> 24) & 0xFF)
   };
-  sendCANMessage(SERVO_CAN_TX_R, 8, dataR, desc + " R", false);
+  sendCANMessage(SERVO_CAN_TX_R, 8, dataR, desc, false, 'R');
 }
 
 void canSetProfileVelocity(uint32_t valL, uint32_t valR) { canWriteU32BothNodes(SERVO_OD_PROFILE_VELOCITY, valL, valR, "Vel"); }
@@ -512,8 +514,8 @@ static void canControlWordSides(bool doL, bool doR, uint16_t cw, const char* des
     0x2B, 0x40, 0x60, 0x00,
     (byte)(cw & 0xFF), (byte)((cw >> 8) & 0xFF), 0x00, 0x00
   };
-  if (doL) sendCANMessage(SERVO_CAN_TX_L, 8, data, String(desc) + " L", false);
-  if (doR) sendCANMessage(SERVO_CAN_TX_R, 8, data, String(desc) + " R", false);
+  if (doL) sendCANMessage(SERVO_CAN_TX_L, 8, data, desc, false, 'L');
+  if (doR) sendCANMessage(SERVO_CAN_TX_R, 8, data, desc, false, 'R');
 }
 
 static void canWriteTargetAbs(bool doL, bool doR, int32_t absL, int32_t absR)
@@ -566,7 +568,7 @@ static void canWriteU32OneNode(bool sideR, uint16_t index, uint32_t val, const c
     (byte)(val & 0xFF), (byte)((val >> 8) & 0xFF),
     (byte)((val >> 16) & 0xFF), (byte)((val >> 24) & 0xFF)
   };
-  sendCANMessage(canId, 8, data, String(desc) + (sideR ? " R" : " L"), false);
+  sendCANMessage(canId, 8, data, desc, false, sideR ? 'R' : 'L');
 }
 
 static void feedCanSetVelAccSide(bool sideR, uint32_t velPp)
@@ -600,7 +602,7 @@ static void canWriteI8OneNode(bool sideR, uint16_t index, int8_t val, const char
     0x2F, (byte)(index & 0xFF), (byte)((index >> 8) & 0xFF), 0x00,
     (byte)val, 0x00, 0x00, 0x00
   };
-  sendCANMessage(canId, 8, data, String(desc) + (sideR ? " R" : " L"), false);
+  sendCANMessage(canId, 8, data, desc, false, sideR ? 'R' : 'L');
 }
 
 static void canWriteI32OneNode(bool sideR, uint16_t index, int32_t val, const char* desc)
@@ -2145,31 +2147,36 @@ void feedLoop()
   motionNestedServiceDepth--;
 }
 
+static void jCat(String& j, const char* fmt, ...)
+{
+  char b[1024];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(b, sizeof(b), fmt, ap);
+  va_end(ap);
+  j += b;
+}
+
 static void feedSideAppendJson(String& j, bool sideR)
 {
   const FeedSideRt& s = feedSideAt(sideR);
-  j += sideR ? ",\"R\":{" : ",\"L\":{";
-  j += "\"gen\":" + String((unsigned long)s.gen);
-  j += ",\"phase\":\""; j += feedSidePhaseName(s.phase); j += "\"";
-  j += ",\"active\":"; j += s.active ? "true" : "false";
-  j += ",\"pending\":"; j += s.pending ? "true" : "false";
-  j += ",\"targetMm\":" + String(s.targetMm, 1);
-  j += ",\"approachMm\":" + String(s.approachMm, 1);
-  j += ",\"approachOmMm\":" + String(s.approachOmMm, 2);
-  j += ",\"correctionMm\":" + String(s.correctionMm, 2);
-  j += ",\"finalOmMm\":" + String(s.finalOmMm, 2);
-  j += ",\"laser\":"; j += s.laserState ? "true" : "false";
-  j += ",\"correctionCount\":" + String((unsigned)s.correctionCount);
-  j += ",\"laserSeekDone\":"; j += s.laserSeekDone ? "true" : "false";
-  j += ",\"velocityStage\":\""; j += feedVelocityStageName(s.phase); j += "\"";
-  j += ",\"transitionMm\":" + String(s.velTransitionMm, 1);
-  j += ",\"omLiveMm\":" + String(s.omLiveMm, 2);
-  j += ",\"omAtTransition\":" + String(s.omAtTransition, 2);
-  j += ",\"omAtLaser\":" + String(s.omAtLaser, 2);
-  j += ",\"result\":\""; j += feedValResultName(s.result); j += "\"";
-  j += ",\"errByte\":" + String((unsigned)s.errByte);
-  j += ",\"fault\":\""; j += String(s.fault); j += "\"";
-  j += "}";
+  jCat(j,
+       "%s{\"gen\":%lu,\"phase\":\"%s\",\"active\":%s,\"pending\":%s,"
+       "\"targetMm\":%.1f,\"approachMm\":%.1f,\"approachOmMm\":%.2f,"
+       "\"correctionMm\":%.2f,\"finalOmMm\":%.2f,\"laser\":%s,"
+       "\"correctionCount\":%u,\"laserSeekDone\":%s,\"velocityStage\":\"%s\","
+       "\"transitionMm\":%.1f,\"omLiveMm\":%.2f,\"omAtTransition\":%.2f,"
+       "\"omAtLaser\":%.2f,\"result\":\"%s\",\"errByte\":%u,\"fault\":\"%s\"}",
+       sideR ? ",\"R\":" : ",\"L\":",
+       (unsigned long)s.gen, feedSidePhaseName(s.phase),
+       s.active ? "true" : "false", s.pending ? "true" : "false",
+       (double)s.targetMm, (double)s.approachMm, (double)s.approachOmMm,
+       (double)s.correctionMm, (double)s.finalOmMm,
+       s.laserState ? "true" : "false", (unsigned)s.correctionCount,
+       s.laserSeekDone ? "true" : "false", feedVelocityStageName(s.phase),
+       (double)s.velTransitionMm, (double)s.omLiveMm, (double)s.omAtTransition,
+       (double)s.omAtLaser, feedValResultName(s.result), (unsigned)s.errByte,
+       s.fault);
 }
 
 String feedStatusJson()
@@ -2180,33 +2187,32 @@ String feedStatusJson()
     motErrFormatUi(uiBuf, sizeof(uiBuf), (uint8_t)feedErrorCode);
   const char* exxx = feedErrorCode ? motErrExxx((uint8_t)feedErrorCode) : "";
 
-  String j = "{";
-  j += "\"canInitialized\":"; j += canInitialized ? "true" : "false";
-  j += ",\"canBitrateKbps\":"; j += CAN_BITRATE_KBPS;
-  j += ",\"servoCanReady\":"; j += servoCanReady ? "true" : "false";
-  j += ",\"canInitPending\":"; j += feedCanInitPending ? "true" : "false";
-  j += ",\"canInitBusy\":"; j += feedCanInitBusy ? "true" : "false";
-  j += ",\"feedActive\":"; j += feedPhaseIsActive() ? "true" : "false";
-  j += ",\"feedOk\":"; j += feedThisCycleSucceeded() ? "true" : "false";
-  j += ",\"fault\":\""; j += String(feedFaultReason); j += "\"";
-  j += ",\"errByte\":"; j += String((unsigned)feedErrorCode);
-  j += ",\"exxx\":\""; j += String(exxx); j += "\"";
-  j += ",\"ui\":\""; j += String(uiBuf); j += "\"";
-  j += ",\"omOfficial\":" + String(feedOmLastOfficialMm, 2);
-  j += ",\"targetMm\":" + String(FEED_TARGET_FIXED_MM, 1);
-  j += ",\"approachPct\":" + String(feedApproachPct, 1);
-  j += ",\"moveSpeedPct\":" + String(feedMoveSpeedPct, 1);
-  j += ",\"laserSeekMs\":" + String((unsigned long)feedLaserSeekMs);
-  j += ",\"feedMode\":\""; j += feedControlModeName(feedControlMode); j += "\"";
-  j += ",\"feedModeId\":" + String((unsigned)feedControlMode);
-  j += ",\"velocityFastPct\":" + String(feedVelFastPct, 0);
-  j += ",\"velocitySlowPct\":" + String(feedVelSlowPct, 0);
-  j += ",\"velocityTransitionPct\":" + String(feedVelTransitionPct, 0);
-  j += ",\"velocityMaxTravelMm\":" + String(feedVelMaxTravelMm, 1);
-  j += ",\"velocityTimeoutMs\":" + String((unsigned long)feedVelTimeoutMs);
-  j += ",\"targetMmL\":" + String(feedTargetMmL, 1);
-  j += ",\"targetMmR\":" + String(feedTargetMmR, 1);
-  j += ",\"skipEnc\":"; j += feedSkipEncoderConfirm ? "true" : "false";
+  static String j;
+  j.reserve(1400);
+  j.remove(0, j.length());
+  jCat(j,
+       "{\"canInitialized\":%s,\"canBitrateKbps\":%u,\"servoCanReady\":%s,"
+       "\"canInitPending\":%s,\"canInitBusy\":%s,\"feedActive\":%s,\"feedOk\":%s,"
+       "\"fault\":\"%s\",\"errByte\":%u,\"exxx\":\"%s\",\"ui\":\"%s\","
+       "\"omOfficial\":%.2f,\"targetMm\":%.1f,\"approachPct\":%.1f,"
+       "\"moveSpeedPct\":%.1f,\"laserSeekMs\":%lu,\"feedMode\":\"%s\","
+       "\"feedModeId\":%u,\"velocityFastPct\":%.0f,\"velocitySlowPct\":%.0f,"
+       "\"velocityTransitionPct\":%.0f,\"velocityMaxTravelMm\":%.1f,"
+       "\"velocityTimeoutMs\":%lu,\"targetMmL\":%.1f,\"targetMmR\":%.1f,"
+       "\"skipEnc\":%s",
+       canInitialized ? "true" : "false", (unsigned)CAN_BITRATE_KBPS,
+       servoCanReady ? "true" : "false",
+       feedCanInitPending ? "true" : "false", feedCanInitBusy ? "true" : "false",
+       feedPhaseIsActive() ? "true" : "false",
+       feedThisCycleSucceeded() ? "true" : "false",
+       feedFaultReason, (unsigned)feedErrorCode, exxx, uiBuf,
+       (double)feedOmLastOfficialMm, (double)FEED_TARGET_FIXED_MM,
+       (double)feedApproachPct, (double)feedMoveSpeedPct,
+       (unsigned long)feedLaserSeekMs, feedControlModeName(feedControlMode),
+       (unsigned)feedControlMode, (double)feedVelFastPct, (double)feedVelSlowPct,
+       (double)feedVelTransitionPct, (double)feedVelMaxTravelMm,
+       (unsigned long)feedVelTimeoutMs, (double)feedTargetMmL, (double)feedTargetMmR,
+       feedSkipEncoderConfirm ? "true" : "false");
   feedSideAppendJson(j, false);
   feedSideAppendJson(j, true);
   j += "}";

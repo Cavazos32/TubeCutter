@@ -84,11 +84,18 @@ class PlcClient(ModuleTcpClient):
     def cmd_byte(self, byte_code: int, **extra: Any) -> bool:
         return self.send_command(byte=byte_code, **extra)
 
-    def cmd_valve(self, byte_code: int, on: bool = True) -> bool:
-        return self.cmd_byte(byte_code, on=on)
+    def cmd_valve(self, byte_code: int, on: bool = True, ack_id: int = 0) -> bool:
+        extra: dict[str, Any] = {"on": on}
+        if ack_id:
+            extra["id"] = int(ack_id)
+        return self.cmd_byte(byte_code, **extra)
 
     def cmd_set_out(
-        self, out_name: str, on: bool = True, duration_sec: float | None = None
+        self,
+        out_name: str,
+        on: bool = True,
+        duration_sec: float | None = None,
+        ack_id: int = 0,
     ) -> bool:
         fields: dict[str, Any] = {
             "command": "setOut",
@@ -97,6 +104,8 @@ class PlcClient(ModuleTcpClient):
         }
         if on and duration_sec is not None:
             fields["durationSec"] = clamp_blower_sec(duration_sec)
+        if ack_id:
+            fields["id"] = int(ack_id)
         return self.send_command(**fields)
 
     def cmd_valve_by_byte(
@@ -104,32 +113,37 @@ class PlcClient(ModuleTcpClient):
         byte_code: int,
         on: bool = True,
         duration_sec: float | None = None,
+        ack_id: int = 0,
     ) -> bool:
         out_name = PLC_VALVE_OUT_NAMES.get(byte_code)
         if out_name:
-            return self.cmd_set_out(out_name, on, duration_sec=duration_sec)
+            return self.cmd_set_out(
+                out_name, on, duration_sec=duration_sec, ack_id=ack_id
+            )
         extra: dict[str, Any] = {"on": on}
         if on and duration_sec is not None:
             extra["durationSec"] = clamp_blower_sec(duration_sec)
+        if ack_id:
+            extra["id"] = int(ack_id)
         return self.cmd_byte(byte_code, **extra)
 
-    def cmd_cutter_r(self, on: bool = True) -> bool:
-        return self.cmd_valve(CMD_CUTTER_R, on)
+    def cmd_cutter_r(self, on: bool = True, ack_id: int = 0) -> bool:
+        return self.cmd_valve(CMD_CUTTER_R, on, ack_id=ack_id)
 
-    def cmd_cutter_l(self, on: bool = True) -> bool:
-        return self.cmd_valve(CMD_CUTTER_L, on)
+    def cmd_cutter_l(self, on: bool = True, ack_id: int = 0) -> bool:
+        return self.cmd_valve(CMD_CUTTER_L, on, ack_id=ack_id)
 
-    def cmd_gripper(self, on: bool = True) -> bool:
-        return self.cmd_valve(CMD_GRIPPER, on)
+    def cmd_gripper(self, on: bool = True, ack_id: int = 0) -> bool:
+        return self.cmd_valve(CMD_GRIPPER, on, ack_id=ack_id)
 
-    def cmd_holder(self, on: bool = True) -> bool:
-        return self.cmd_valve(CMD_HOLDER, on)
+    def cmd_holder(self, on: bool = True, ack_id: int = 0) -> bool:
+        return self.cmd_valve(CMD_HOLDER, on, ack_id=ack_id)
 
-    def cmd_encoder(self, on: bool = True) -> bool:
-        return self.cmd_valve(CMD_ENCODER, on)
+    def cmd_encoder(self, on: bool = True, ack_id: int = 0) -> bool:
+        return self.cmd_valve(CMD_ENCODER, on, ack_id=ack_id)
 
-    def cmd_holder_encoder(self, on: bool = True) -> bool:
-        return self.cmd_valve(CMD_HOLDER_ENCODER, on)
+    def cmd_holder_encoder(self, on: bool = True, ack_id: int = 0) -> bool:
+        return self.cmd_valve(CMD_HOLDER_ENCODER, on, ack_id=ack_id)
 
     def cmd_blower(self, on: bool = True, duration_sec: float | None = None) -> bool:
         return self.cmd_valve_by_byte(CMD_BLOWER, on, duration_sec=duration_sec)

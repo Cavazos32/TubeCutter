@@ -22,7 +22,7 @@ static const uint32_t CONNECT_TIMEOUT_MS = 2000;
 static const uint32_t HEARTBEAT_WARN_MS = 8000;
 static const uint32_t STALE_LINK_MS = 30000;
 static EspSta staLink;
-static char pfTcpHoldBuf[1600];
+static char pfTcpHoldBuf[2048];
 static EspTcpHold pfTcpHold = {pfTcpHoldBuf, sizeof(pfTcpHoldBuf), 0};
 static char pfHoldBufL[640];
 static char pfHoldBufR[640];
@@ -35,7 +35,15 @@ WebServer server(80);
 WiFiServer pfTcpServer(PF_MASTER_TCP_PORT);
 WiFiClient pfTcpClient;
 static char pfTcpRxLine[512];
-static uint16_t pfTcpRxLen = 0;
+static EspRxLine pfTcpRx = {pfTcpRxLine, sizeof(pfTcpRxLine), 0, false};
+static const uint8_t PF_ACK_Q = 4;
+static char pfAckQ[PF_ACK_Q][256];
+static char pfAckSpill[256];
+static bool pfAckSpillOn = false;
+static bool pfTcpRxHeld = false;
+static uint8_t pfAckHead = 0;
+static uint8_t pfAckN = 0;
+static bool pfTcpStatusDirty = false;
 static bool pfTcpServicesUp = false;
 static bool pfTcpWasConnected = false;
 static bool pfTcpNeedInit = true;
@@ -48,8 +56,8 @@ WiFiClient pfClientR;
 
 static char rxLineL[2048];
 static char rxLineR[2048];
-static uint16_t rxLenL = 0;
-static uint16_t rxLenR = 0;
+static EspRxLine rxSideL = {rxLineL, sizeof(rxLineL), 0, false};
+static EspRxLine rxSideR = {rxLineR, sizeof(rxLineR), 0, false};
 static uint32_t lastReconnectMsL = 0;
 static uint32_t lastReconnectMsR = 0;
 static uint32_t lastRxMsL = 0;
@@ -484,6 +492,7 @@ static void pfParseLine(const char* line, char defaultSide)
       if (!tag.length()) tag = jStr(line, "errorTag");
       next.tag = tag.length() ? tag : String(pfErrorTagFromWireCode(next.code));
       applyMasterErrorVar(next);
+      pfTcpStatusDirty = true;
       return;
     }
     parseSideEvent(line, s);
@@ -500,29 +509,18 @@ static void pfOnLine(const char* line, char defaultSide)
   pfParseLine(line, defaultSide);
 }
 
-static const uint16_t RX_LINE_MAX = 2047;
-
-static void pfRx(WiFiClient& client, char* rxLine, uint16_t& rxLen, char defaultSide)
+static void pfRx(WiFiClient& client, EspRxLine& rx, char defaultSide)
 {
   while (client.available())
   {
-    char c = client.read();
-    if (c == '\n' || c == '\r')
-    {
-      if (rxLen)
-      {
-        rxLine[rxLen] = 0;
-        pfOnLine(rxLine, defaultSide);
-        rxLen = 0;
-      }
-    }
-    else if (rxLen < RX_LINE_MAX)
-      rxLine[rxLen++] = c;
+    if (!espRxLinePush(rx, (char)client.read())) continue;
+    pfOnLine(rx.buf, defaultSide);
+    rx.len = 0;
   }
 }
 
 static void pfTryConnect(WiFiClient& client, const IPAddress& ip, uint32_t& lastReconnectMs,
-                         char* rxLine, uint16_t& rxLen, char sideTag,
+                         EspRxLine& rx, char sideTag,
                          uint32_t& connectMs, uint32_t& lastRxMs, uint8_t& failCount)
 {
   if (client.connected() || WiFi.status() != WL_CONNECTED) return;
@@ -543,8 +541,7 @@ static void pfTryConnect(WiFiClient& client, const IPAddress& ip, uint32_t& last
   {
     espTcpKeepAlive(client);
     espTcpHoldClear(pfHoldFor(client));
-    rxLen = 0;
-    rxLine[0] = 0;
+    espRxLineReset(rx);
     connectMs = millis();
     lastRxMs = 0;
     failCount = 0;
@@ -628,16 +625,16 @@ static void masterServiceWiFi()
 }
 
 static void pfServiceSide(WiFiClient& client, const IPAddress& ip, uint32_t& lastReconnectMs,
-                          char* rxLine, uint16_t& rxLen, char sideTag,
+                          EspRxLine& rx, char sideTag,
                           uint32_t& connectMs, uint32_t& lastRxMs, uint8_t& failCount)
 {
   if (client.connected())
   {
-    pfRx(client, rxLine, rxLen, sideTag);
+    pfRx(client, rx, sideTag);
     pfWatchLink(client, lastRxMs, connectMs, lastReconnectMs, sideTag);
     return;
   }
-  pfTryConnect(client, ip, lastReconnectMs, rxLine, rxLen, sideTag,
+  pfTryConnect(client, ip, lastReconnectMs, rx, sideTag,
                connectMs, lastRxMs, failCount);
   masterServiceHttp();
 }
@@ -672,12 +669,17 @@ static void appendSideJson(String& j, const char* key, const SideView& s)
   j += ",\"sensorsArmed\":"; j += s.sensorsArmed ? "true" : "false";
   j += ",\"triggerActive\":"; j += s.triggerActive ? "true" : "false";
   j += ",\"tfeedIncomplete\":"; j += s.tfeedIncomplete ? "true" : "false";
-  j += ",\"tfeedResumeSec\":"; j += String(s.tfeedResumeSec, 2);
+  j += ",\"tfeedResumeSec\":";
+  char num[16];
+  snprintf(num, sizeof(num), "%.2f", (double)s.tfeedResumeSec);
+  j += num;
   j += ",\"refillMaterial\":"; j += s.refillMaterial ? "true" : "false";
   j += ",\"refillDereeler\":"; j += s.refillDereeler ? "true" : "false";
   j += ",\"refillServo\":"; j += s.refillServo ? "true" : "false";
   j += ",\"refillFeeder\":"; j += s.refillFeeder ? "true" : "false";
-  j += ",\"refillPulseS\":"; j += String(s.refillPulseS, 1);
+  j += ",\"refillPulseS\":";
+  snprintf(num, sizeof(num), "%.1f", (double)s.refillPulseS);
+  j += num;
   j += ",\"machineState\":"; jsonAppendStr(j, s.machineState);
   j += ",\"error\":"; j += s.error ? "true" : "false";
   j += ",\"errorCode\":"; j += s.errorCode;
@@ -950,10 +952,20 @@ static bool pfTcpLinkOk()
   return pfTcpClient && pfTcpClient.connected();
 }
 
+static void pfAckReset()
+{
+  pfAckHead = 0;
+  pfAckN = 0;
+  pfAckSpillOn = false;
+  pfTcpRxHeld = false;
+}
+
 static void pfTcpNoteDead()
 {
   espTcpStop(pfTcpClient);
   espTcpHoldClear(pfTcpHold);
+  pfAckReset();
+  pfTcpStatusDirty = true;
 }
 
 static bool pfTcpTx(const String& m)
@@ -965,11 +977,59 @@ static bool pfTcpTx(const String& m)
   return false;
 }
 
+static bool pfAckCopy(char* dst, size_t cap, const char* line)
+{
+  if (!line || !line[0]) return false;
+  size_t n = strlen(line);
+  if (n + 2 >= cap) return false;
+  memcpy(dst, line, n);
+  if (line[n - 1] != '\n') dst[n++] = '\n';
+  dst[n] = 0;
+  return true;
+}
+
+static bool pfAckStore(const char* line)
+{
+  if (!line || !line[0] || pfAckN >= PF_ACK_Q) return false;
+  char* dst = pfAckQ[(pfAckHead + pfAckN) % PF_ACK_Q];
+  if (!pfAckCopy(dst, sizeof(pfAckQ[0]), line)) return false;
+  pfAckN++;
+  return true;
+}
+
+static bool pfAckPark(const char* line)
+{
+  if (pfAckStore(line)) return true;
+  if (pfAckSpillOn) return false;
+  if (!pfAckCopy(pfAckSpill, sizeof(pfAckSpill), line)) return false;
+  pfAckSpillOn = true;
+  return true;
+}
+
+static bool pfAckHasRoom()
+{
+  return pfAckN < PF_ACK_Q || !pfAckSpillOn;
+}
+
 static void pfTcpTxPump()
 {
-  if (!pfTcpLinkOk() || !pfTcpHold.len) return;
-  if (!espTcpHoldFlush(pfTcpClient, pfTcpHold) && !pfTcpClient.connected())
-    pfTcpNoteDead();
+  if (!pfTcpLinkOk()) return;
+  if (pfTcpHold.len && !espTcpHoldFlush(pfTcpClient, pfTcpHold)) {
+    if (!pfTcpClient.connected()) pfTcpNoteDead();
+    return;
+  }
+  while (pfAckN) {
+    char* slot = pfAckQ[pfAckHead];
+    size_t n = strlen(slot);
+    if (!espTcpWriteAll(pfTcpClient, slot, &n)) {
+      if (!pfTcpClient.connected()) pfTcpNoteDead();
+      return;
+    }
+    pfAckHead = (pfAckHead + 1) % PF_ACK_Q;
+    pfAckN--;
+  }
+  if (pfAckSpillOn && pfAckStore(pfAckSpill))
+    pfAckSpillOn = false;
 }
 
 static String pfTcpJsonEscape(const String& in)
@@ -986,17 +1046,18 @@ static String pfTcpJsonEscape(const String& in)
   return out;
 }
 
-static void pfTcpTxState(uint8_t byteCode, const char* name)
+static bool pfTcpTxState(uint8_t byteCode, const char* name)
 {
   char buf[128];
   snprintf(buf, sizeof(buf),
            "{\"ver\":%u,\"type\":\"state\",\"actuator\":\"prefeeder\",\"byte\":%u,\"name\":\"%s\"}",
            (unsigned)PF_MASTER_PROTO_VER, (unsigned)byteCode, name);
-  pfTcpTx(String(buf));
+  if (!pfTcpTx(String(buf))) return false;
   pfTcpLastStateByte = byteCode;
+  return true;
 }
 
-static void pfTcpTxEvent(uint8_t byteCode, const char* name, char side, bool active)
+static bool pfTcpTxEvent(uint8_t byteCode, const char* name, char side, bool active)
 {
   char buf[192];
   snprintf(buf, sizeof(buf),
@@ -1004,7 +1065,7 @@ static void pfTcpTxEvent(uint8_t byteCode, const char* name, char side, bool act
            "\"name\":\"%s\",\"side\":\"%c\",\"active\":%s}",
            (unsigned)PF_MASTER_PROTO_VER, (unsigned)byteCode, name, side,
            active ? "true" : "false");
-  pfTcpTx(String(buf));
+  return pfTcpTx(String(buf));
 }
 
 static bool pfSideBusy(const SideView& s)
@@ -1036,7 +1097,7 @@ static void pfTcpPushStateIfChanged()
 {
   const uint8_t st = pfTcpResolveStateByte();
   if (st == pfTcpLastStateByte) return;
-  pfTcpTxState(st, pfTcpStateName(st));
+  if (!pfTcpTxState(st, pfTcpStateName(st))) return;
   if (st == PF_ST_RETURN)
     pfTcpStopPending = false;
 }
@@ -1064,11 +1125,11 @@ static void pfTcpPushSideErrors(char side, SideView& s, bool* lastFlags, bool fo
   {
     const bool now = pfSideErrFlag(s, i);
     if (!force && now == lastFlags[i]) continue;
-    lastFlags[i] = now;
     const uint8_t errByte = (side == 'R')
                                 ? (uint8_t)(PF_ERR_BUFFER_FULL_R + i)
                                 : (uint8_t)(PF_ERR_BUFFER_FULL_L + i);
-    pfTcpTxEvent(errByte, pfTcpErrorName(errByte), side, now);
+    if (!pfTcpTxEvent(errByte, pfTcpErrorName(errByte), side, now)) continue;
+    lastFlags[i] = now;
   }
 }
 
@@ -1080,8 +1141,9 @@ static void pfTcpPushErrorEvents(bool force = false)
 
 static String pfTcpStatusJson()
 {
-  String j;
-  j.reserve(900);
+  static String j;
+  j.reserve(1800);
+  j.remove(0, j.length());
   j += "{\"ver\":";
   j += PF_MASTER_PROTO_VER;
   j += ",\"type\":\"status\",\"actuator\":\"prefeeder\",\"byte\":";
@@ -1119,7 +1181,8 @@ static void pfTcpPushFullSnapshot()
   // (fallo enclavado real) y puede descartar espejos viejos de sensor Buffer
   // antes de intentar Set al ver PF_ST_ERROR.
   pfTcpPushErrorEvents(true);
-  pfTcpTx(pfTcpStatusJson());
+  if (pfTcpTx(pfTcpStatusJson())) pfTcpStatusDirty = false;
+  else pfTcpStatusDirty = true;
   const uint8_t st = pfTcpResolveStateByte();
   pfTcpTxState(st, pfTcpStateName(st));
 }
@@ -1156,7 +1219,14 @@ static void pfTcpTxAck(uint8_t cmdByte, bool ok, const String& err)
            "\"ok\":%s,\"message\":\"%s\"}",
            (unsigned)PF_MASTER_PROTO_VER, (unsigned)cmdByte,
            ok ? "true" : "false", pfTcpJsonEscape(err).c_str());
-  pfTcpTx(String(buf));
+  if (pfTcpLinkOk()) {
+    if (!pfTcpHold.len && espTcpHoldPut(pfTcpHold, buf)) {
+      if (!espTcpHoldFlush(pfTcpClient, pfTcpHold) && !pfTcpClient.connected())
+        pfTcpNoteDead();
+    } else if (!pfAckPark(buf)) {
+      Serial.println("[MASTER] ACK no enviado");
+    }
+  }
   if (ok)
     pfTcpPushStateIfChanged();
 }
@@ -1314,9 +1384,7 @@ static void pfTcpOnLine(const char* line)
 
   const uint8_t cmdByte = pfTcpResolveCmdByte(line);
   if (!cmdByte) {
-    pfTcpTx(String("{\"ver\":") + PF_MASTER_PROTO_VER
-            + ",\"type\":\"ack\",\"actuator\":\"prefeeder\",\"ok\":false,"
-            "\"message\":\"Falta byte o command valido\"}");
+    pfTcpTxAck(0, false, "Falta byte o command valido");
     return;
   }
 
@@ -1325,27 +1393,22 @@ static void pfTcpOnLine(const char* line)
     return;
   }
 
-  pfTcpTx(String("{\"ver\":") + PF_MASTER_PROTO_VER
-          + ",\"type\":\"ack\",\"actuator\":\"prefeeder\",\"ok\":false,"
-          "\"message\":\"byte/cmd PreFeeder desconocido\"}");
+  pfTcpTxAck(0, false, "byte/cmd PreFeeder desconocido");
 }
 
 static void pfTcpRxDrain()
 {
-  while (pfTcpClient.available())
+  while (pfTcpClient.available() || pfTcpRxHeld)
   {
-    const char c = (char)pfTcpClient.read();
-    if (c == '\n' || c == '\r')
-    {
-      if (pfTcpRxLen)
-      {
-        pfTcpRxLine[pfTcpRxLen] = 0;
-        pfTcpOnLine(pfTcpRxLine);
-        pfTcpRxLen = 0;
-      }
+    if (!pfTcpRxHeld) {
+      if (!espRxLinePush(pfTcpRx, (char)pfTcpClient.read())) continue;
+      pfTcpRxHeld = true;
     }
-    else if (pfTcpRxLen < sizeof(pfTcpRxLine) - 1)
-      pfTcpRxLine[pfTcpRxLen++] = c;
+    // No consumir el comando si su ACK no tiene dónde quedar.
+    if (!pfAckHasRoom()) break;
+    pfTcpOnLine(pfTcpRx.buf);
+    pfTcpRx.len = 0;
+    pfTcpRxHeld = false;
   }
 }
 
@@ -1354,7 +1417,9 @@ static void pfTcpOnClientAccepted()
   pfTcpClient.setNoDelay(true);
   espTcpKeepAlive(pfTcpClient);
   espTcpHoldClear(pfTcpHold);
-  pfTcpRxLen = 0;
+  espRxLineReset(pfTcpRx);
+  pfTcpRxHeld = false;
+  pfAckSpillOn = false;
   pfTcpLastStateByte = 0;
   pfTcpNeedInit = true;
   pfTcpStopPending = false;
@@ -1407,7 +1472,7 @@ static void pfTcpStopServices()
 {
   pfTcpNoteDead();
   pfTcpWasConnected = false;
-  pfTcpRxLen = 0;
+  espRxLineReset(pfTcpRx);
   if (!pfTcpServicesUp) return;
   pfTcpServer.end();
   pfTcpServicesUp = false;
@@ -1418,13 +1483,13 @@ static void pfTcpPollStateEvents()
 {
   if (!pfTcpLinkOk()) return;
 
-  if (pfTcpNeedInit) {
-    pfTcpTxState(PF_ST_INIT, "InitState");
+  if (pfTcpNeedInit && pfTcpTxState(PF_ST_INIT, "InitState"))
     pfTcpNeedInit = false;
-  }
 
   pfTcpPushErrorEvents();
   pfTcpPushStateIfChanged();
+  if (pfTcpStatusDirty && pfTcpTx(pfTcpStatusJson()))
+    pfTcpStatusDirty = false;
 }
 
 static void masterServiceTcpHmi()
@@ -1446,7 +1511,7 @@ static void masterServiceTcpHmi()
     {
       Serial.println("[MASTER] TCP HMI desconectado");
       pfTcpWasConnected = false;
-      pfTcpRxLen = 0;
+      espRxLineReset(pfTcpRx);
     }
     if (pfTcpClient) pfTcpNoteDead();
     return;
@@ -1512,11 +1577,11 @@ void loop()
   masterLogWifiOnce();
   masterServiceTcpHmi();
 
-  pfServiceSide(pfClientL, PF_L_IP, lastReconnectMsL, rxLineL, rxLenL, 'L',
+  pfServiceSide(pfClientL, PF_L_IP, lastReconnectMsL, rxSideL, 'L',
                 connectMsL, lastRxMsL, failCountL);
   masterServiceHttp();
 
-  pfServiceSide(pfClientR, PF_R_IP, lastReconnectMsR, rxLineR, rxLenR, 'R',
+  pfServiceSide(pfClientR, PF_R_IP, lastReconnectMsR, rxSideR, 'R',
                 connectMsR, lastRxMsR, failCountR);
 
   masterServiceHttp();

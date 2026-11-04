@@ -9,7 +9,16 @@
 static WiFiServer tcpServer(ANDON_TCP_PORT);
 static WiFiClient tcpClient;
 static char tcpRxLine[384];
-static uint16_t tcpRxLen = 0;
+static EspRxLine tcpRx = {tcpRxLine, sizeof(tcpRxLine), 0, false};
+static const uint8_t ACK_Q = 4;
+static char ackQ[ACK_Q][192];
+static char ackSpill[192];
+static bool ackSpillOn = false;
+static bool tcpRxHeld = false;
+static uint8_t ackQHead = 0;
+static uint8_t ackQn = 0;
+static bool andonStatusDirty = false;
+static bool pressureEventPending = false;
 static bool tcpServicesUp = false;
 static bool tcpWasConnected = false;
 
@@ -78,9 +87,9 @@ void andonTowerAllOff()
   andonSetBuzzer(false);
 }
 
-static void andonTxStatus()
+static bool andonTxStatusNow()
 {
-  if (!tcpLinkOk()) return;
+  if (!tcpLinkOk()) return false;
   char buf[280];
   snprintf(buf, sizeof(buf),
            "{\"ver\":%u,\"type\":\"status\",\"actuator\":\"andon\","
@@ -95,7 +104,13 @@ static void andonTxStatus()
            buzzerMuted ? "true" : "false",
            (unsigned)lastMachineByte,
            pressureFaultLatched ? "true" : "false");
-  tcpTx(String(buf));
+  return tcpTx(String(buf));
+}
+
+static void andonTxStatus()
+{
+  if (andonTxStatusNow()) andonStatusDirty = false;
+  else andonStatusDirty = true;
 }
 
 static bool andonIsNaByte(uint8_t byteCode)
@@ -251,15 +266,20 @@ static void andonResumeAuto()
   andonApplyMachineByte(lastMachineByte);
 }
 
-void PressureError()
+static bool andonTxPressureNow()
 {
-  if (!tcpLinkOk()) return;
+  if (!tcpLinkOk()) return false;
   char buf[128];
   snprintf(buf, sizeof(buf),
            "{\"ver\":%u,\"type\":\"event\",\"actuator\":\"andon\","
            "\"byte\":%u,\"name\":\"PressureError\"}",
            (unsigned)ANDON_PROTO_VER, (unsigned)ANDON_ERR_PRESSURE);
-  tcpTx(String(buf));
+  return tcpTx(String(buf));
+}
+
+void PressureError()
+{
+  pressureEventPending = !andonTxPressureNow();
 }
 
 bool andonPressureFaultRaw()
@@ -301,10 +321,21 @@ static bool tcpLinkOk()
   return tcpClient && tcpClient.connected();
 }
 
+static void ackReset()
+{
+  ackQHead = 0;
+  ackQn = 0;
+  ackSpillOn = false;
+  tcpRxHeld = false;
+}
+
 static void tcpNoteDead()
 {
   espTcpStop(tcpClient);
   espTcpHoldClear(tcpHold);
+  ackReset();
+  andonStatusDirty = true;
+  if (pressureFaultLatched) pressureEventPending = true;
 }
 
 static bool tcpTx(const String& m)
@@ -316,11 +347,66 @@ static bool tcpTx(const String& m)
   return false;
 }
 
+static bool ackCopyLine(char* dst, size_t cap, const char* line)
+{
+  if (!line || !line[0]) return false;
+  size_t n = strlen(line);
+  if (n + 2 >= cap) return false;
+  memcpy(dst, line, n);
+  if (line[n - 1] != '\n') dst[n++] = '\n';
+  dst[n] = 0;
+  return true;
+}
+
+static bool ackStore(const char* line)
+{
+  if (!line || !line[0] || ackQn >= ACK_Q) return false;
+  char* dst = ackQ[(ackQHead + ackQn) % ACK_Q];
+  if (!ackCopyLine(dst, sizeof(ackQ[0]), line)) return false;
+  ackQn++;
+  return true;
+}
+
+static bool ackPark(const char* line)
+{
+  if (ackStore(line)) return true;
+  if (ackSpillOn) return false;
+  if (!ackCopyLine(ackSpill, sizeof(ackSpill), line)) return false;
+  ackSpillOn = true;
+  return true;
+}
+
+static bool ackHasRoom()
+{
+  return ackQn < ACK_Q || !ackSpillOn;
+}
+
 static void tcpTxPump()
 {
-  if (!tcpLinkOk() || !tcpHold.len) return;
-  if (!espTcpHoldFlush(tcpClient, tcpHold) && !tcpClient.connected())
-    tcpNoteDead();
+  if (!tcpLinkOk()) return;
+  if (tcpHold.len && !espTcpHoldFlush(tcpClient, tcpHold)) {
+    if (!tcpClient.connected()) tcpNoteDead();
+    return;
+  }
+  while (ackQn) {
+    char* slot = ackQ[ackQHead];
+    size_t n = strlen(slot);
+    if (!espTcpWriteAll(tcpClient, slot, &n)) {
+      if (!tcpClient.connected()) tcpNoteDead();
+      return;
+    }
+    ackQHead = (ackQHead + 1) % ACK_Q;
+    ackQn--;
+  }
+  if (ackSpillOn && ackStore(ackSpill))
+    ackSpillOn = false;
+  if (pressureEventPending) {
+    if (!andonTxPressureNow()) return;
+    pressureEventPending = false;
+  }
+  if (andonStatusDirty) {
+    if (andonTxStatusNow()) andonStatusDirty = false;
+  }
 }
 
 static int jInt(const char* j, const char* k, int d)
@@ -360,8 +446,15 @@ static void tcpAck(uint8_t byteCode, bool ok, const char* msg)
            "{\"ver\":%u,\"type\":\"ack\",\"actuator\":\"andon\",\"byte\":%u,"
            "\"ok\":%s,\"message\":\"%s\"}",
            (unsigned)ANDON_PROTO_VER, (unsigned)byteCode,
-           ok ? "true" : "false", msg);
-  tcpTx(String(buf));
+           ok ? "true" : "false", msg ? msg : "");
+  if (!tcpLinkOk()) return;
+  if (!tcpHold.len && espTcpHoldPut(tcpHold, buf)) {
+    if (!espTcpHoldFlush(tcpClient, tcpHold) && !tcpClient.connected())
+      tcpNoteDead();
+    return;
+  }
+  if (!ackPark(buf))
+    Serial.println("[TCP] ACK no enviado");
 }
 
 static void tcpOnLine(const char* line)
@@ -426,17 +519,15 @@ static void tcpOnLine(const char* line)
 
 static void tcpRxDrain()
 {
-  while (tcpClient.available()) {
-    char c = (char)tcpClient.read();
-    if (c == '\n' || c == '\r') {
-      if (tcpRxLen) {
-        tcpRxLine[tcpRxLen] = 0;
-        tcpOnLine(tcpRxLine);
-        tcpRxLen = 0;
-      }
-    } else if (tcpRxLen < sizeof(tcpRxLine) - 1) {
-      tcpRxLine[tcpRxLen++] = c;
+  while (tcpClient.available() || tcpRxHeld) {
+    if (!tcpRxHeld) {
+      if (!espRxLinePush(tcpRx, (char)tcpClient.read())) continue;
+      tcpRxHeld = true;
     }
+    if (!ackHasRoom()) break;
+    tcpOnLine(tcpRx.buf);
+    tcpRx.len = 0;
+    tcpRxHeld = false;
   }
 }
 
@@ -445,7 +536,9 @@ static void tcpOnClientAccepted()
   tcpClient.setNoDelay(true);
   espTcpKeepAlive(tcpClient);
   espTcpHoldClear(tcpHold);
-  tcpRxLen = 0;
+  espRxLineReset(tcpRx);
+  tcpRxHeld = false;
+  ackSpillOn = false;
   tcpTx(String("{\"ver\":") + ANDON_PROTO_VER + ",\"type\":\"hello\",\"role\":\"andon\"}");
   andonTxStatus();
   tcpWasConnected = true;
@@ -481,7 +574,7 @@ static void tcpStopServices()
 {
   tcpNoteDead();
   tcpWasConnected = false;
-  tcpRxLen = 0;
+  espRxLineReset(tcpRx);
   if (!tcpServicesUp) return;
   tcpServer.end();
   tcpServicesUp = false;
@@ -531,7 +624,7 @@ static void serviceTcp()
     if (tcpWasConnected) {
       Serial.println("[TCP] Off");
       tcpWasConnected = false;
-      tcpRxLen = 0;
+      espRxLineReset(tcpRx);
     }
     if (tcpClient) tcpNoteDead();
     return;
@@ -539,6 +632,7 @@ static void serviceTcp()
 
   tcpWasConnected = true;
   tcpRxDrain();
+  tcpTxPump();
 }
 
 void setup()

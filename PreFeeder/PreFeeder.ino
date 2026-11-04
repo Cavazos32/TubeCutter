@@ -912,7 +912,9 @@ static uint32_t peerLastStatusMs = 0;
 static bool peerLinkOk = false;
 static bool peerUp = false;
 static EspSta staLink;
-static char peerHoldBuf[1500];
+static char peerHoldBuf[2048];
+static char peerRxBuf[1200];
+static EspRxLine peerRx = {peerRxBuf, sizeof(peerRxBuf), 0, false};
 static EspTcpHold peerHold = {peerHoldBuf, sizeof(peerHoldBuf), 0};
 
 static String jStr(const char* j, const char* k) {
@@ -933,21 +935,25 @@ static int jInt(const char* j, const char* k, int d) {
 static void peerNoteDead() {
   espTcpStop(peerClient);
   espTcpHoldClear(peerHold);
+  espRxLineReset(peerRx);
   peerLinkOk = false;
 }
 
-static void peerTx(const String& m) {
+static bool peerTx(const String& m) {
   if (!peerClient.connected()) {
     if (peerClient) peerNoteDead();
-    return;
+    return false;
   }
   if (peerHold.len && !espTcpHoldFlush(peerClient, peerHold)) {
     if (!peerClient.connected()) peerNoteDead();
-    return;
+    return false;
   }
-  if (!m.length() || !espTcpHoldPut(peerHold, m.c_str())) return;
-  if (!espTcpHoldFlush(peerClient, peerHold) && !peerClient.connected())
+  if (!m.length() || !espTcpHoldPut(peerHold, m.c_str())) return false;
+  if (!espTcpHoldFlush(peerClient, peerHold) && !peerClient.connected()) {
     peerNoteDead();
+    return false;
+  }
+  return peerHold.len == 0 || peerClient.connected();
 }
 
 static void dispatchPeerJson(const String& line) {
@@ -996,8 +1002,9 @@ static void dispatchPeerJson(const String& line) {
 }
 
 static String buildPeerStatus(const MachineStatus& c, const SensorSnapshot& s) {
-  String j;
-  j.reserve(2000);
+  static String j;
+  j.reserve(1800);
+  j.remove(0, j.length());
   j += "{\"ver\":1,\"type\":\"status\",\"role\":\"";
   j += PF_ROLE;
   j += "\",\"side\":\"";
@@ -1030,9 +1037,12 @@ static String buildPeerStatus(const MachineStatus& c, const SensorSnapshot& s) {
   j += ",\"error\":";
   j += c.fault != FAULT_NONE ? "true" : "false";
   j += ",\"errorCode\":";
-  j += String(machineFaultWireCode());
+  char num[24];
+  snprintf(num, sizeof(num), "%u", (unsigned)machineFaultWireCode());
+  j += num;
   j += ",\"faultEpoch\":";
-  j += String(faultEpoch);
+  snprintf(num, sizeof(num), "%u", (unsigned)faultEpoch);
+  j += num;
   j += ",\"autoEnabled\":";
   j += c.autoEnabled ? "true" : "false";
   j += ",\"feederActive\":";
@@ -1042,13 +1052,17 @@ static String buildPeerStatus(const MachineStatus& c, const SensorSnapshot& s) {
   j += ",\"triggerActive\":";
   j += c.triggerActive ? "true" : "false";
   j += ",\"triggerMsLeft\":";
-  j += String(c.feederMsLeft);
+  snprintf(num, sizeof(num), "%lu", (unsigned long)c.feederMsLeft);
+  j += num;
   j += ",\"triggerFeedS\":";
-  j += String(P->triggerFeedS, 2);
+  snprintf(num, sizeof(num), "%.2f", (double)P->triggerFeedS);
+  j += num;
   j += ",\"autoRpm\":";
-  j += String(P->dereelerRpm, 1);
+  snprintf(num, sizeof(num), "%.1f", (double)P->dereelerRpm);
+  j += num;
   j += ",\"motor2Rpm\":";
-  j += String(P->feederRpm, 1);
+  snprintf(num, sizeof(num), "%.1f", (double)P->feederRpm);
+  j += num;
   j += ",\"refillMaterial\":";
   j += refillMat ? "true" : "false";
   j += ",\"refillDereeler\":";
@@ -1343,24 +1357,20 @@ void pfNetworkTick(uint32_t nowMs) {
   MachineStatus c = machineStatus();
   const SensorSnapshot& s = machineSensors();
   if (peerClient) {
-    static String line;
     while (peerClient.available()) {
-      char ch = (char)peerClient.read();
-      if (ch == '\n') {
-        if (line.length()) dispatchPeerJson(line);
-        line = "";
-      } else if (ch != '\r' && line.length() < 900)
-        line += ch;
+      if (!espRxLinePush(peerRx, (char)peerClient.read())) continue;
+      dispatchPeerJson(String(peerRx.buf));
+      peerRx.len = 0;
     }
     if (!peerClient.connected()) {
-      line = "";
       peerNoteDead();
     } else {
       uint32_t iv = (c.feederActive || c.bufferActive) ? PEER_STATUS_FAST_MS : PEER_STATUS_MS;
       if (peerStatusForce || nowMs - peerLastStatusMs >= iv) {
-        peerTx(buildPeerStatus(c, s));
-        peerLastStatusMs = nowMs;
-        peerStatusForce = false;
+        if (peerTx(buildPeerStatus(c, s))) {
+          peerLastStatusMs = nowMs;
+          peerStatusForce = false;
+        }
       }
     }
   }

@@ -102,6 +102,8 @@ PLC_ACK_WATCH_S = 1.0
 ACK_GHOST_MAX = 2
 MOTION_IDLE_NO_TARGET_S = 1.0
 PF_TFEED_DONE_TIMEOUT_S = 30.0
+# El Master empuja status al cambiar. Este intervalo solo recupera un push perdido.
+PF_STATUS_KEEPALIVE_S = 1.0
 PF_SETTLE_BEFORE_IDLE_S = 15.0
 PF_TFEED_CAPTURE_AFTER_PAUSE_S = 0.5
 # El ASDA cierra el HOME en ~0.4–0.6 mm. Con 0.5 mm esa parada lanzaba otro MOVE.
@@ -799,6 +801,26 @@ class _PlcAckPending:
         self.expired = False
 
 
+def plc_ack_match_index(queue, seq: int, req_id: int) -> int | None:
+    """Índice de la orden que cierra este ACK.
+
+    Con id, solo esa orden. Sin id, la más vieja del byte si el ACK es
+    posterior a ella. Un id desconocido no elige otra orden.
+    """
+    rid = int(req_id or 0)
+    if rid:
+        for i, item in enumerate(queue):
+            if int(item.id) == rid and not item.matched:
+                return i
+        return None
+    if not queue:
+        return None
+    head = queue[0]
+    if int(seq) <= int(head.since_seq):
+        return None
+    return 0
+
+
 class CycleRunner:
     """Ejecuta el flujo de CycleFlowCopy en un hilo (orquestación)."""
     def __init__(self, host: CycleHost) -> None:
@@ -918,15 +940,25 @@ class CycleRunner:
                 "stepByStep": self._step_by_step,
                 "refillActive": self._refill_mode and self._active,
                 "clearActive": self._clear_mode and self._active,
-                "refillAwaitingConfirm": self._refill_awaiting_confirm,
+                "refillAwaitingConfirm": bool(
+                    self._refill_awaiting_confirm
+                    and (self._refill_mode or self._clear_mode)
+                ),
                 # Prompt se mantiene durante feed/secuencia automática para que la UI no parpadee.
+                # Clear usa el mismo contrato de botones, con clearActive distinto.
                 "refillPrompt": (
                     self._refill_prompt
-                    if (self._refill_mode and self._active and self._refill_prompt)
+                    if (
+                        self._active
+                        and self._refill_prompt
+                        and (self._refill_mode or self._clear_mode)
+                    )
                     else ""
                 ),
                 "purgeHandsWarning": bool(
-                    self._purge_hands_warning and self._refill_mode and self._active
+                    self._purge_hands_warning
+                    and self._active
+                    and (self._refill_mode or self._clear_mode)
                 ),
                 "asdaMoveWarning": bool(
                     self._asda_move_warning and self._active
@@ -1025,7 +1057,7 @@ class CycleRunner:
         """
         if not self._active or self._post_lot_pf_settle:
             return False
-        if self._pause.is_set() or self._refill_mode:
+        if self._pause.is_set() or self._refill_mode or self._clear_mode:
             return False
         return True
 
@@ -1070,7 +1102,11 @@ class CycleRunner:
     def purge_hands_locked(self) -> bool:
         """True solo en la secuencia automática que avisa no meter las manos."""
         with self._lock:
-            return bool(self._purge_hands_warning and self._refill_mode and self._active)
+            return bool(
+                self._purge_hands_warning
+                and self._active
+                and (self._refill_mode or self._clear_mode)
+            )
 
     def cancel_unstarted_lot_purge(self) -> None:
         """Suelta una purga pedida que todavía no entró al cuerpo.
@@ -1078,7 +1114,7 @@ class CycleRunner:
         Reset debe poder restablecer el error aunque la purga no haya arrancado.
         """
         with self._lock:
-            if self._refill_mode and self._active:
+            if (self._refill_mode or self._clear_mode) and self._active:
                 return
             self._lot_purge_request = None
 
@@ -1355,7 +1391,7 @@ class CycleRunner:
         with self._lock:
             if self._recovery_prompt == "abort_decide" and self._recovery_awaiting:
                 return True
-            if self._refill_awaiting_confirm or self._refill_mode:
+            if self._refill_awaiting_confirm or self._refill_mode or self._clear_mode:
                 return False
             self._pending_lot_decision = True
             self._recovery_prompt = "abort_decide"
@@ -1555,7 +1591,7 @@ class CycleRunner:
                 self._progress = saved_progress
             self._suspend_piece_watch = False
         if status == "cancel":
-            self._host.cmd_plc_tools_safe()
+            self._plc_accepted(self._host.cmd_plc_tools_safe(), "Purga lote tools safe")
             self._host.cycle_log("Purga (lote) cancelada — lote en Pause")
         elif status != "ok":
             self._host.cycle_log("Purga (lote) incompleta — lote en Pause")
@@ -1672,7 +1708,10 @@ class CycleRunner:
                 self._host.cycle_log("Refill: operador confirmó")
         else:
             self._refill_reject.set()
-            self._host.cycle_log("Refill: operador canceló (ASDA permanece en park)")
+            if self._clear_mode:
+                self._host.cycle_log("Clear: operador canceló")
+            else:
+                self._host.cycle_log("Refill: operador canceló (ASDA permanece en park)")
         self._host.cycle_notify()
         return {"ok": True}
 
@@ -1727,7 +1766,6 @@ class CycleRunner:
             self._refill_prompt = "working"
             self._purge_hands_warning = True
             self._asda_move_warning = False
-            self._refill_mode = True
             self._clear_mode = True
             self._active = True
         self._host.defer_motion_boot_home_for_cycle()
@@ -1887,6 +1925,21 @@ class CycleRunner:
         """PreFeeder participa en el ciclo si hay enlace."""
         return self._host.pf_connected()
 
+    def _pf_pause_for_status(self, sleep_s: float) -> None:
+        """Duerme mirando la caché. El status nuevo llega por evento del Master."""
+        keepalive = getattr(self._host, "pf_keepalive_status", None)
+        if callable(keepalive):
+            keepalive(PF_STATUS_KEEPALIVE_S)
+        time.sleep(sleep_s)
+
+    def _plc_accepted(self, ok: bool, what: str) -> bool:
+        """False si la orden física no salió. No deja avanzar la secuencia."""
+        if ok or self._should_abort() or self._fault:
+            return bool(ok)
+        self._host.cycle_log(f"{what}: envío al PLC falló")
+        self._raise_fault("E066")
+        return False
+
     def _pf_idle_for_hold(self, reason: str) -> None:
         """Pause/Error/fin → In process OFF. El esclavo entra a Idle solo con
         buffer full ON y holgura ON (y el asentamiento ya cerrado). No usa Stop 0x2B.
@@ -1911,14 +1964,14 @@ class CycleRunner:
             return
         deadline = time.monotonic() + PF_TFEED_CAPTURE_AFTER_PAUSE_S
         seq0 = self._host.pf_status_seq()
+        self._host.pf_request_status()
         while time.monotonic() < deadline:
-            self._host.pf_request_status()
             for side in self._feed_side_list():
                 if self._host.pf_tfeed_incomplete(side):
                     self._pf_tfeed_resume[side] = self._host.pf_tfeed_resume_sec(side)
             if self._host.pf_status_seq() > seq0:
                 break
-            time.sleep(0.05)
+            self._pf_pause_for_status(0.05)
         if not self._pf_tfeed_resume:
             return
         parts: list[str] = []
@@ -1939,10 +1992,10 @@ class CycleRunner:
         if not sides:
             return True
         deadline = time.monotonic() + max(0.0, float(timeout_s))
+        self._host.pf_request_status()
         while time.monotonic() < deadline:
             if self._should_abort():
                 return False
-            self._host.pf_request_status()
             pending = [
                 s
                 for s in sides
@@ -1950,7 +2003,7 @@ class CycleRunner:
             ]
             if not pending:
                 return True
-            time.sleep(0.05)
+            self._pf_pause_for_status(0.05)
         self._host.cycle_log(
             f"PreFeeder: timeout {timeout_s:.1f}s fin Tfeed retry"
         )
@@ -2249,7 +2302,7 @@ class CycleRunner:
                 self._purge_hands_warning = False
         if status == "cancel":
             self._host.cycle_log("Recovery: purga cancelada — tools safe")
-            self._host.cmd_plc_tools_safe()
+            self._plc_accepted(self._host.cmd_plc_tools_safe(), "Recovery tools safe")
             self._host.cycle_notify()
             return False
         if status != "ok":
@@ -2988,23 +3041,42 @@ class CycleRunner:
         if timer is not None:
             timer.cancel()
 
-    def on_plc_ack(self, byte_code: int, seq: int, ok: bool) -> None:
-        """Cierra solo la orden más vieja de ese byte. Un ACK tardío no valida la siguiente."""
+    def on_plc_ack(
+        self, byte_code: int, seq: int, ok: bool, req_id: int = 0
+    ) -> None:
+        """Cierra la orden con ese id. Sin id, solo la más vieja de ese byte."""
         fault_label: str | None = None
         timer: threading.Timer | None = None
         with self._ack_lock:
-            queue = self._ack_q.get(int(byte_code))
-            if not queue:
-                return
-            head = queue[0]
-            if int(seq) <= head.since_seq:
-                return
-            queue.pop(0)
-            self._ack_by_id.pop(head.id, None)
-            head.matched = True
-            timer = head.timer
-            if not head.expired and not ok:
-                fault_label = head.label
+            rid = int(req_id or 0)
+            if rid:
+                pending = self._ack_by_id.get(rid)
+                if pending is None or pending.matched:
+                    return
+                if int(byte_code) and pending.byte != int(byte_code):
+                    return
+                queue = self._ack_q.get(pending.byte, [])
+                self._ack_q[pending.byte] = [
+                    item for item in queue if item.id != pending.id
+                ]
+                self._ack_by_id.pop(pending.id, None)
+                pending.matched = True
+                timer = pending.timer
+                if not pending.expired and not ok:
+                    fault_label = pending.label
+            else:
+                queue = self._ack_q.get(int(byte_code))
+                if not queue:
+                    return
+                idx = plc_ack_match_index(queue, seq, 0)
+                if idx is None:
+                    return
+                head = queue.pop(idx)
+                self._ack_by_id.pop(head.id, None)
+                head.matched = True
+                timer = head.timer
+                if not head.expired and not ok:
+                    fault_label = head.label
         if timer is not None:
             timer.cancel()
         if fault_label:
@@ -3516,8 +3588,7 @@ class CycleRunner:
                 else:
                     self._raise_fault("prefeeder_all_ok")
                 return False
-            self._host.pf_request_status()
-            time.sleep(0.1)
+            self._pf_pause_for_status(0.1)
 
     def _ensure_pf_buffer_full_after_resume(
         self, reason: str = "Resume", *, force: bool = False
@@ -3609,9 +3680,7 @@ class CycleRunner:
                     f"PreFeeder: sigue rellenando antes de Idle · {why_txt}"
                 )
                 next_log_at = time.monotonic() + log_interval
-            # Status fresco; RX async.
-            self._host.pf_request_status()
-            time.sleep(0.1)
+            self._pf_pause_for_status(0.1)
 
     def _run_lineal_abs(self, abs_target_mm: float) -> bool:
         """Lineal producción: CMD_MOVE (0x05) + Reached por TCP ASDA.
@@ -4163,12 +4232,20 @@ class CycleRunner:
         """
         cut_sides = CycleConfig.normalize_feed_sides(cfg.feed_sides)
         self._host.cycle_log(f"Cortador ON (Set) lados={cut_sides}")
-        self._host.cmd_plc_cutters(True, sides=cut_sides, force=True)
+        if not self._plc_accepted(
+            self._host.cmd_plc_cutters(True, sides=cut_sides, force=True),
+            "Purga cortador ON",
+        ):
+            return False
         self._mark_cutter_set()
         if self._pausable_delay(cycle_delay_ms("wait_cutter_pulse")):
             self._host.cmd_plc_cutters(False, sides=cut_sides, force=True)
             return False
-        self._host.cmd_plc_cutters(False, sides=cut_sides, force=True)
+        if not self._plc_accepted(
+            self._host.cmd_plc_cutters(False, sides=cut_sides, force=True),
+            "Purga cortador OFF",
+        ):
+            return False
         self._mark_cutter_res()
         self._host.cycle_log(f"Cortador OFF (Res) lados={cut_sides}")
         if self._pausable_delay(CUTTER_POST_MS):
@@ -4200,7 +4277,8 @@ class CycleRunner:
                 return False
 
             self._host.cycle_log("Purga: pinzas CIERRAN")
-            self._host.cmd_plc_gripper(True)
+            if not self._plc_accepted(self._host.cmd_plc_gripper(True), "Purga pinzas ON"):
+                return False
             if self._pausable_delay(GRIPPERS_ON_MS):
                 return False
 
@@ -4234,7 +4312,8 @@ class CycleRunner:
             if self._pausable_delay(DWELL_AT_DEST_MS):
                 return False
             self._host.cycle_log("Purga: pinzas ABREN")
-            self._host.cmd_plc_gripper(False)
+            if not self._plc_accepted(self._host.cmd_plc_gripper(False), "Purga pinzas OFF"):
+                return False
             if self._pausable_delay(GRIPPER_RELEASE_MS):
                 return False
 
@@ -4260,7 +4339,7 @@ class CycleRunner:
         self._host.cycle_log(
             "Refill cancelado — ASDA permanece en park; tools safe"
         )
-        self._host.cmd_plc_tools_safe()
+        self._plc_accepted(self._host.cmd_plc_tools_safe(), "Refill cancel tools safe")
         self._finish(False, soft_cancel=True)
 
     def _purge_feed_until_laser(self) -> bool:
@@ -4295,7 +4374,8 @@ class CycleRunner:
         self._host.cycle_log(
             f"Refill: tools safe + ASDA → {asda_mm:g} mm (área libre)"
         )
-        self._host.cmd_plc_tools_safe()
+        if not self._plc_accepted(self._host.cmd_plc_tools_safe(), "Refill tools safe"):
+            return "fail"
         if self._should_abort():
             return "fail"
         if self._host.motion_busy():
@@ -4337,7 +4417,8 @@ class CycleRunner:
             self._progress = 20
 
         self._host.cycle_log("Refill: Holder+Encoder ON")
-        self._arm_holder_encoder()
+        if not self._plc_accepted(self._arm_holder_encoder(), "Refill Holder+Encoder"):
+            return "fail"
         time.sleep(max(0, HOLDER_ON_MS) / 1000.0)
         if self._should_abort():
             return "fail"
@@ -4471,7 +4552,8 @@ class CycleRunner:
         owned_materialist = False
         cfg = self.get_config()
         target = abs(float(cfg.deposit_max_travel_mm)) or 1500.0
-        self._host.cmd_plc_tools_safe()
+        if not self._plc_accepted(self._host.cmd_plc_tools_safe(), "Clear tools safe"):
+            return "fail", False
         if self._should_abort():
             return "cancel", False
         if self._host.motion_busy():
@@ -4536,7 +4618,6 @@ class CycleRunner:
     def _run_clear(self, rpm: float) -> None:
         with self._lock:
             self._active = True
-            self._refill_mode = True
             self._clear_mode = True
             self._refill_prompt = "working"
             self._purge_hands_warning = True
@@ -4754,7 +4835,7 @@ class CycleRunner:
                     if self._host.pf_is_ready():
                         ready = True
                         break
-                    time.sleep(0.1)
+                    self._pf_pause_for_status(0.1)
                 if not ready:
                     if self._host.pf_has_fault():
                         self._raise_current_pf_fault(
@@ -5409,23 +5490,27 @@ class CycleRunner:
         # Stop/error/recovery no tocan PLC. Fin de lote OK: tools safe + holder/enc.
         # Abort/Stop: dejar válvulas como estén (All Off / Reset PLC manual).
         if not (self._aborted or self._stop.is_set() or self._fault):
-            self._host.cmd_plc_tools_safe()
-            if not soft_cancel:
-                self._arm_holder_encoder()
-            self._host.cycle_log(
-                "Finish: Holder/Encoder cerrados; cutters/grippers OFF"
-                if not refill
-                else (
-                    "Refill cancelado: tools safe"
-                    if soft_cancel
-                    else "Refill finish: Holder/Encoder ON; cutters/grippers OFF"
+            tools_ok = self._host.cmd_plc_tools_safe()
+            arm_ok = True if soft_cancel else self._arm_holder_encoder()
+            if not tools_ok or not arm_ok:
+                self._host.cycle_log("Finish: envío de seguro o Holder/Encoder falló")
+                self._raise_fault("E066")
+            else:
+                self._host.cycle_log(
+                    "Finish: Holder/Encoder cerrados; cutters/grippers OFF"
+                    if not refill
+                    else (
+                        "Refill cancelado: tools safe"
+                        if soft_cancel
+                        else "Refill finish: Holder/Encoder ON; cutters/grippers OFF"
+                    )
                 )
-            )
         # Fin de lote OK + PF: CT/UI ya cerrados; relleno post-lote fuera de CT.
         post_lot_pf = (
             ok
             and not soft_cancel
             and not refill
+            and not clear
             and self._use_prefeeder()
             and not (self._aborted or self._stop.is_set())
         )
@@ -5439,7 +5524,7 @@ class CycleRunner:
         # aquí: enclava PF-007; Stop de operador / error ya mandaron 0x2B.
         # Purga y Clear ya terminaron su secuencia: no quedarse en Busy
         # esperando el relleno del alimentador.
-        manual_routine = self._refill_mode
+        manual_routine = refill or clear
         # No cortar en seco un lote: esperar Buffer Full + holgura (+ M2 idle).
         if self._use_prefeeder() and not (self._aborted or self._stop.is_set()):
             if ok and not manual_routine:

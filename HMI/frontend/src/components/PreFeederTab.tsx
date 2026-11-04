@@ -5,6 +5,7 @@ import {
   RotateCcw,
   Layers,
   Activity,
+  ScanLine,
 } from 'lucide-react';
 import { PreFeederState, LogEntry, PreFeederSensor } from '../types';
 import { LogTerminal } from './LogTerminal';
@@ -37,6 +38,7 @@ interface PreFeederTabProps {
   onBusy?: () => void;
   onTriggerR: () => void;
   onTriggerL: () => void;
+  onReadSensors: () => void;
   showLogs?: boolean;
   logs: LogEntry[];
   onClearLogs: () => void;
@@ -50,6 +52,7 @@ export const PreFeederTab: React.FC<PreFeederTabProps> = ({
   onStop,
   onReset,
   onBusy,
+  onReadSensors,
   showLogs = true,
   logs,
   onClearLogs,
@@ -214,6 +217,17 @@ export const PreFeederTab: React.FC<PreFeederTabProps> = ({
           <span>{t('btn_busy_cycle')}</span>
         </button>
       </div>
+
+      <button
+        id="btn-read-pf-sensors"
+        type="button"
+        onClick={onReadSensors}
+        disabled={!connected}
+        className={hmiModuleBtnSecondary}
+      >
+        <ScanLine className={hmiModuleIconBtn} />
+        <span>{t('btn_read_sensors')}</span>
+      </button>
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
         <div className={`${hmiPanelCls} ${hmiPanelPadding}`}>
