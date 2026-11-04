@@ -126,13 +126,18 @@ export function isPurgeBusy(
   cycle:
     | Pick<
         BackendSnapshot['cycle'],
-        'refillActive' | 'refillPrompt' | 'purgeHandsWarning' | 'asdaMoveWarning'
+        | 'refillActive'
+        | 'clearActive'
+        | 'refillPrompt'
+        | 'purgeHandsWarning'
+        | 'asdaMoveWarning'
       >
     | undefined
 ): boolean {
   return (
     !!cycle &&
     (!!cycle.refillActive ||
+      !!cycle.clearActive ||
       !!cycle.refillPrompt ||
       !!cycle.purgeHandsWarning ||
       !!cycle.asdaMoveWarning)

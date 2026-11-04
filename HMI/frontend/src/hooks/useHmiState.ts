@@ -492,6 +492,14 @@ export function useHmiState() {
 
   const startRefill = useCallback(async (opts?: { mm?: number; asdaMm?: number }) => {
     try {
+      const c = snapRef.current?.cycle;
+      if (c?.refillActive && c.refillAwaitingConfirm) {
+        const res = await api.confirmCycleRefill(false);
+        if (res && res.ok === false && res.error) {
+          window.alert(res.error);
+        }
+        return;
+      }
       const res = await api.startCycleRefill(opts);
       if (res && res.ok === false && res.error) {
         window.alert(res.error);

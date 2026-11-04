@@ -233,10 +233,12 @@ export const CycleTab: React.FC<CycleTabProps> = ({
           ? machineState.refillPrompt ||
             (machineState.refillActive ? 'working' : '')
           : '');
+  const manualPurgeOrClear =
+    !!machineState.refillActive || !!machineState.clearActive;
   const showManualRefill =
     !machineState.recoveryAfterError &&
     !machineState.e050Lot &&
-    !!machineState.refillActive &&
+    manualPurgeOrClear &&
     !!machineState.refillPrompt &&
     !!onRefillConfirm;
   const skipCut = !!machineState.refillSkipCut;

@@ -893,6 +893,8 @@ class CycleRunner:
         self._resume_need_buffer_full = False
         # Tras última pieza OK: PF sigue rellenando; CT/UI ya cerrados.
         self._post_lot_pf_settle = False
+        # Lote productivo ya cerrado; fallos PF post-lote no invalidan lastOk.
+        self._lot_productively_complete = False
         self._lot_rpm = 1200.0
         self._lot_length_mm: float = 0.0
         # Batches que caben en carrera por tray (None = sin tope). Lleno → vaciar.
@@ -939,6 +941,7 @@ class CycleRunner:
                 ),
                 "stepByStep": self._step_by_step,
                 "refillActive": self._refill_mode and self._active,
+                "refillSkipCut": bool(self._refill_mode or self._clear_mode),
                 "clearActive": self._clear_mode and self._active,
                 "refillAwaitingConfirm": bool(
                     self._refill_awaiting_confirm
@@ -1235,6 +1238,7 @@ class CycleRunner:
         self._pf_tfeed_resume = {}
         self._resume_need_buffer_full = False
         self._post_lot_pf_settle = False
+        self._lot_productively_complete = False
         with self._lock:
             self._refill_mode = False
             self._clear_mode = False
@@ -1816,6 +1820,8 @@ class CycleRunner:
         self._refill_prompt = ""
         self._purge_hands_warning = False
         self._asda_move_warning = False
+        self._post_lot_pf_settle = False
+        self._lot_productively_complete = False
         self._refill_confirm.clear()
         self._refill_reject.clear()
         self._refill_retry.clear()
@@ -2437,7 +2443,9 @@ class CycleRunner:
         """Enter the unified ERROR hold; error/recovery do not select recovery."""
         self._fault = ui
         self._recovery = recovery
-        self._recovery_after_error = self.is_active()
+        with self._lock:
+            post_lot = self._post_lot_pf_settle or self._lot_productively_complete
+        self._recovery_after_error = self.is_active() and not post_lot
         self._resume_need_buffer_full = False
         self._pause.set()
         with self._lock:
@@ -2917,6 +2925,7 @@ class CycleRunner:
         """UI/lote cerrado; PreFeeder puede seguir hasta buffer+holgura OK."""
         with self._lock:
             self._post_lot_pf_settle = True
+            self._lot_productively_complete = True
             # Producción terminada: no reportar active=True mientras solo
             # esperamos settled del PF (evita HMI en PRODUCIENDO con 4/4).
             self._active = False
@@ -3634,7 +3643,7 @@ class CycleRunner:
         holg = self._host.pf_holgura_present(side)
         if full is not True:
             return False, f"{side}:buffer≠Full"
-        if holg is False:
+        if holg is not True:
             return False, f"{side}:holgura≠OK"
         if filling is True:
             return False, f"{side}:rellenando"
@@ -3655,7 +3664,11 @@ class CycleRunner:
         next_log_at = time.monotonic() + log_interval
         last_why = ""
         while True:
-            if self._aborted or self._stop.is_set():
+            if self._aborted or self._stop.is_set() or self._fault:
+                if self._fault:
+                    self._host.cycle_log(
+                        "PreFeeder: settle post-lote abortado — fallo en máquina"
+                    )
                 return
             reasons: list[str] = []
             all_ok = True
@@ -4189,6 +4202,8 @@ class CycleRunner:
         with self._lock:
             self._refill_prompt = prompt
             self._refill_awaiting_confirm = True
+            # Operador elige Alimentar/Continuar: quitar banner de manos.
+            self._purge_hands_warning = False
         self._refill_confirm.clear()
         self._refill_reject.clear()
         self._refill_retry.clear()
@@ -4225,42 +4240,9 @@ class CycleRunner:
             self._host.cycle_notify()
 
     # Secuencias auxiliares de purga y refill.
-    def _run_purge_cut(self, cfg: CycleConfig) -> bool:
-        """Corte en purga (misma secuencia que ciclo normal, sin holder ni drenaje PLC).
-
-        False = abort. Res de emergencia si abort tras Set.
-        """
-        cut_sides = CycleConfig.normalize_feed_sides(cfg.feed_sides)
-        self._host.cycle_log(f"Cortador ON (Set) lados={cut_sides}")
-        if not self._plc_accepted(
-            self._host.cmd_plc_cutters(True, sides=cut_sides, force=True),
-            "Purga cortador ON",
-        ):
-            return False
-        self._mark_cutter_set()
-        if self._pausable_delay(cycle_delay_ms("wait_cutter_pulse")):
-            self._host.cmd_plc_cutters(False, sides=cut_sides, force=True)
-            return False
-        if not self._plc_accepted(
-            self._host.cmd_plc_cutters(False, sides=cut_sides, force=True),
-            "Purga cortador OFF",
-        ):
-            return False
-        self._mark_cutter_res()
-        self._host.cycle_log(f"Cortador OFF (Res) lados={cut_sides}")
-        if self._pausable_delay(CUTTER_POST_MS):
-            return False
-        if self._ensure_cutter_settled_before_travel():
-            return False
-        return True
-
     def _run_purge_auto_sequence(self, rpm: float, cfg: CycleConfig) -> bool:
-        """Secuencia automática tras la 2.ª confirmación CONTINUAR PURGA.
-
-        Tras cerrar pinzas: corte (pulso + post + asiento) y luego ASDA al depósito.
-        """
-        saved_lineal_sec = self._last_lineal_sec
-        saved_lineal_mm = self._last_lineal_mm
+        """Tras Continuar purga: aviso de manos → ASDA a 0 → tools safe (sin corte)."""
+        _ = cfg  # lados de feed ya aplicados en alimentación a láser
         try:
             with self._lock:
                 self._refill_prompt = "working"
@@ -4272,56 +4254,11 @@ class CycleRunner:
             if not self._wait_duration_s(PURGE_WARNING_LEAD_S):
                 return False
 
-            self._host.cycle_log("Purga: ASDA → 0")
+            self._host.cycle_log("Purga: ASDA → 0 (sin corte)")
             if not self._ensure_asda_at_zero(reason="purga"):
                 return False
-
-            self._host.cycle_log("Purga: pinzas CIERRAN")
-            if not self._plc_accepted(self._host.cmd_plc_gripper(True), "Purga pinzas ON"):
-                return False
-            if self._pausable_delay(GRIPPERS_ON_MS):
-                return False
-
-            if not self._run_purge_cut(cfg):
-                return False
-
-            dep_mm = self._deposit_extra_mm(1)
-            self._host.clear_motion_wait_flags()
-            self._host.cycle_log(
-                f"Purga: ASDA → depósito batch 1 ({dep_mm:g} mm)"
-            )
-            if not self._host.cmd_motion_move_mm(dep_mm, rpm):
-                if not self._should_abort() and not self._fault:
-                    kind = ""
-                    if hasattr(self._host, "last_move_fail_kind"):
-                        kind = self._host.last_move_fail_kind()
-                    if kind == "transport":
-                        self._raise_fault("E065")
-                    else:
-                        self._raise_fault("deposit_cmd")
-                return False
-            if (
-                not self._wait_motion(
-                    target_mm=dep_mm,
-                    reissue=lambda: self._host.cmd_motion_move_mm(dep_mm, rpm),
-                )
-                or self._should_abort()
-            ):
-                return False
-
-            if self._pausable_delay(DWELL_AT_DEST_MS):
-                return False
-            self._host.cycle_log("Purga: pinzas ABREN")
-            if not self._plc_accepted(self._host.cmd_plc_gripper(False), "Purga pinzas OFF"):
-                return False
-            if self._pausable_delay(GRIPPER_RELEASE_MS):
-                return False
-
-            self._last_lineal_sec = 0.0
-            self._last_lineal_mm = 0.0
-            self._host.cycle_log("Purga: soplador + ASDA → 0 (WIP delivery)")
-            if not self._home_with_wip_delivery(
-                abs(dep_mm), rpm, prefetch_running=False
+            if not self._plc_accepted(
+                self._host.cmd_plc_tools_safe(), "Purga tools safe"
             ):
                 return False
             return True
@@ -4329,8 +4266,6 @@ class CycleRunner:
             with self._lock:
                 self._purge_hands_warning = False
             self._host.cycle_notify()
-            self._last_lineal_sec = saved_lineal_sec
-            self._last_lineal_mm = saved_lineal_mm
 
     def _refill_cancel_park(self) -> None:
         if self._aborted or self._stop.is_set():
@@ -4529,7 +4464,9 @@ class CycleRunner:
     def _feed_feeders_for(self, sec: float) -> bool:
         with self._lock:
             self._refill_prompt = "working"
-            self._purge_hands_warning = True
+            # Clear: solo feeders en depósito; el aviso de manos no debe tapar botones.
+            if not self._clear_mode:
+                self._purge_hands_warning = True
         self._host.cycle_notify()
         if not self._hold_feeders(True):
             self._hold_feeders(False)
@@ -5554,12 +5491,14 @@ class CycleRunner:
             pieces_done = int(self._pieces_done)
             cycle_qty = int(self._total_reps)
             lot_fault = str(self._fault or "")
+            lot_complete = self._lot_productively_complete
             self._started_at = None
             self._active = False
             self._refill_mode = False
             self._clear_mode = False
-            self._last_ok = ok
-            if ok:
+            self._last_ok = True if lot_complete else ok
+            self._lot_productively_complete = False
+            if ok or lot_complete:
                 self._rep = self._total_reps
                 self._pieces_done = self._total_reps
                 self._progress = 100
@@ -5572,7 +5511,7 @@ class CycleRunner:
                     int(min(100, round(100.0 * self._pieces_done / total))),
                 )
         analysis_end_lot(
-            ok=ok and not soft_cancel,
+            ok=(ok or lot_complete) and not soft_cancel,
             ct_sec=elapsed,
             pieces_done=pieces_done,
             cycle_qty=max(1, cycle_qty),

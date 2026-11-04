@@ -1130,6 +1130,8 @@ class HmiState:
             return None
         with self._lock:
             info = (self._pf.get("sides") or {}).get(side_u) or {}
+            if info.get("latchedError") and int(info.get("errorWireId") or 0) == 6:
+                return False
             val = info.get("holguraOn")
             if val is None:
                 return None
@@ -1226,7 +1228,7 @@ class HmiState:
         """Lado listo para salir de en proceso: Full, holgura OK, sin relleno ni Tfeed."""
         if self.pf_buffer_full(side) is not True:
             return False
-        if self.pf_holgura_present(side) is False:
+        if self.pf_holgura_present(side) is not True:
             return False
         if self.pf_auto_filling(side) is True:
             return False

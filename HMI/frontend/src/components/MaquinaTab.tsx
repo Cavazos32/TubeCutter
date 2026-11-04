@@ -413,10 +413,12 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
     showRecoveryTrack;
   const showMachineResetCoach = showErrorProcess && processStep === 'reset';
   const showMachineResumeCoach = showErrorProcess && processStep === 'resume';
+  const manualPurgeOrClear =
+    !!machineState.refillActive || !!machineState.clearActive;
   const showManualRefill =
     !machineState.recoveryAfterError &&
     !machineState.e050Lot &&
-    !!machineState.refillActive &&
+    manualPurgeOrClear &&
     !!machineState.refillPrompt &&
     !!onRefillConfirm;
   const showRecoveryActions =
