@@ -52,6 +52,22 @@ APP_CONFIG_JSON_KEYS: tuple[str, ...] = (
 # Marcador visual en cycle.json (ignorado al cargar app/ciclo).
 CYCLE_JSON_SECTION_SEPARATOR_KEY = "--- cycle ---"
 
+# Esperas editadas en cycle.json, en el orden de los pasos del HMI.
+# El texto se escribe como comentario junto a la clave.
+CYCLE_JSON_HMI_WAIT_NOTES: tuple[tuple[str, str], ...] = (
+    ("holderOnMs", "2 Espera: sujetador"),
+    ("grippersOnMs", "7 Espera: pinzas cerradas"),
+    ("holderOpenMs", "10 Espera: tubo liberado"),
+    ("linearDoneMs", "12 Espera antes del corte"),
+    ("holderPrecutMs", "14 Espera: listo para cortar"),
+    ("cutterPulseMs", "16 Tiempo de corte"),
+    ("cutterPostMs", "18 Espera tras el corte"),
+    ("cutterSettleMs", "19 Asentamiento mínimo del cortador"),
+    ("dwellAtDestMs", "21 Espera en depósito"),
+    ("gripperReleaseMs", "23 Espera: pinzas abiertas"),
+    ("asentarMs", "27 Espera: material asentado"),
+)
+
 # Valores iniciales (se sobrescriben al cargar config/cycle.json).
 HOLDER_ON_MS = 25
 HOLDER_PRECUT_MS = 20
@@ -86,6 +102,8 @@ def cycle_delay_ms(step_key: str) -> int:
 
 PURGE_WARNING_LEAD_S = 0.3
 CLEAR_FEED_S = 5.0
+# Despeje de Limpiar hacia la charola. No usa depositMaxTravelMm (tope del tray).
+CLEAR_ASDA_MM = 400.0
 WIP_BLOWER_START_DELAY_S = 0.050
 WIP_BLOWER_MIN_TRAVEL_MM = 1.0
 WIP_START_CACHE_TOL_MM = 5.0
@@ -517,11 +535,86 @@ class CycleConfig:
         return out
 
 
+def _strip_json_line_comments(text: str) -> str:
+    """Quita comentarios // que están fuera de cadenas."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_str = False
+    escape = False
+    while i < n:
+        ch = text[i]
+        if in_str:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "/":
+            i += 2
+            while i < n and text[i] not in "\r\n":
+                i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _cycle_json_line_comments(path: Path) -> dict[str, str]:
+    """Comentario // de cada clave. Los pasos del HMI tienen nombre por defecto."""
+    notes = {key: label for key, label in CYCLE_JSON_HMI_WAIT_NOTES}
+    if not path.is_file():
+        return notes
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return notes
+    for line in text.splitlines():
+        code, sep, comment = line.partition("//")
+        if not sep:
+            continue
+        key_at = code.find('"')
+        if key_at < 0:
+            continue
+        key_end = code.find('"', key_at + 1)
+        if key_end < 0 or ":" not in code[key_end:]:
+            continue
+        label = comment.strip()
+        if label:
+            notes[code[key_at + 1 : key_end]] = label
+    return notes
+
+
+def _format_cycle_json(doc: dict[str, Any], comments: dict[str, str]) -> str:
+    lines = ["{"]
+    items = list(doc.items())
+    last = len(items) - 1
+    for i, (key, val) in enumerate(items):
+        comma = "" if i == last else ","
+        line = f"  {json.dumps(key, ensure_ascii=False)}: {json.dumps(val, ensure_ascii=False)}{comma}"
+        note = comments.get(key)
+        if note:
+            line += f" // {note}"
+        lines.append(line)
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
 def _read_cycle_json(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {}
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        text = _strip_json_line_comments(path.read_text(encoding="utf-8"))
+        raw = json.loads(text)
     except (json.JSONDecodeError, OSError, TypeError, ValueError):
         return {}
     return raw if isinstance(raw, dict) else {}
@@ -540,9 +633,11 @@ def merge_cycle_json_document(
         if key in app:
             out[key] = app[key]
     out[CYCLE_JSON_SECTION_SEPARATOR_KEY] = None
-    for key in sorted(_cycle_json_cycle_keys()):
-        if key in cycle:
-            out[key] = cycle[key]
+    present = {key for key in _cycle_json_cycle_keys() if key in cycle}
+    wait_first = [key for key, _label in CYCLE_JSON_HMI_WAIT_NOTES if key in present]
+    rest = sorted(present.difference(wait_first))
+    for key in (*wait_first, *rest):
+        out[key] = cycle[key]
     return out
 
 
@@ -650,14 +745,12 @@ def load_cycle_config(path: Path = CONFIG_PATH) -> CycleConfig:
 
 
 def save_cycle_config(cfg: CycleConfig, path: Path = CONFIG_PATH) -> None:
+    comments = _cycle_json_line_comments(path)
     raw = migrate_legacy_config_files(path)
     app = {k: raw[k] for k in APP_CONFIG_JSON_KEYS if k in raw}
     doc = merge_cycle_json_document(app, cfg.to_dict())
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(doc, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+    path.write_text(_format_cycle_json(doc, comments), encoding="utf-8")
 
 
 def save_app_config_section(
@@ -671,12 +764,10 @@ def save_app_config_section(
         cycle = {k: raw[k] for k in cycle_keys if k in raw}
     if not cycle:
         cycle = CycleConfig().to_dict()
+    comments = _cycle_json_line_comments(path)
     doc = merge_cycle_json_document(app, cycle)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(doc, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+    path.write_text(_format_cycle_json(doc, comments), encoding="utf-8")
 
 
 def read_app_config_section(path: Path = CONFIG_PATH) -> dict[str, Any]:
@@ -1085,7 +1176,9 @@ class CycleRunner:
             return bool(self._clear_mode and self._active)
 
     def _purge_busy_locked(self) -> bool:
-        """True mientras dura cualquier fase de la rutina de purga (lock ya tomado)."""
+        """True mientras dura la purga. Limpiar es otra rutina."""
+        if self._clear_mode and self._active:
+            return False
         if self._lot_purge_request is not None:
             return True
         if self._purge_hands_warning:
@@ -1736,8 +1829,13 @@ class CycleRunner:
         self._host.cycle_notify()
         return {"ok": True}
 
+    def _clear_asda_target_mm(self) -> float:
+        cap = abs(float(self.get_config().deposit_max_travel_mm)) or CLEAR_ASDA_MM
+        travel = abs(float(CLEAR_ASDA_MM)) or cap
+        return min(travel, cap)
+
     def request_clear(self, rpm: float) -> dict[str, Any]:
-        """ASDA al máximo, feeders 5 s, luego Retry (otros 5 s) o Continuar (ASDA a 0)."""
+        """ASDA al despeje, feeders 5 s, luego Retry (otros 5 s) o Continuar (ASDA a 0)."""
         with self._lock:
             if self._purge_busy_locked():
                 return {"ok": False, "error": "Purga ya en curso"}
@@ -1770,7 +1868,7 @@ class CycleRunner:
             self._active = True
         self._host.defer_motion_boot_home_for_cycle()
         self._set_state(TX_BUSY)
-        target = abs(float(self.get_config().deposit_max_travel_mm)) or 1500.0
+        target = self._clear_asda_target_mm()
         self._host.cycle_log(
             f"Clear — ASDA→{target:g} mm · feeders {CLEAR_FEED_S:g} s · "
             f"Retry o Continuar"
@@ -4272,14 +4370,33 @@ class CycleRunner:
             if not self._wait_duration_s(PURGE_WARNING_LEAD_S):
                 return False
 
-            self._host.cycle_log("Purga: ASDA → 0")
-            if not self._ensure_asda_at_zero(reason="purga"):
-                return False
-
+            # Igual que la pieza: pinzas cierran, holder abre, el eje se lleva
+            # el tubo, holder cierra y corta. Si el eje va a 0 con pinzas
+            # abiertas, la pieza se queda.
             self._host.cycle_log("Purga: pinzas CIERRAN")
             if not self._plc_accepted(self._host.cmd_plc_gripper(True), "Purga pinzas ON"):
                 return False
             if self._pausable_delay(GRIPPERS_ON_MS):
+                return False
+
+            self._host.cycle_log("Purga: Holder+Encoder OFF")
+            if not self._plc_accepted(
+                self._open_holder_encoder(), "Purga Holder+Encoder OFF"
+            ):
+                return False
+            if self._pausable_delay(HOLDER_OPEN_MS):
+                return False
+
+            self._host.cycle_log("Purga: ASDA → 0")
+            if not self._ensure_asda_at_zero(reason="purga"):
+                return False
+
+            self._host.cycle_log("Purga: Holder+Encoder ON")
+            if not self._plc_accepted(
+                self._arm_holder_encoder(), "Purga Holder+Encoder ON"
+            ):
+                return False
+            if self._pausable_delay(HOLDER_PRECUT_MS):
                 return False
 
             if not self._run_purge_cut(cfg):
@@ -4515,25 +4632,31 @@ class CycleRunner:
                 )
                 self._finish(False)
 
-    def _hold_feeders(self, on: bool) -> bool:
-        ok = True
-        for side in self._feed_side_list():
-            res = self._host.cmd_pf_refill(side, "feeder", on, hold=True)
-            if not res.get("ok"):
-                ok = False
-                self._host.cycle_log(
-                    f"Clear: feeder {side} {'ON' if on else 'OFF'} rechazado"
-                )
-        return ok
-
     def _feed_feeders_for(self, sec: float) -> bool:
+        """Alimenta con el feeder de Motion (el mismo del ciclo) durante sec."""
         with self._lock:
             self._refill_prompt = "working"
             self._purge_hands_warning = True
         self._host.cycle_notify()
-        if not self._hold_feeders(True):
-            self._hold_feeders(False)
+        if not self._ensure_holder_encoder_closed_for_feed():
             return False
+        self._host.clear_motion_wait_flags()
+        sides = self._feed_side_list()
+        failed: list[str] = []
+        if "L" in sides and not self._host.cmd_motion_feed_l(skip_validate=True):
+            failed.append("L")
+        if "R" in sides and not self._host.cmd_motion_feed_r(skip_validate=True):
+            failed.append("R")
+        if failed:
+            self._host.cmd_motion_stop()
+            self._host.cycle_log(
+                f"Clear: feeder no arrancó lados={''.join(failed)}"
+            )
+            self._raise_fault("feed_cmd")
+            return False
+        self._host.cycle_log(
+            f"Clear: feeder ON lados={''.join(sides)} · {float(sec):g} s"
+        )
         deadline = time.monotonic() + max(0.0, float(sec))
         aborted = False
         while time.monotonic() < deadline:
@@ -4541,26 +4664,21 @@ class CycleRunner:
                 aborted = True
                 break
             time.sleep(0.05)
-        self._hold_feeders(False)
+        self._host.cmd_motion_stop()
         return not aborted and not self._should_abort()
 
-    def _execute_clear(self, rpm: float) -> tuple[str, bool]:
-        """ASDA al máximo, feeders 5 s, Retry o Continuar.
-
-        Devuelve (estado, materialista encendido por esta rutina).
-        """
-        owned_materialist = False
-        cfg = self.get_config()
-        target = abs(float(cfg.deposit_max_travel_mm)) or 1500.0
+    def _execute_clear(self, rpm: float) -> str:
+        """ASDA al despeje, feeder de Motion 5 s, Retry o Continuar."""
+        target = self._clear_asda_target_mm()
         if not self._plc_accepted(self._host.cmd_plc_tools_safe(), "Clear tools safe"):
-            return "fail", False
+            return "fail"
         if self._should_abort():
-            return "cancel", False
+            return "cancel"
         if self._host.motion_busy():
             self._host.cycle_log("Clear: Motion ocupado — esperando…")
             if not self._host.wait_motion_lineal_idle(45.0):
                 self._raise_fault("timeout_motion")
-                return "fail", False
+                return "fail"
         current = self._host.asda_position_mm()
         if current is None:
             current = self._host.refresh_asda_position_mm()
@@ -4571,7 +4689,7 @@ class CycleRunner:
             self._host.clear_motion_wait_flags()
             if not self._host.cmd_motion_move_mm(target, rpm):
                 self._raise_fault("move_cmd")
-                return "fail", False
+                return "fail"
             if (
                 not self._wait_motion(
                     target_mm=target,
@@ -4579,32 +4697,20 @@ class CycleRunner:
                 )
                 or self._should_abort()
             ):
-                return ("cancel" if self._should_abort() else "fail"), False
+                return "cancel" if self._should_abort() else "fail"
             self._host.cycle_log(f"Clear: ASDA en {target:g} mm")
 
-        if not self._materialist:
-            res = self._host.cmd_cycle_materialist(True)
-            if not res.get("ok"):
-                self._host.cycle_log(
-                    "Clear: no se pudo activar Materialista para los feeders"
-                )
-                return "fail", False
-            owned_materialist = True
-            time.sleep(0.3)
-            if self._should_abort():
-                return "cancel", owned_materialist
-
         if not self._feed_feeders_for(CLEAR_FEED_S):
-            return ("cancel" if self._should_abort() else "fail"), owned_materialist
+            return "cancel" if self._should_abort() else "fail"
 
         while True:
             decision = self._wait_refill_operator_decision("after_feed")
             if decision == "retry":
                 if not self._feed_feeders_for(CLEAR_FEED_S):
-                    return ("cancel" if self._should_abort() else "fail"), owned_materialist
+                    return "cancel" if self._should_abort() else "fail"
                 continue
             if decision != "ok":
-                return "cancel", owned_materialist
+                return "cancel"
             break
 
         with self._lock:
@@ -4612,8 +4718,8 @@ class CycleRunner:
             self._purge_hands_warning = True
         self._host.cycle_notify()
         if not self._ensure_asda_at_zero(reason="clear"):
-            return ("cancel" if self._should_abort() else "fail"), owned_materialist
-        return "ok", owned_materialist
+            return "cancel" if self._should_abort() else "fail"
+        return "ok"
 
     def _run_clear(self, rpm: float) -> None:
         with self._lock:
@@ -4626,17 +4732,14 @@ class CycleRunner:
             self._finished_elapsed = 0.0
             self._progress = 0
         self._host.cycle_notify()
-        owned = False
         status = "fail"
         try:
-            status, owned = self._execute_clear(rpm)
+            status = self._execute_clear(rpm)
         except Exception as exc:
             self._raise_fault(f"exception:{exc}")
             self._host.cycle_log(f"Clear exception: {exc}")
             status = "fail"
-        self._hold_feeders(False)
-        if owned:
-            self._host.cmd_cycle_materialist(False)
+        self._host.cmd_motion_stop()
         if status == "ok":
             self._finish(True)
             return

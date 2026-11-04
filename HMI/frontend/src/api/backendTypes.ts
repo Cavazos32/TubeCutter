@@ -178,6 +178,9 @@ export interface BackendSnapshot {
   selectedModel: number;
   mm: number;
   rpm: number;
+  /** Destino del control manual. No es la longitud del modelo. */
+  manualMm?: number;
+  manualRpm?: number;
   banner: BackendBanner;
   error?: BackendErrorLatch;
   progress: number;
