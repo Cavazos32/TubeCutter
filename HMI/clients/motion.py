@@ -275,20 +275,36 @@ class MotionClient(ModuleTcpClient):
         ok = self.cmd_enc_measure_r()
         return self.cmd_enc_measure_l() and ok
 
-    def cmd_feed_r(self, *, skip_validate: bool = False, feed_mm: float | None = None) -> bool:
+    def cmd_feed_r(
+        self,
+        *,
+        skip_validate: bool = False,
+        feed_mm: float | None = None,
+        feed_duration_ms: int | None = None,
+    ) -> bool:
         extra: dict = {}
         if skip_validate:
             extra["skipValidate"] = True
             if feed_mm is not None:
                 extra["mm"] = float(feed_mm)
+            if feed_duration_ms is not None and int(feed_duration_ms) > 0:
+                extra["feedDurationMs"] = int(feed_duration_ms)
         return self.cmd_byte(CMD_FEED_R, **extra) if extra else self.cmd_byte(CMD_FEED_R)
 
-    def cmd_feed_l(self, *, skip_validate: bool = False, feed_mm: float | None = None) -> bool:
+    def cmd_feed_l(
+        self,
+        *,
+        skip_validate: bool = False,
+        feed_mm: float | None = None,
+        feed_duration_ms: int | None = None,
+    ) -> bool:
         extra: dict = {}
         if skip_validate:
             extra["skipValidate"] = True
             if feed_mm is not None:
                 extra["mm"] = float(feed_mm)
+            if feed_duration_ms is not None and int(feed_duration_ms) > 0:
+                extra["feedDurationMs"] = int(feed_duration_ms)
         return self.cmd_byte(CMD_FEED_L, **extra) if extra else self.cmd_byte(CMD_FEED_L)
 
     def cmd_reset_errors(self) -> bool:

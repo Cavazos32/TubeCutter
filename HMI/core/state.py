@@ -439,6 +439,8 @@ class HmiState:
             },
             # Master errorAny (status). ErrorState 0x3C solo no implica EXXX.
             "error_any": False,
+            # Operador: omitir holgura por lado (HMI + esclavo); toggle con empleado.
+            "holguraOmit": {"L": False, "R": False},
             # UI del Master (EXXX / PF-007). Nunca el texto genérico 0x3C.
             "master_error_ui": "",
             "master_error_side": "",
@@ -727,6 +729,7 @@ class HmiState:
                 "prefeeder": {
                     **self._pf,
                     "connected": self.pf_connected(),
+                    "holguraOmit": dict(self._pf.get("holguraOmit") or {"L": False, "R": False}),
                     "errors": {
                         k: dict(v)
                         for k, v in self._pf["sensor_view"].items()
@@ -888,8 +891,15 @@ class HmiState:
 
     def _enc_poll_loop(self) -> None:
         while not self._enc_poll_stop.is_set():
-            # Mismo TCP que CMD_MOVE: no sondear encoders durante lote.
-            if self._client.connected and not self._cycle.is_active():
+            # Mismo TCP que CMD_MOVE: no sondear encoders durante lote ni
+            # mientras el arranque lineal / Init CAN compite por la cola.
+            with self._lock:
+                boot_busy = bool(
+                    self._motion_boot_armed
+                    and not self._motion_boot_prep_done
+                )
+                cycle_on = self._cycle.is_active()
+            if self._client.connected and not cycle_on and not boot_busy:
                 self.cmd_motion("enc_poll")
             time.sleep(0.6)
 
@@ -1153,6 +1163,9 @@ class HmiState:
         if side_u not in ("L", "R"):
             return None
         with self._lock:
+            omit = bool((self._pf.get("holguraOmit") or {}).get(side_u))
+            if omit:
+                return True
             info = (self._pf.get("sides") or {}).get(side_u) or {}
             if info.get("latchedError") and int(info.get("errorWireId") or 0) == 6:
                 return False
@@ -1406,6 +1419,27 @@ class HmiState:
     def stage2_fault(self) -> str:
         return self._stage2_fault
 
+    def _motion_servo_can_ready(self) -> bool:
+        """True si /api/feed/status reporta servo CAN listo (sin pedir Init)."""
+        self.refresh_feed_can_status()
+        with self._lock:
+            return bool(self._motion.get("servoCanReady"))
+
+    @staticmethod
+    def _feed_can_init_http_detail(exc: BaseException) -> tuple[int | None, str]:
+        code = getattr(exc, "code", None)
+        detail = str(exc)
+        read = getattr(exc, "read", None)
+        if callable(read):
+            try:
+                raw = read().decode("utf-8", errors="replace")
+                body = json.loads(raw) if raw else {}
+                if isinstance(body, dict) and body.get("error"):
+                    detail = str(body["error"])
+            except Exception:  # noqa: BLE001
+                pass
+        return (int(code) if code is not None else None, detail)
+
     def cmd_motion_feed_can_init(self) -> bool:
         """Pide a Motion su rutina de encendido del alimentador.
 
@@ -1414,34 +1448,24 @@ class HmiState:
         y el resultado se espera con `wait_feed_can_ready`.
         """
         host = getattr(self._client, "_host", DEFAULT_HOST)
+        if self._motion_servo_can_ready():
+            return True
         try:
             data = motion_http_feed_can_init(host=str(host))
         except Exception as exc:  # noqa: BLE001 — enlace HTTP Motion
+            code, detail = self._feed_can_init_http_detail(exc)
+            if self._motion_servo_can_ready():
+                return True
             # Firmware Motion sin la orden de arranque (404): el
             # alimentador ya corrió esa misma rutina al encender. Si su
             # servo ya quedó listo, no hay nada más que arrancar: el paso
             # sigue con esa condición real, no con un fallo inventado.
-            if getattr(exc, "code", None) in (404, 405, 501):
-                try:
-                    st = motion_http_feed_status(host=str(host))
-                except Exception:  # noqa: BLE001
-                    st = {}
-                if st.get("servoCanReady"):
-                    self.cycle_log(
-                        "Arranque alimentador: Motion sin orden nueva; "
-                        "servo ya listo desde el encendido"
-                    )
-                    return True
-            detail = str(exc)
-            read = getattr(exc, "read", None)
-            if callable(read):
-                try:
-                    raw = read().decode("utf-8", errors="replace")
-                    body = json.loads(raw) if raw else {}
-                    if isinstance(body, dict) and body.get("error"):
-                        detail = str(body["error"])
-                except Exception:  # noqa: BLE001 — cuerpo HTTP no JSON
-                    pass
+            if code in (404, 405, 501) and self._motion_servo_can_ready():
+                self.cycle_log(
+                    "Arranque alimentador: Motion sin orden nueva; "
+                    "servo ya listo desde el encendido"
+                )
+                return True
             self._stage2_fault = f"Arranque alimentador: {detail}"
             return False
         if not data.get("ok"):
@@ -1766,24 +1790,44 @@ class HmiState:
     def cmd_motion_stop(self) -> bool:
         return self._client.cmd_stop()
 
-    def cmd_motion_feed_l(self, *, skip_validate: bool = False, feed_mm: float | None = None) -> bool:
+    def cmd_motion_feed_l(
+        self,
+        *,
+        skip_validate: bool = False,
+        feed_mm: float | None = None,
+        feed_duration_ms: int | None = None,
+    ) -> bool:
         self._feed_ok_l.clear()
         self._feed_ng_l.clear()
         self._feed_fault_l = ""
         self._feed_gen_l += 1
         self._feed_armed_l = True
-        ok = self._client.cmd_feed_l(skip_validate=skip_validate, feed_mm=feed_mm)
+        ok = self._client.cmd_feed_l(
+            skip_validate=skip_validate,
+            feed_mm=feed_mm,
+            feed_duration_ms=feed_duration_ms,
+        )
         if not ok:
             self._feed_armed_l = False
         return ok
 
-    def cmd_motion_feed_r(self, *, skip_validate: bool = False, feed_mm: float | None = None) -> bool:
+    def cmd_motion_feed_r(
+        self,
+        *,
+        skip_validate: bool = False,
+        feed_mm: float | None = None,
+        feed_duration_ms: int | None = None,
+    ) -> bool:
         self._feed_ok_r.clear()
         self._feed_ng_r.clear()
         self._feed_fault_r = ""
         self._feed_gen_r += 1
         self._feed_armed_r = True
-        ok = self._client.cmd_feed_r(skip_validate=skip_validate, feed_mm=feed_mm)
+        ok = self._client.cmd_feed_r(
+            skip_validate=skip_validate,
+            feed_mm=feed_mm,
+            feed_duration_ms=feed_duration_ms,
+        )
         if not ok:
             self._feed_armed_r = False
         return ok
@@ -2718,12 +2762,11 @@ class HmiState:
         OFF: si no hay enlace PF, igual se sale del interlock HMI.
         Siempre accionable salvo purga en curso: con lote vivo pausa y re-arranca la pieza al Resume.
         """
-        if self._cycle.is_purge_busy() and not self._cycle.is_clear_active():
+        if self._cycle.is_purge_busy():
             return {"ok": False, "error": "Purga en curso"}
         if (
             on
             and self._cycle.is_active()
-            and not self._cycle.is_clear_active()
             and not self._cycle.is_e050_materialist_wait()
         ):
             self._cycle.hold_lot_and_restart_piece(
@@ -2788,13 +2831,13 @@ class HmiState:
         feed_mm: float | None = None,
         asda_mm: float | None = None,
     ) -> dict:
-        """Purga/refill material: ASDA park → Alimentar o Continuar purga → secuencia automática.
+        """Purga/refill: ASDA park → alimentar o continuar → ASDA 0 → secuencia automática.
 
         Siempre accionable (también con latch EXXX o lote vivo), salvo si ya hay purga en curso.
         Si hay EXXX, primero lo restablece (mismo Reset de módulo). Si la falla sigue, no arranca.
         Start/Resume/Pause/Materialist bloqueados durante la purga; Stop y posición inicial siguen.
         """
-        _, rpm = self._model_mm_rpm()
+        length, rpm = self._model_mm_rpm()
         if self._cycle.is_refill_active() or self._cycle.is_purge_busy():
             return {"ok": False, "error": "Purga ya en curso"}
         if self.error_is_latched():
@@ -2802,31 +2845,24 @@ class HmiState:
             if not cleared.get("ok"):
                 return cleared
         if self._cycle.is_active():
-            res = self._cycle.request_lot_purge(feed_mm=feed_mm, asda_mm=asda_mm)
+            res = self._cycle.request_lot_purge(
+                feed_mm=feed_mm, asda_mm=asda_mm, length_mm=length
+            )
             if res.get("ok"):
                 _append_log(self._main_log, "Purge dentro del lote (progreso conservado)")
             return res
-        return self._cycle.request_refill(rpm, feed_mm=feed_mm, asda_mm=asda_mm)
-
-    def cmd_cycle_clear(self) -> dict:
-        """Clear: ASDA al despeje, feeder 5 s, Retry o Continuar (ASDA a 0).
-
-        Si Limpiar ya está activo, este mismo comando lo apaga.
-        """
-        if self._cycle.is_clear_active():
-            if self._cycle.snapshot().get("refillAwaitingConfirm"):
-                return self._cycle.confirm_refill(False)
-            return self._cycle.request_stop()
-        _, rpm = self._model_mm_rpm()
-        if self._cycle.is_refill_active() or self._cycle.is_purge_busy():
-            return {"ok": False, "error": "Purga en curso"}
-        return self._cycle.request_clear(rpm)
+        return self._cycle.request_refill(
+            rpm, feed_mm=feed_mm, asda_mm=asda_mm, length_mm=length
+        )
 
     def cmd_cycle_refill_confirm(self, ok: bool = True) -> dict:
         return self._cycle.confirm_refill(ok)
 
     def cmd_cycle_refill_retry(self, feed_mm: float | None = None) -> dict:
         return self._cycle.retry_refill(feed_mm=feed_mm)
+
+    def cmd_cycle_refill_clean(self) -> dict:
+        return self._cycle.purge_clean_feed()
 
     def cmd_recovery_review(self, ok: bool = True) -> dict:
         res = self._cycle.confirm_recovery_review(ok)
@@ -3186,7 +3222,56 @@ class HmiState:
         self._notify()
         return {"ok": True, "pulseS": pulse_s, "hold": bool(hold)}
 
+    def cmd_pf_toggle_holgura_omit(self, side: str, employee_id: str) -> dict[str, Any]:
+        side_u = str(side or "").strip().upper()
+        if side_u not in ("L", "R"):
+            return {"ok": False, "error": "invalid_side"}
+        emp = str(employee_id or "").strip()
+        if not emp.isdigit() or len(emp) != 5:
+            return {"ok": False, "error": "invalid_employee"}
+        with self._lock:
+            ho = self._pf.setdefault("holguraOmit", {"L": False, "R": False})
+            want_on = not bool(ho.get(side_u))
+        if not self.pf_connected():
+            return {"ok": False, "error": "Sin enlace con el alimentador"}
+        ok = self._manual_pf(
+            lambda: self._pf_client.cmd_set_holgura_omit(side_u, want_on)
+        )
+        if not ok:
+            with self._lock:
+                err = str(
+                    (self._pf.get("status") or {}).get("text")
+                    or "No se pudo enviar omitir holgura al PreFeeder"
+                )
+            return {"ok": False, "error": err}
+        with self._lock:
+            ho[side_u] = want_on
+            verb = "activado" if want_on else "desactivado"
+            text = f"Omitir holgura {side_u} {verb} (empleado {emp})"
+            _append_log(self._pf_log, text)
+            _append_log(self._main_log, f"Alimentador: {text}")
+            self._pf["status"] = {"text": text, "kind": "ok" if want_on else "info"}
+        try:
+            append_checklist_history(
+                {
+                    "type": "pf_holgura_omit",
+                    "employeeId": emp,
+                    "side": side_u,
+                    "active": want_on,
+                    "at": utc_now_iso(),
+                }
+            )
+        except OSError:
+            pass
+        self._notify()
+        return {"ok": True, "side": side_u, "active": want_on}
+
     def cmd_pf(self, action: str, **kwargs) -> dict:
+        if action == "toggle_holgura_omit":
+            return self.cmd_pf_toggle_holgura_omit(
+                str(kwargs.get("side", "")),
+                str(kwargs.get("employeeId", "")),
+            )
         if action == "materialist":
             return self.cmd_cycle_materialist(True)
         if action in ("in_process", "busy"):
@@ -3949,8 +4034,34 @@ class HmiState:
                 target=self.refresh_feed_can_status, daemon=True
             ).start()
 
+    def _motion_boot_skip_if_already_ready(self) -> None:
+        """Tras reconectar: no repetir Servo ON / Init CAN si ya estaban listos."""
+        self.refresh_feed_can_status()
+        with self._lock:
+            if self._motion_boot_prep_done or not self._motion["connected"]:
+                return
+            if self._cycle.is_active():
+                return
+            can_ok = bool(self._motion.get("servoCanReady"))
+            idle = self._last_state_byte in MOTION_BOOT_READY_STATES
+            pos = self._motion.get("asdaPositionMm")
+            at_home = pos is None or abs(float(pos)) <= 1.0
+            if not (can_ok and idle and at_home):
+                return
+            self._motion_boot_prep_done = True
+            self._motion_boot_can_done = True
+            self._motion_boot_armed = False
+            self._motion_boot_awaiting_on_ack = False
+            msg = (
+                "Arranque lineal: omitido — alimentador CAN y ASDA ya listos"
+            )
+            _append_log(self._motion_log, msg)
+            self._set_motion_status(msg, "ok")
+        self._notify()
+
     def _motion_boot_try_launch(self) -> None:
         """Si Motion ya reportó Init/Idle y la prep está armada, lanza Servo ON/Home."""
+        self._motion_boot_skip_if_already_ready()
         boot_gen: int | None = None
         with self._lock:
             if (
@@ -4031,6 +4142,8 @@ class HmiState:
         deadline = time.monotonic() + timeout_s
         saw_busy = False
         idle_since: float | None = None
+        if self._motion_servo_can_ready():
+            return "ok"
         while time.monotonic() < deadline:
             if self._motion_boot_can_stop(gen):
                 return "aborted"
@@ -4101,15 +4214,22 @@ class HmiState:
         """Un intento de Init CAN. None = listo o abortado; str = motivo para reintentar."""
         if self._motion_boot_can_stop(gen):
             return None
+        if self._motion_servo_can_ready():
+            self._motion_boot_can_succeeded()
+            return None
         ok = self.cmd_motion_feed_can_init()
         fault = ""
         wait_running = False
         if not ok:
             with self._lock:
                 fault = str(self._stage2_fault or "").strip()
+            if self._motion_servo_can_ready():
+                self._motion_boot_can_succeeded()
+                return None
             low = fault.lower()
-            # Motion ya ejecuta un Init: ese intento es el nuestro, hay que esperarlo.
-            if "en curso" in low:
+            # Motion ya ejecuta un Init, o el alimentador está ocupado
+            # (feed / cola TCP): esperar status, no spamear reintentos.
+            if "en curso" in low or "ocupado" in low:
                 wait_running = True
             else:
                 return fault or "Init CAN no encolado"
@@ -4663,6 +4783,9 @@ class HmiState:
                         ).start()
                         return True
                     text = detail or "Comando rechazado"
+                    if (text or "").strip().lower() == "ocupado":
+                        # Cola TCP llena (enc_poll / ráfaga): no banner ni log MAQUINA.
+                        return True
                     _append_log(self._main_log, text)
                     _append_log(self._motion_log, text)
                     self._set_banner(text, "error")
@@ -4898,6 +5021,15 @@ class HmiState:
             holg = bool(side.get("holgura"))
             if runtime.get("holguraOn") != holg:
                 runtime["holguraOn"] = holg
+                changed = True
+        if "holguraOmit" in side:
+            omit = bool(side.get("holguraOmit"))
+            if runtime.get("holguraOmit") != omit:
+                runtime["holguraOmit"] = omit
+                changed = True
+            ho = self._pf.setdefault("holguraOmit", {"L": False, "R": False})
+            if ho.get(side_key) != omit:
+                ho[side_key] = omit
                 changed = True
         if "autoState" in side:
             st = str(side.get("autoState") or "").strip().lower() or None

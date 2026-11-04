@@ -141,6 +141,17 @@ class PreFeederClient(ModuleTcpClient):
             command="setHmiTfeedEnabled", value="1" if on else "0"
         )
 
+    def cmd_set_holgura_omit(self, side: str, on: bool) -> bool:
+        """Omite sensor holgura en un esclavo L|R (material residual)."""
+        side_u = str(side or "").strip().upper()
+        if side_u not in ("L", "R"):
+            return False
+        return self.send_command(
+            command="setHolguraOmit",
+            value="1" if on else "0",
+            side=side_u,
+        )
+
     def cmd_trigger_r(self, sec: float | None = None) -> bool:
         extra: dict[str, str] = {}
         if sec is not None and sec > 0.05:

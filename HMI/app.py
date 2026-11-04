@@ -375,11 +375,6 @@ def api_cycle_refill():
     )
 
 
-@app.post("/api/cycle/clear")
-def api_cycle_clear():
-    return jsonify(get_state().cmd_cycle_clear())
-
-
 @app.post("/api/cycle/refill/confirm")
 def api_cycle_refill_confirm():
     body = request.get_json(silent=True) or {}
@@ -403,6 +398,11 @@ def api_cycle_refill_retry():
             feed_mm=float(feed_mm) if feed_mm is not None else None
         )
     )
+
+
+@app.post("/api/cycle/refill/clean")
+def api_cycle_refill_clean():
+    return jsonify(get_state().cmd_cycle_refill_clean())
 
 
 @app.get("/api/cycle/config")

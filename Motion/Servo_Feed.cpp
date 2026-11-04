@@ -775,6 +775,10 @@ struct FeedSideRt {
   bool velEncoderSeen = false;
   bool velTvelZeroSent = false;
   uint8_t purgeCreepChunks = 0;  // skipValidate: trozos completados (mín. purga)
+  // Purga Clean HMI: alimentar N ms sin parar por láser.
+  bool purgeTimedFeed = false;
+  uint32_t timedFeedDurationMs = 0;
+  uint32_t timedFeedEndMs = 0;
 };
 
 static FeedSideRt feedSides[2];
@@ -1223,6 +1227,9 @@ static void feedSideFinish(bool sideR, FeedValResult result, uint8_t errByte, co
   s.errByte = errByte;
   s.skipValidate = false;
   s.overrideTargetMm = 0.0f;
+  s.purgeTimedFeed = false;
+  s.timedFeedDurationMs = 0;
+  s.timedFeedEndMs = 0;
   if (reason && reason[0]) {
     strncpy(s.fault, reason, sizeof(s.fault) - 1);
     s.fault[sizeof(s.fault) - 1] = '\0';
@@ -1370,6 +1377,8 @@ static bool feedSideStartLaserSeek(bool sideR, uint32_t now, const char* why)
   return true;
 }
 
+static void feedSideStartTimedPurge(bool sideR);
+
 static void feedSideStartApproach(bool sideR)
 {
   FeedSideRt& s = feedSideAt(sideR);
@@ -1386,6 +1395,12 @@ static void feedSideStartApproach(bool sideR)
   s.pending = false;
   s.moveStartMs = 0;
   s.absDueMs = 0;
+
+  // Purga Clean: duración fija, sin parar por LR-X.
+  if (s.skipValidate && s.timedFeedDurationMs > 0) {
+    feedSideStartTimedPurge(sideR);
+    return;
+  }
 
   // Purga HMI: por lado, creep hasta LR-X ON (sin OM). Si ya está ON → OK inmediato.
   // El otro lado sigue si aún no llegó. Timeout 10 s (refill lejano).
@@ -1470,6 +1485,7 @@ static void feedAcceptVelocityLaserHalt(FeedSideRt& s, uint32_t now)
 static void feedTryVelocityLaserHalt(bool sideR, bool laserOn, uint32_t now)
 {
   FeedSideRt& s = feedSideAt(sideR);
+  if (s.purgeTimedFeed) return;
   if (!feedVelocityLaserHaltEligible(s) || !laserOn) return;
   if (!sendCanHaltFirstNonBlocking(sideR)) return;
   feedAcceptVelocityLaserHalt(s, now);
@@ -1551,6 +1567,34 @@ static void feedSideStartVelocity(bool sideR)
   s.phase = FSP_VEL_PREPARE;
 }
 
+static void feedSideStartTimedPurge(bool sideR)
+{
+  FeedSideRt& s = feedSideAt(sideR);
+  const uint32_t durMs = s.timedFeedDurationMs;
+  feedSideClearDiag(s);
+  s.skipValidate = true;
+  s.timedFeedDurationMs = durMs;
+  s.purgeTimedFeed = true;
+  s.targetMm = FEED_TARGET_FIXED_MM;
+  s.approachMm = 0.0f;
+  s.velTransitionMm = 9999.0f;
+  s.gen = feedGenCounter++;
+  if (s.gen == 0) s.gen = feedGenCounter++;
+  motionTcpClearFeedSidePending(sideR);
+  const uint32_t now = millis();
+  s.opStartMs = now;
+  s.active = true;
+  s.pending = false;
+  s.timedFeedEndMs = now + durMs;
+  s.velModeActive = true;
+  s.huntLaser = false;
+  Serial.printf("FEED %c PURGE TIMED %lums (sin láser)\n",
+                sideR ? 'R' : 'L', (unsigned long)durMs);
+  sendCanHaltImmediate(sideR);
+  s.settleUntilMs = now + FEED_HALT_SETTLE_MS;
+  s.phase = FSP_VEL_PREPARE;
+}
+
 static void feedSideStartPending(bool sideR)
 {
   const FeedSideRt& s = feedSideAt(sideR);
@@ -1570,7 +1614,8 @@ static bool feedSideVelocityWatchdogs(bool sideR, uint32_t now, float om)
     return true;
   }
 
-  if (om >= feedVelMaxTravelMm) {
+  // Purga Clean: duración fija, sin validar LR-X; no usar tope OM→E004/E005.
+  if (!s.purgeTimedFeed && om >= feedVelMaxTravelMm) {
     Serial.printf("OM=%.1f LR-X=OFF\n", (double)om);
     Serial.println("VELOCITY FEED MAX TRAVEL");
     feedSideVelocityAbort(sideR, now, laserErr, "VELOCITY FEED MAX TRAVEL");
@@ -1865,7 +1910,7 @@ static void feedSideService(bool sideR, uint32_t now)
 
     case FSP_VEL_PREPARE:
       if (now < s.settleUntilMs) break;
-      if (feedLaserMaterialPresentRaw(sideR)) {
+      if (!s.purgeTimedFeed && feedLaserMaterialPresentRaw(sideR)) {
         s.laserState = true;
         s.velModeActive = false;
         Serial.printf("FEED %c VELOCITY skip: LR-X already ON\n", sideR ? 'R' : 'L');
@@ -1899,6 +1944,11 @@ static void feedSideService(bool sideR, uint32_t now)
     case FSP_VEL_FAST:
     case FSP_VEL_SLOW:
       {
+        if (s.purgeTimedFeed && now >= s.timedFeedEndMs) {
+          feedSideVelocityHaltNow(sideR, now, "PURGE TIMED end");
+          s.phase = FSP_VEL_STOPPING;
+          break;
+        }
         if (s.velStopLatched) {
           s.phase = FSP_VEL_STOPPING;
           break;
@@ -2219,7 +2269,8 @@ String feedStatusJson()
   return j;
 }
 
-bool feedQueueTestSide(int8_t onlySide, String& err, bool skipValidate, float targetMm)
+bool feedQueueTestSide(int8_t onlySide, String& err, bool skipValidate, float targetMm,
+                       uint32_t feedDurationMs)
 {
   if (!servoCanReady) {
     // EXXX oficial E023 / 0x61 (no texto suelto sin código).
@@ -2230,11 +2281,14 @@ bool feedQueueTestSide(int8_t onlySide, String& err, bool skipValidate, float ta
   }
   const float overrideMm =
       (skipValidate && targetMm >= 1.0f) ? clampFeedTargetMm(targetMm) : 0.0f;
+  const uint32_t durMs =
+      (skipValidate && feedDurationMs > 0) ? feedDurationMs : 0u;
   if (onlySide == 0) {
     if (feedSides[0].active || feedSides[0].pending) { err = "Feed L ocupado"; return false; }
     feedSides[0].pending = true;
     feedSides[0].skipValidate = skipValidate;
     feedSides[0].overrideTargetMm = overrideMm;
+    feedSides[0].timedFeedDurationMs = durMs;
     return true;
   }
   if (onlySide == 1) {
@@ -2242,6 +2296,7 @@ bool feedQueueTestSide(int8_t onlySide, String& err, bool skipValidate, float ta
     feedSides[1].pending = true;
     feedSides[1].skipValidate = skipValidate;
     feedSides[1].overrideTargetMm = overrideMm;
+    feedSides[1].timedFeedDurationMs = durMs;
     return true;
   }
   // both
@@ -2255,6 +2310,8 @@ bool feedQueueTestSide(int8_t onlySide, String& err, bool skipValidate, float ta
   feedSides[1].skipValidate = skipValidate;
   feedSides[0].overrideTargetMm = overrideMm;
   feedSides[1].overrideTargetMm = overrideMm;
+  feedSides[0].timedFeedDurationMs = durMs;
+  feedSides[1].timedFeedDurationMs = durMs;
   return true;
 }
 

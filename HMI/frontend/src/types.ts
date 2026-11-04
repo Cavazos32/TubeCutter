@@ -113,7 +113,6 @@ export interface MachineState {
   cycleMaterialist: boolean;
   cycleBusy: boolean;
   refillActive: boolean;
-  clearActive: boolean;
   refillAwaitingConfirm: boolean;
   /** working | await_feed | after_feed | "" (after_cut ya no existe en la purga nueva) */
   refillPrompt: string;
@@ -125,7 +124,6 @@ export interface MachineState {
   recoveryAfterError: boolean;
   e050Lot: boolean;
   e050FinishPiece: boolean;
-  refillSkipCut: boolean;
   /** Advertencia 'NO INTRODUCIR LAS MANOS': activa toda la rutina automática de purga. */
   purgeHandsWarning: boolean;
   /** E050+Materialista con pieza: ASDA termina la pieza (banner global). */
@@ -218,6 +216,9 @@ export interface PreFeederState {
   sensorsR: PreFeederSensor[];
   refillL: PfRefillState;
   refillR: PfRefillState;
+  /** Sensor holgura ignorado en esclavo (material residual). */
+  holguraOmitL?: boolean;
+  holguraOmitR?: boolean;
 }
 
 export interface AppConfigState {

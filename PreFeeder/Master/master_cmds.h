@@ -35,7 +35,8 @@ static inline PfCmdScope pfMasterCmdScope(const String& cmd)
   if (cmd == "trigger"
       || cmd == "setRefillPulseS" || cmd == "refillPulseS"
       || cmd == "setTriggerFeed" || cmd == "setTriggerCfg"
-      || cmd == "setAllCfg" || cmd == "applyAllCfg")
+      || cmd == "setAllCfg" || cmd == "applyAllCfg"
+      || cmd == "setHolguraOmit" || cmd == "holguraOmit")
     return PfCmdScope::Side;
 
   return PfCmdScope::Unknown;

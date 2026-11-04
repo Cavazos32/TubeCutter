@@ -121,20 +121,19 @@ export function mergeLogTail(
   return next.length > MAX_UI_LOGS ? next.slice(next.length - MAX_UI_LOGS) : next;
 }
 
-/** Purga activa. Limpiar reutiliza el aviso de manos y no cuenta como purga. */
+/** Purga activa (refill manual o rutina en curso). */
 export function isPurgeBusy(
   cycle:
     | Pick<
         BackendSnapshot['cycle'],
         | 'refillActive'
-        | 'clearActive'
         | 'refillPrompt'
         | 'purgeHandsWarning'
         | 'asdaMoveWarning'
       >
     | undefined
 ): boolean {
-  if (!cycle || cycle.clearActive) return false;
+  if (!cycle) return false;
   return (
     !!cycle.refillActive ||
     !!cycle.refillPrompt ||
@@ -205,7 +204,7 @@ export function mapMachineState(
     machineByte: typeof cycle.byte === 'number' ? cycle.byte : undefined,
     machineName: cycle.name || '',
     isRunning: productiveRunning,
-    isPaused: cycle.paused,
+    isPaused: !!(cycle.active && cycle.paused),
     cycleActive: cycle.active && !postLotPfSettle,
     postLotPfSettle,
     pfOperatorStartBlocked: !!cycle.pfOperatorStartBlocked,
@@ -214,7 +213,6 @@ export function mapMachineState(
     cycleMaterialist: cycle.materialist ?? false,
     cycleBusy: !!(cycle.busy ?? false),
     refillActive: !!cycle.refillActive,
-    clearActive: !!cycle.clearActive,
     refillAwaitingConfirm: !!cycle.refillAwaitingConfirm,
     refillPrompt: String(cycle.refillPrompt || ''),
     recoveryPrompt: String(cycle.recoveryPrompt || ''),
@@ -226,7 +224,6 @@ export function mapMachineState(
       !!cycle.e050FinishPiece ||
       String(cycle.recoveryPrompt || '').startsWith('e050_'),
     e050FinishPiece: !!cycle.e050FinishPiece,
-    refillSkipCut: !!cycle.refillSkipCut,
     purgeHandsWarning: !!cycle.purgeHandsWarning,
     asdaMoveWarning: !!cycle.asdaMoveWarning,
     purgeBusy: isPurgeBusy(cycle),
@@ -456,6 +453,8 @@ export function mapPreFeederState(snap: BackendSnapshot): PreFeederState {
     sensorsR: buildSensors(snap, 'R'),
     refillL: mapPfRefill(pf.sides?.L),
     refillR: mapPfRefill(pf.sides?.R),
+    holguraOmitL: !!pf.holguraOmit?.L,
+    holguraOmitR: !!pf.holguraOmit?.R,
   };
 }
 

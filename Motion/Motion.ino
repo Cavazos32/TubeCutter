@@ -3046,16 +3046,20 @@ static bool feederTcpDoByte(uint8_t cmdByte, const char* line) {
   bool ok = false;
   const bool sideR = (cmdByte == FEED_CMD_FEED_R);
   // Purga HMI: skipValidate=true → creep hasta láser ON (sin OM, timeout 10 s).
+  // feedDurationMs>0 + skipValidate → Purga Clean (sin láser, duración fija).
   const bool skipValidate = asdaTcpJBool(line, "skipValidate", false);
   // mm legado (Long feed); la purga-a-láser lo ignora.
   const float targetMm = skipValidate ? asdaTcpJFloat(line, "mm", 0.0f) : 0.0f;
+  const int feedDurRaw = skipValidate ? asdaTcpJInt(line, "feedDurationMs", 0) : 0;
+  const uint32_t feedDurationMs =
+      (skipValidate && feedDurRaw > 0) ? (uint32_t)feedDurRaw : 0u;
 
   switch (cmdByte) {
     case FEED_CMD_FEED_R:
-      ok = feedQueueTestSide(1, err, skipValidate, targetMm);
+      ok = feedQueueTestSide(1, err, skipValidate, targetMm, feedDurationMs);
       break;
     case FEED_CMD_FEED_L:
-      ok = feedQueueTestSide(0, err, skipValidate, targetMm);
+      ok = feedQueueTestSide(0, err, skipValidate, targetMm, feedDurationMs);
       break;
     default:
       err = "byte/cmd feeder desconocido";

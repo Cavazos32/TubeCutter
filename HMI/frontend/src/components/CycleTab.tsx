@@ -4,6 +4,7 @@ import {
   CheckCircle2,
   Save,
   RotateCcw,
+  Eraser,
   Sliders,
   Clock,
   ShieldAlert,
@@ -203,6 +204,7 @@ interface CycleTabProps {
   onRefill?: () => void;
   onRefillConfirm?: (ok: boolean) => void;
   onRefillRetry?: () => void;
+  onRefillClean?: () => void;
   onRefillLongFeed?: () => void;
   onRecoveryReview?: (ok: boolean) => void;
 }
@@ -221,6 +223,7 @@ export const CycleTab: React.FC<CycleTabProps> = ({
   resumeEnabled = false,
   onRefillConfirm,
   onRefillRetry,
+  onRefillClean,
   onRefillLongFeed,
   onRecoveryReview,
 }) => {
@@ -233,15 +236,12 @@ export const CycleTab: React.FC<CycleTabProps> = ({
           ? machineState.refillPrompt ||
             (machineState.refillActive ? 'working' : '')
           : '');
-  const manualPurgeOrClear =
-    !!machineState.refillActive || !!machineState.clearActive;
   const showManualRefill =
     !machineState.recoveryAfterError &&
     !machineState.e050Lot &&
-    manualPurgeOrClear &&
+    !!machineState.refillActive &&
     !!machineState.refillPrompt &&
     !!onRefillConfirm;
-  const skipCut = !!machineState.refillSkipCut;
   const e050Ask = recoveryStage === 'e050_materialist';
   const trayFull = recoveryStage === 'tray_full';
   const recoveryTitle = trayFull
@@ -290,12 +290,8 @@ export const CycleTab: React.FC<CycleTabProps> = ({
         : recoveryStage === 'continue_cycle'
         ? t('recovery_continue_hint')
         : recoveryStage === 'await_feed'
-          ? skipCut
-            ? t('refill_confirm_hint_await_nocut')
-            : t('refill_confirm_hint_await')
-          : skipCut
-            ? t('refill_confirm_hint_feed_nocut')
-            : t('refill_confirm_hint_feed');
+          ? t('refill_confirm_hint_await')
+          : t('refill_confirm_hint_feed');
   // Refill manual: solo banner sky. Amber = recovery/E050/tray.
   const showRecoveryActions =
     !showManualRefill &&
@@ -564,6 +560,20 @@ export const CycleTab: React.FC<CycleTabProps> = ({
               {t('btn_refill_confirm_retry')}
             </button>
           )}
+          {(recoveryStage === 'await_feed' || recoveryStage === 'after_feed') &&
+            onRefillClean && (
+            <button
+              id="btn-cycle-recovery-clean"
+              type="button"
+              title={t('btn_purge_clean_hint')}
+              onClick={onRefillClean}
+              disabled={!machineState.refillAwaitingConfirm}
+              className="inline-flex items-center gap-1.5 rounded-md border border-sky-600 bg-sky-600 px-3 py-2 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-50"
+            >
+              <Eraser className="h-3.5 w-3.5" />
+              {t('btn_purge_clean')}
+            </button>
+          )}
           {(recoveryStage === 'after_feed' || recoveryStage === 'await_feed') &&
             onRefillConfirm && (
             <button
@@ -688,26 +698,18 @@ export const CycleTab: React.FC<CycleTabProps> = ({
         <div className="flex flex-wrap items-center gap-3 rounded-md border border-sky-300 dark:border-sky-700 bg-sky-50 dark:bg-sky-950/50 px-3 py-3 shadow-2xs">
           <div className="min-w-0 flex-1">
             <p className={`${hmiAssistTitle} text-sky-900 dark:text-sky-100`}>
-              {machineState.clearActive
-                ? machineState.refillPrompt === 'working'
-                  ? t('clear_working_title')
-                  : t('clear_decide_title')
-                : machineState.refillPrompt === 'working'
-                  ? t('refill_confirm_title_working')
-                  : machineState.refillPrompt === 'await_feed'
-                    ? t('refill_confirm_title_await')
-                    : t('refill_confirm_title_feed')}
+              {machineState.refillPrompt === 'working'
+                ? t('refill_confirm_title_working')
+                : machineState.refillPrompt === 'await_feed'
+                  ? t('refill_confirm_title_await')
+                  : t('refill_confirm_title_feed')}
             </p>
             <p className={`mt-1 ${hmiAssistHint} text-sky-800/80 dark:text-sky-200/80`}>
-              {machineState.clearActive
-                ? machineState.refillPrompt === 'working'
-                  ? t('clear_working_hint')
-                  : t('clear_decide_hint')
-                : machineState.refillPrompt === 'working'
-                  ? t('refill_confirm_hint_working')
-                  : machineState.refillPrompt === 'await_feed'
-                    ? t('refill_confirm_hint_await')
-                    : t('refill_confirm_hint_feed')}
+              {machineState.refillPrompt === 'working'
+                ? t('refill_confirm_hint_working')
+                : machineState.refillPrompt === 'await_feed'
+                  ? t('refill_confirm_hint_await')
+                  : t('refill_confirm_hint_feed')}
             </p>
           </div>
           {(machineState.refillPrompt === 'await_feed' ||
@@ -721,7 +723,22 @@ export const CycleTab: React.FC<CycleTabProps> = ({
               className={hmiModuleBtnWarning}
             >
               <RotateCcw className="h-3.5 w-3.5" />
-              {machineState.clearActive ? t('btn_clear_retry') : t('btn_refill_confirm_retry')}
+              {t('btn_refill_confirm_retry')}
+            </button>
+          )}
+          {(machineState.refillPrompt === 'await_feed' ||
+            machineState.refillPrompt === 'after_feed') &&
+            onRefillClean && (
+            <button
+              id="btn-cycle-purge-clean"
+              type="button"
+              title={t('btn_purge_clean_hint')}
+              onClick={onRefillClean}
+              disabled={!machineState.refillAwaitingConfirm}
+              className="inline-flex items-center gap-1.5 rounded-md border border-sky-600 bg-sky-600 px-3 py-2 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-50"
+            >
+              <Eraser className="h-3.5 w-3.5" />
+              {t('btn_purge_clean')}
             </button>
           )}
           {machineState.refillPrompt !== 'working' && (
@@ -733,7 +750,7 @@ export const CycleTab: React.FC<CycleTabProps> = ({
               className={hmiModuleBtnSuccess}
             >
               <Check className="h-3.5 w-3.5" />
-              {machineState.clearActive ? t('btn_clear_continue') : t('btn_refill_confirm_next_cut')}
+              {t('btn_refill_confirm_next_cut')}
             </button>
           )}
         </div>

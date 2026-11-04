@@ -177,7 +177,7 @@ export const hmiIndicationShell =
 export const hmiIndicationBanner =
   'flex w-full flex-1 flex-wrap items-center justify-center gap-4 rounded-xl border px-5 py-5 sm:gap-5 sm:px-8 sm:py-7 min-h-[7rem]';
 export const hmiIndicationAlert =
-  'flex w-full flex-1 items-center justify-center px-4 py-6 text-center text-2xl font-black uppercase leading-tight tracking-wide sm:px-6 sm:py-8 sm:text-3xl lg:text-4xl';
+  'flex w-full shrink-0 items-center justify-center px-4 py-6 text-center text-2xl font-black uppercase leading-tight tracking-wide sm:px-6 sm:py-8 sm:text-3xl lg:text-4xl';
 export const hmiIndicationTitle =
   'text-xl font-bold leading-snug sm:text-2xl lg:text-3xl';
 export const hmiIndicationHint =

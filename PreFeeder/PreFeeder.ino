@@ -74,6 +74,13 @@ static bool holguraSensorRawOn() {
 
 static bool holguraOkStable() { return holguraStableOn; }
 
+// Operador: ignorar GPIO holgura (material residual). No persiste en NVS.
+static bool holguraSensorOmit = false;
+
+static bool holguraRequirementMet() {
+  return holguraSensorOmit || holguraOkStable();
+}
+
 // Misma espera que GPIO19: 50 ms ON, 100 ms OFF.
 static void debounceLevel(bool raw, uint32_t dt, uint32_t& onMs, uint32_t& offMs, bool& stable) {
   if (raw) {
@@ -445,7 +452,7 @@ static bool holguraOffFaultPaused() {
 // Auto ON (también esperando in process): OFF estable > N s → fallo.
 // Sigue contando en HOLG_WAIT_ON aunque el feeder esté girando.
 static void serviceHolguraOffFault(uint32_t nowMs) {
-  if (!P || fault != FAULT_NONE || !autoOn || idleMode) {
+  if (!P || fault != FAULT_NONE || !autoOn || idleMode || holguraSensorOmit) {
     holguraOffSinceMs = 0;
     return;
   }
@@ -467,7 +474,8 @@ static bool feederStepperMoving() {
 // Armado + holgura OFF estable + feeder quieto de verdad > T s → mismo fallo de holgura.
 // No corre fuera de producción: ahí el motor está quieto a propósito y vale el timer de OFF.
 static void serviceHolguraStallFault(uint32_t nowMs) {
-  if (!P || fault != FAULT_NONE || !motionArmed() || holguraOkStable() || feederStepperMoving()) {
+  if (!P || fault != FAULT_NONE || !motionArmed() || holguraSensorOmit
+      || holguraOkStable() || feederStepperMoving()) {
     holguraStallSinceMs = 0;
     return;
   }
@@ -512,7 +520,7 @@ static void serviceHolguraFeed(uint32_t nowMs) {
 // Idle solo con buffer full estable, holgura ON y el ciclo de asentamiento cerrado.
 // Cortar en el flanco (settle / n s / Tfeed) deja el feeder a medias.
 static bool settledForIdle() {
-  if (!gSnap.bufFullStable || !holguraOkStable()) return false;
+  if (!gSnap.bufFullStable || !holguraRequirementMet()) return false;
   if (feederDemand || feederMode != FEED_NONE) return false;
   return holguraPhase == HOLG_IDLE;
 }
@@ -773,6 +781,13 @@ void machineHandleCommand(const NetCommand& cmd) {
       paramsValidate(*P);
       paramsSave(*P);
       break;
+    case NC_SET_HOLGURA_OMIT:
+      holguraSensorOmit = (cmd.arg == "1" || cmd.arg == "true" || cmd.arg == "on");
+      if (holguraSensorOmit) {
+        holguraOffSinceMs = 0;
+        holguraStallSinceMs = 0;
+      }
+      break;
     case NC_SET_REFILL_PULSE:
       P->refillPulseMs = (uint32_t)(cmd.arg.toFloat() * 1000.0f);
       paramsValidate(*P);
@@ -840,16 +855,16 @@ void machineTick(uint32_t nowMs) {
       pendingTrigger = false;
       pendingTriggerId = 0;
       pendingTriggerSec = 0.0f;
-      if (P->hmiTfeedEnabled && holguraOkStable())
+      if (P->hmiTfeedEnabled && holguraRequirementMet())
         startTfeedDemand(nowMs, sec, tid);
-      else if (!holguraOkStable()) {
+      else if (!holguraRequirementMet()) {
         holguraActiveTriggerId = tid;
         beginHolguraFeed(nowMs);
       } else if (tid)
         triggerIdRemember(tid);  // holgura ya ON: no arrancar ciclo OFF→ON
     // Holgura OFF siempre rearma feeder aunque postCycleOffWatch esté activo (ciclo
     // terminó con holgura OFF tras haber visto ON): omitirlo dejaba solo buffer/DeReeler.
-    } else if (!feederDemand && !holguraOkStable())
+    } else if (!feederDemand && !holguraOkStable() && !holguraSensorOmit)
       beginHolguraFeed(nowMs);
     serviceFeederDemand(nowMs);
     serviceBoostEdges(nowMs);     // impulsos mid/high + inversión temporizada
@@ -986,6 +1001,9 @@ static void dispatchPeerJson(const String& line) {
   } else if (cmd == "setHmiTfeedEnabled" || cmd == "setTfeedEnabled") {
     nc.type = NC_SET_HMI_TFEED;
     nc.arg = val;
+  } else if (cmd == "setHolguraOmit" || cmd == "holguraOmit") {
+    nc.type = NC_SET_HOLGURA_OMIT;
+    nc.arg = val;
   } else if (cmd == "setRefillPulseS" || cmd == "refillPulseS") {
     nc.type = NC_SET_REFILL_PULSE;
     nc.arg = val;
@@ -1034,6 +1052,8 @@ static String buildPeerStatus(const MachineStatus& c, const SensorSnapshot& s) {
   j += s.hoseAbsent ? "true" : "false";
   j += ",\"holgura\":";
   j += s.holguraOn ? "true" : "false";
+  j += ",\"holguraOmit\":";
+  j += holguraSensorOmit ? "true" : "false";
   j += ",\"error\":";
   j += c.fault != FAULT_NONE ? "true" : "false";
   j += ",\"errorCode\":";

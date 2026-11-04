@@ -97,10 +97,6 @@ export function setCycleStepByStep(on: boolean) {
   );
 }
 
-export function startCycleClear() {
-  return post<{ ok: boolean; error?: string }>('/api/cycle/clear', {});
-}
-
 export function startCycleRefill(opts?: { mm?: number; asdaMm?: number }) {
   const body: Record<string, unknown> = {};
   if (opts?.mm != null) body.mm = opts.mm;
@@ -110,6 +106,10 @@ export function startCycleRefill(opts?: { mm?: number; asdaMm?: number }) {
 
 export function confirmCycleRefill(ok: boolean = true) {
   return post<{ ok: boolean; error?: string }>('/api/cycle/refill/confirm', { ok });
+}
+
+export function purgeCleanFeed() {
+  return post<{ ok: boolean; error?: string }>('/api/cycle/refill/clean', {});
 }
 
 export function confirmRecoveryReview(ok: boolean = true) {
@@ -252,7 +252,10 @@ export function prefeederAction(
   action: string,
   extra: Record<string, unknown> = {}
 ) {
-  return post<{ ok: boolean; error?: string; pulseS?: number }>('/api/prefeeder', { action, ...extra });
+  return post<{ ok: boolean; error?: string; pulseS?: number; active?: boolean; side?: string }>(
+    '/api/prefeeder',
+    { action, ...extra }
+  );
 }
 
 export function andonAction(

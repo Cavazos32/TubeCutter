@@ -131,7 +131,7 @@ bool feedQueueTest(const FeedTestReq& req, String& err);
 // skipValidate: purga/refill — creep hasta láser ON por lado, sin OM.
 // targetMm ignorado (legado Long feed). Timeout FEED_PURGE_LASER_TIMEOUT_MS.
 bool feedQueueTestSide(int8_t onlySide, String& err, bool skipValidate = false,
-                       float targetMm = 0.0f);
+                       float targetMm = 0.0f, uint32_t feedDurationMs = 0);
 bool feedResetRuntime();
 
 void motionTcpOnEncoderError();

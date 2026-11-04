@@ -48,7 +48,6 @@ export interface BackendCycleSnapshot {
   busy?: boolean;
   stepByStep: boolean;
   refillActive?: boolean;
-  clearActive?: boolean;
   refillAwaitingConfirm?: boolean;
   refillPrompt?: string;
   step: number;
@@ -74,7 +73,6 @@ export interface BackendCycleSnapshot {
   e050FinishPiece?: boolean;
   e050MaterialistRequested?: boolean;
   e050MaterialistWait?: boolean;
-  refillSkipCut?: boolean;
   /** Clave JSON que el backend debe emitir en snapshot.cycle (booleano). */
   purgeHandsWarning?: boolean;
   asdaMoveWarning?: boolean;
@@ -148,6 +146,7 @@ export interface BackendPreFeeder {
   bufferReady?: boolean;
   /** Iniciar alimentador: preparación en curso. */
   manualPrepBusy?: boolean;
+  holguraOmit?: { L?: boolean; R?: boolean };
   sides?: {
     L?: BackendPfSide;
     R?: BackendPfSide;

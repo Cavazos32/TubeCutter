@@ -288,14 +288,14 @@ function AppMain() {
             onRefill={() => {
               void hmi.startRefill();
             }}
-            onClear={() => {
-              void hmi.startClear();
-            }}
             onRefillConfirm={(ok) => {
               void hmi.confirmRefill(ok);
             }}
             onRefillRetry={() => {
               void hmi.retryRefill();
+            }}
+            onRefillClean={() => {
+              void hmi.purgeCleanFeed();
             }}
             onRefillLongFeed={() => {
               void hmi.retryRefill(REFILL_LONG_FEED_MM);
@@ -350,6 +350,9 @@ function AppMain() {
             }}
             onRefillRetry={() => {
               void hmi.retryRefill();
+            }}
+            onRefillClean={() => {
+              void hmi.purgeCleanFeed();
             }}
             onRefillLongFeed={() => {
               void hmi.retryRefill(REFILL_LONG_FEED_MM);

@@ -1,31 +1,31 @@
 {
   "andonBuzzerMute": true,
   "debugPassword": "tcm2026",
-  "maintenanceCycleCount": 2206,
+  "maintenanceCycleCount": 2307,
   "checklistRequired": false,
   "checklistLastCompletedAt": "2026-10-27T16:54:51Z",
   "checklistSession": null,
   "--- cycle ---": null,
   "holderOnMs": 25, // 2 Espera: sujetador
-  "grippersOnMs": 80, // 7 Espera: pinzas cerradas
-  "holderOpenMs": 50, // 10 Espera: tubo liberado
+  "grippersOnMs": 25, // 7 Espera: pinzas cerradas
+  "holderOpenMs": 300, // 10 Espera: tubo liberado
   "linearDoneMs": 20, // 12 Espera antes del corte
-  "holderPrecutMs": 100, // 14 Espera: listo para cortar
+  "holderPrecutMs": 300, // 14 Espera: listo para cortar
   "cutterPulseMs": 100, // 16 Tiempo de corte
-  "cutterPostMs": 100, // 18 Espera tras el corte
+  "cutterPostMs": 300, // 18 Espera tras el corte
   "cutterSettleMs": 80, // 19 Asentamiento mínimo del cortador
   "dwellAtDestMs": 10, // 21 Espera en depósito
   "gripperReleaseMs": 30, // 23 Espera: pinzas abiertas
   "asentarMs": 50, // 27 Espera: material asentado
   "asdaHomeEpsMm": 1.0,
-  "cutOffsetMm": 1.0,
+  "cutOffsetMm": 3.0,
   "depositBatchSize": 50,
   "depositExtraMm": 100.0,
   "depositMaxTravelMm": 1500.0,
   "depositStackGapMm": 100.0,
-  "feedSides": "R",
+  "feedSides": "L",
   "feedWaitTimeoutS": 15.0,
-  "gripperClearanceMm": 15.0,
+  "gripperClearanceMm": 20.0,
   "motionIdleNoTargetS": 1.0,
   "motionTargetTolMm": 3.0,
   "motionWaitTimeoutS": 25.0,
@@ -36,6 +36,7 @@
   "pfTriggerEnabled": false,
   "pieceWatchTimeoutS": 20.0,
   "plcBlowerSec": 0.2,
+  "purgeDepositMm": 100.0,
   "purgeWarningLeadS": 0.3,
   "refillAsdaMm": -300.0,
   "refillLaserTimeoutS": 10.0,

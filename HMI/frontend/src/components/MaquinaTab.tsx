@@ -25,6 +25,7 @@ import { CHECKLIST_PIECE_EXTRA_MM } from '../types/checklist';
 import { LogTerminal } from './LogTerminal';
 import { useApp } from '../context/AppContext';
 import { isGenericErrorText } from '../api/mappers';
+import { PfHolguraOmitModal } from './PfHolguraOmitModal';
 import {
   hmiIndicationAlert,
   hmiIndicationBanner,
@@ -78,9 +79,9 @@ interface MaquinaTabProps {
   onReset: () => void;
   onMachineHome?: () => void | Promise<void>;
   onRefill?: () => void;
-  onClear?: () => void;
   onRefillConfirm?: (ok: boolean) => void;
   onRefillRetry?: () => void;
+  onRefillClean?: () => void;
   onRefillLongFeed?: () => void;
   onRecoveryReview?: (ok: boolean) => void;
   onPfStart?: () => void;
@@ -121,9 +122,9 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
   onReset,
   onMachineHome,
   onRefill,
-  onClear,
   onRefillConfirm,
   onRefillRetry,
+  onRefillClean,
   onRecoveryReview,
   onPfStart,
   onPfRefill,
@@ -146,6 +147,7 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
   const offsetDirtyRef = useRef(false);
   const offsetSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [btnFlash, setBtnFlash] = useState({ stop: false, reset: false, home: false });
+  const [holguraOmitModalSide, setHolguraOmitModalSide] = useState<'L' | 'R' | null>(null);
   const btnFlashTimers = useRef<Partial<Record<'stop' | 'reset', ReturnType<typeof setTimeout>>>>({});
 
   const pulseBtn = (key: 'stop' | 'reset') => {
@@ -314,32 +316,20 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
   const pfConnected = preFeederState.connection.connected;
   const pfHasError = !!preFeederState.hasError && pfConnected;
   const pfStartReady = !!preFeederState.bufferReady;
-  const clearRun = !!machineState.clearActive;
-  const skipCut = !!machineState.refillSkipCut;
-  const manualTitle = clearRun
-    ? machineState.refillPrompt === 'working'
-      ? t('clear_working_title')
-      : t('clear_decide_title')
-    : machineState.refillPrompt === 'working'
+  const manualTitle =
+    machineState.refillPrompt === 'working'
       ? t('refill_confirm_title_working')
       : machineState.refillPrompt === 'await_feed'
         ? t('refill_confirm_title_await')
         : t('refill_confirm_title_feed');
-  const manualHint = clearRun
-    ? machineState.refillPrompt === 'working'
-      ? t('clear_working_hint')
-      : t('clear_decide_hint')
-    : machineState.refillPrompt === 'working'
+  const manualHint =
+    machineState.refillPrompt === 'working'
       ? t('refill_confirm_hint_working')
       : machineState.refillPrompt === 'await_feed'
-        ? skipCut
-          ? t('refill_confirm_hint_await_nocut')
-          : t('refill_confirm_hint_await')
-        : skipCut
-          ? t('refill_confirm_hint_feed_nocut')
-          : t('refill_confirm_hint_feed');
-  const retryLabel = clearRun ? t('btn_clear_retry') : t('btn_refill_confirm_retry');
-  const continueLabel = clearRun ? t('btn_clear_continue') : t('btn_refill_confirm_next_cut');
+        ? t('refill_confirm_hint_await')
+        : t('refill_confirm_hint_feed');
+  const retryLabel = t('btn_refill_confirm_retry');
+  const continueLabel = t('btn_refill_confirm_next_cut');
   const modelMm = Math.abs(Number(models[selectedModelIndex]?.mm ?? machineState.mm ?? 0));
   const workLengthMm = modelMm + CHECKLIST_PIECE_EXTRA_MM;
   const workLengthLabel = Number.isInteger(workLengthMm)
@@ -370,11 +360,7 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
       ? 'ask'
       : recoveryStage === 'e050_finishing'
         ? 'piece'
-      : recoveryStage === 'e050_materialist_wait' ||
-          ((recoveryStage === 'working' ||
-            recoveryStage === 'await_feed' ||
-            recoveryStage === 'after_feed') &&
-            skipCut)
+      : recoveryStage === 'e050_materialist_wait'
         ? 'empty'
         : recoveryStage === 'review_piece' || recoveryStage === 'verify_piece'
           ? 'review'
@@ -413,12 +399,10 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
     showRecoveryTrack;
   const showMachineResetCoach = showErrorProcess && processStep === 'reset';
   const showMachineResumeCoach = showErrorProcess && processStep === 'resume';
-  const manualPurgeOrClear =
-    !!machineState.refillActive || !!machineState.clearActive;
   const showManualRefill =
     !machineState.recoveryAfterError &&
     !machineState.e050Lot &&
-    manualPurgeOrClear &&
+    !!machineState.refillActive &&
     !!machineState.refillPrompt &&
     !!onRefillConfirm;
   const showRecoveryActions =
@@ -486,12 +470,8 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
                 : recoveryStage === 'working'
                   ? t('refill_confirm_hint_working')
                   : recoveryStage === 'await_feed'
-                    ? skipCut
-                      ? t('refill_confirm_hint_await_nocut')
-                      : t('refill_confirm_hint_await')
-                    : skipCut
-                      ? t('refill_confirm_hint_feed_nocut')
-                      : t('refill_confirm_hint_feed');
+                    ? t('refill_confirm_hint_await')
+                    : t('refill_confirm_hint_feed');
 
   const processHint = e050Lot
     ? processStep === 'ask'
@@ -534,7 +514,6 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
   const startDisabled =
     hasFault ||
     machineState.isRunning ||
-    postLotPfSettle ||
     machineState.refillActive ||
     checklistRequired;
   const checklistBlocksResume =
@@ -1119,6 +1098,20 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
                     {t('btn_refill_confirm_retry')}
                   </button>
                 )}
+                {(recoveryStage === 'await_feed' || recoveryStage === 'after_feed') &&
+                  onRefillClean && (
+                  <button
+                    id="btn-recovery-purge-clean"
+                    type="button"
+                    title={t('btn_purge_clean_hint')}
+                    onClick={onRefillClean}
+                    disabled={!machineState.refillAwaitingConfirm}
+                    className={`${hmiIndicationBtn} border border-sky-600 bg-sky-600 text-white hover:bg-sky-700`}
+                  >
+                    <Eraser className={iconBtn} />
+                    {t('btn_purge_clean')}
+                  </button>
+                )}
                 {(recoveryStage === 'after_feed' || recoveryStage === 'await_feed') &&
                   onRefillConfirm && (
                   <button
@@ -1268,6 +1261,21 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
                     {retryLabel}
                   </button>
                 )}
+                {(machineState.refillPrompt === 'await_feed' ||
+                  machineState.refillPrompt === 'after_feed') &&
+                  onRefillClean && (
+                  <button
+                    id="btn-purge-clean-maquina"
+                    type="button"
+                    title={t('btn_purge_clean_hint')}
+                    onClick={onRefillClean}
+                    disabled={!machineState.refillAwaitingConfirm}
+                    className={`${hmiIndicationBtn} border border-sky-600 bg-sky-600 text-white hover:bg-sky-700`}
+                  >
+                    <Eraser className={iconBtn} />
+                    {t('btn_purge_clean')}
+                  </button>
+                )}
                 {machineState.refillPrompt !== 'working' && (
                   <button
                     id="btn-refill-confirm-yes"
@@ -1295,10 +1303,10 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
                 id="btn-refill-maquina"
                 type="button"
                 onClick={onRefill}
-                disabled={!onRefill || clearRun}
+                disabled={!onRefill}
                 title={t('refill_helpers_subtitle')}
                 className={`${btnBase} ${btnText} ${
-                  !onRefill || clearRun
+                  !onRefill
                     ? 'border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 text-slate-400 cursor-not-allowed'
                     : machineState.refillActive
                       ? btnAuxOn
@@ -1307,22 +1315,6 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
               >
                 <Droplets className={iconBtn} />
                 <span>{t('btn_refill')}</span>
-              </button>
-              <button
-                id="btn-clear-maquina"
-                type="button"
-                onClick={onClear}
-                disabled={!onClear || (machineState.purgeBusy && !clearRun)}
-                className={`${btnBase} ${btnText} ${
-                  !onClear || (machineState.purgeBusy && !clearRun)
-                    ? 'border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 text-slate-400 cursor-not-allowed'
-                    : clearRun
-                      ? btnAuxOn
-                      : btnAuxIdle
-                }`}
-              >
-                <Eraser className={iconBtn} />
-                <span>{t('btn_clear')}</span>
               </button>
               <button
                 id="btn-home-maquina"
@@ -1439,10 +1431,55 @@ export const MaquinaTab: React.FC<MaquinaTabProps> = ({
                 <ChevronsRight className={iconBtn} />
                 <span>{t('pf_jog_r')}</span>
               </button>
+              <button
+                id="btn-main-pf-holgura-omit-l"
+                type="button"
+                onClick={() => setHolguraOmitModalSide('L')}
+                disabled={!pfConnected}
+                title={
+                  preFeederState.holguraOmitL
+                    ? t('pf_holgura_omit_active_hint')
+                    : t('pf_holgura_omit_on_hint')
+                }
+                className={`${btnBase} ${btnText} disabled:opacity-40 ${
+                  preFeederState.holguraOmitL ? btnAuxOn : btnAuxIdle
+                }`}
+              >
+                <span>{t('pf_holgura_omit_l')}</span>
+              </button>
+              <button
+                id="btn-main-pf-holgura-omit-r"
+                type="button"
+                onClick={() => setHolguraOmitModalSide('R')}
+                disabled={!pfConnected}
+                title={
+                  preFeederState.holguraOmitR
+                    ? t('pf_holgura_omit_active_hint')
+                    : t('pf_holgura_omit_on_hint')
+                }
+                className={`${btnBase} ${btnText} disabled:opacity-40 ${
+                  preFeederState.holguraOmitR ? btnAuxOn : btnAuxIdle
+                }`}
+              >
+                <span>{t('pf_holgura_omit_r')}</span>
+              </button>
             </div>
           </section>
         </div>
       </div>
+
+      {holguraOmitModalSide && (
+        <PfHolguraOmitModal
+          isOpen
+          side={holguraOmitModalSide}
+          active={
+            holguraOmitModalSide === 'L'
+              ? !!preFeederState.holguraOmitL
+              : !!preFeederState.holguraOmitR
+          }
+          onClose={() => setHolguraOmitModalSide(null)}
+        />
+      )}
 
       {showLogs && (
         <div className="shrink-0 border-t border-slate-200 bg-slate-50/90 px-2 pb-2 pt-1 dark:border-slate-800 dark:bg-slate-950/90 [&_.mt-4]:mt-0">

@@ -71,6 +71,7 @@ static uint16_t cmdId = 1;
 struct SideView {
   bool home = false;
   bool holgura = false;
+  bool holguraOmit = false;
   bool mid = false;
   bool high = false;
   bool endstop = false;
@@ -352,6 +353,7 @@ static void parseSideSnapshot(const char* j, SideView& s)
 {
   s.home = jBool(j, "home", s.home);
   s.holgura = jBool(j, "holgura", s.holgura);
+  s.holguraOmit = jBool(j, "holguraOmit", s.holguraOmit);
   s.mid = jBool(j, "mid", s.mid);
   s.high = jBool(j, "high", s.high);
   s.endstop = jBool(j, "endstop", s.endstop);
@@ -656,6 +658,7 @@ static void appendSideJson(String& j, const char* key, const SideView& s)
   j += ",\""; j += key; j += "\":{";
   j += "\"home\":"; j += s.home ? "true" : "false";
   j += ",\"holgura\":"; j += s.holgura ? "true" : "false";
+  j += ",\"holguraOmit\":"; j += s.holguraOmit ? "true" : "false";
   j += ",\"mid\":"; j += s.mid ? "true" : "false";
   j += ",\"high\":"; j += s.high ? "true" : "false";
   j += ",\"endstop\":"; j += s.endstop ? "true" : "false";
@@ -1373,6 +1376,16 @@ static void pfTcpOnLine(const char* line)
   if (cmdName == "setHmiTfeedEnabled" || cmdName == "setTfeedEnabled") {
     const bool ok = pfDispatchCmd(cmdName, pfPeerOnOffVal(pfTcpCmdValue), '-');
     pfTcpTxAck(0, ok, ok ? "" : "setHmiTfeedEnabled sin enlace L/R");
+    return;
+  }
+  if (cmdName == "setHolguraOmit" || cmdName == "holguraOmit") {
+    const char side = jSideChar(line, '-');
+    if (side != 'L' && side != 'R') {
+      pfTcpTxAck(0, false, "setHolguraOmit requiere side L|R");
+      return;
+    }
+    const bool ok = pfDispatchCmd(cmdName, pfPeerOnOffVal(pfTcpCmdValue), side);
+    pfTcpTxAck(0, ok, ok ? "" : "setHolguraOmit sin enlace al esclavo");
     return;
   }
   if (cmdName == "ping") {

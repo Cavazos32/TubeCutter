@@ -76,7 +76,6 @@ const DEFAULT_MACHINE: MachineState = {
   cycleMaterialist: false,
   cycleBusy: false,
   refillActive: false,
-  clearActive: false,
   refillAwaitingConfirm: false,
   refillPrompt: '',
   recoveryPrompt: '',
@@ -85,7 +84,6 @@ const DEFAULT_MACHINE: MachineState = {
   recoveryAfterError: false,
   e050Lot: false,
   e050FinishPiece: false,
-  refillSkipCut: false,
   purgeHandsWarning: false,
   asdaMoveWarning: false,
   purgeBusy: false,
@@ -479,17 +477,6 @@ export function useHmiState() {
       .catch(() => {});
   }, []);
 
-  const startClear = useCallback(async () => {
-    try {
-      const res = await api.startCycleClear();
-      if (res && res.ok === false && res.error) {
-        window.alert(res.error);
-      }
-    } catch {
-      /* ignore */
-    }
-  }, []);
-
   const startRefill = useCallback(async (opts?: { mm?: number; asdaMm?: number }) => {
     try {
       const c = snapRef.current?.cycle;
@@ -534,6 +521,17 @@ export function useHmiState() {
   const retryRefill = useCallback(async (mm?: number) => {
     try {
       const res = await api.retryCycleRefill(mm != null ? { mm } : undefined);
+      if (res && res.ok === false && res.error) {
+        window.alert(res.error);
+      }
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const purgeCleanFeed = useCallback(async () => {
+    try {
+      const res = await api.purgeCleanFeed();
       if (res && res.ok === false && res.error) {
         window.alert(res.error);
       }
@@ -918,10 +916,10 @@ export function useHmiState() {
     toggleCycleMaterialist,
     toggleCycleBusy,
     setCycleStepByStep,
-    startClear,
     startRefill,
     confirmRefill,
     retryRefill,
+    purgeCleanFeed,
     confirmRecoveryReview,
     reloadFeedOffset,
     saveCycleConfig,
