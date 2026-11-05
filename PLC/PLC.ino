@@ -125,6 +125,7 @@ struct ValveJob {
   uint8_t ackByte;
   uint8_t flags;
   uint16_t reqId;
+  unsigned long enqueuedMs;
 };
 
 static ValveJob valveJobs[VALVE_JOB_Q];
@@ -133,6 +134,7 @@ static uint8_t valveJobCount = 0;
 static unsigned long lastValvePulseEndMs = 0;
 
 static char lineQ[LINE_Q][240];
+static unsigned long lineQMs[LINE_Q];
 static uint8_t lineQHead = 0;
 static uint8_t lineQn = 0;
 
@@ -144,8 +146,14 @@ static uint8_t vpAckByte = 0;
 static uint8_t vpFlags = 0;
 static uint16_t vpReqId = 0;
 static unsigned long vpPhaseMs = 0;
+static unsigned long vpEnqueuedMs = 0;
 // id del comando que se está interpretando. El pulso lo copia a su job.
 static uint16_t tcpReqId = 0;
+// millis() del RX/dispatch del comando actual (latencia end-to-end ACK).
+static unsigned long tcpReqMs = 0;
+
+static void ackTraceDebt(const char* tag, uint8_t byteCode, uint16_t reqId,
+                         unsigned long ageMs, const char* extra);
 
 static bool valveEnqueue(const uint8_t* pins, uint8_t n, uint8_t ackByte, uint8_t flags)
 {
@@ -158,6 +166,7 @@ static bool valveEnqueue(const uint8_t* pins, uint8_t n, uint8_t ackByte, uint8_
   j.ackByte = ackByte;
   j.flags = flags;
   j.reqId = tcpReqId;
+  j.enqueuedMs = tcpReqMs ? tcpReqMs : millis();
   valveJobCount++;
   return true;
 }
@@ -267,7 +276,13 @@ static bool setPlcOutputByName(const char* outName, bool state, bool& deferred)
       if (needL) stCutterL = state;
       syncCuttersFlag();
       deferred = true;
+#if PLC_ACK_TRACE
+      ackTraceDebt("defer", PLC_CMD_CUTTERS, tcpReqId, 0, "setOut CUTTERS");
+#endif
     } else {
+#if PLC_ACK_TRACE
+      ackTraceDebt("imm", PLC_CMD_CUTTERS, tcpReqId, 0, "setOut ya en estado");
+#endif
       plcSendAck(PLC_CMD_CUTTERS, true, "", tcpReqId);
     }
   }
@@ -371,6 +386,30 @@ static uint8_t ackQn = 0;
 static char ackSpill[192];
 static bool ackSpillOn = false;
 
+#if PLC_ACK_TRACE
+static void ackTraceDebt(const char* tag, uint8_t byteCode, uint16_t reqId,
+                         unsigned long ageMs, const char* extra)
+{
+  Serial.printf(
+      "[ACK] %s byte=0x%02X id=%u age=%lums lineQ=%u jobQ=%u ackQ=%u spill=%u "
+      "vp=%u hold=%u%s%s\n",
+      tag ? tag : "?",
+      (unsigned)byteCode,
+      (unsigned)reqId,
+      (unsigned long)ageMs,
+      (unsigned)lineQn,
+      (unsigned)valveJobCount,
+      (unsigned)ackQn,
+      ackSpillOn ? 1u : 0u,
+      (unsigned)vpPhase,
+      (unsigned)txHold.len,
+      (extra && extra[0]) ? " · " : "",
+      (extra && extra[0]) ? extra : "");
+}
+#else
+static void ackTraceDebt(const char*, uint8_t, uint16_t, unsigned long, const char*) {}
+#endif
+
 static void ackReset()
 {
   ackQHead = 0;
@@ -420,18 +459,40 @@ static bool ackStore(const char* line)
 // spill guarda el más nuevo si la cola ya está llena; no se descarta.
 static void ackPush(const char* line)
 {
-  if (!line || !line[0] || !tcpLinkOk()) return;
+  if (!line || !line[0] || !tcpLinkOk()) {
+#if PLC_ACK_TRACE
+    if (line && line[0])
+      Serial.println("[ACK] push drop · TCP off");
+#endif
+    return;
+  }
   if (!txHold.len && espTcpHoldPut(txHold, line)) {
     if (!espTcpHoldFlush(tcpClient, txHold) && !tcpClient.connected())
       tcpNoteDead();
+#if PLC_ACK_TRACE
+    Serial.printf("[ACK] tx path=hold%s\n",
+                  txHold.len ? " (parcial)" : " (flush)");
+#endif
     return;
   }
-  if (ackStore(line)) return;
+  if (ackStore(line)) {
+#if PLC_ACK_TRACE
+    Serial.printf("[ACK] tx path=queue ackQ=%u\n", (unsigned)ackQn);
+#endif
+    return;
+  }
   if (!ackSpillOn && ackCopyLine(ackSpill, sizeof(ackSpill), line)) {
     ackSpillOn = true;
+#if PLC_ACK_TRACE
+    Serial.println("[ACK] tx path=spill");
+#endif
     return;
   }
   Serial.println("[TCP] ACK no enviado");
+#if PLC_ACK_TRACE
+  Serial.printf("[ACK] DROP ackQ=%u hold=%u\n",
+                (unsigned)ackQn, (unsigned)txHold.len);
+#endif
 }
 
 static void tcpTxPump()
@@ -472,6 +533,8 @@ static bool ackCanAcceptCommand()
 
 static void plcSendAck(uint8_t cmdByte, bool ok, const char* message, uint16_t reqId)
 {
+  const unsigned long now = millis();
+  const unsigned long ageMs = (tcpReqMs && now >= tcpReqMs) ? (now - tcpReqMs) : 0;
   char buf[192];
   if (reqId) {
     snprintf(buf, sizeof(buf),
@@ -486,6 +549,10 @@ static void plcSendAck(uint8_t cmdByte, bool ok, const char* message, uint16_t r
              (unsigned)PLCA_PROTO_VER, (unsigned)cmdByte,
              ok ? "true" : "false", message ? message : "");
   }
+  ackTraceDebt(ok ? "send_ok" : "send_ng", cmdByte, reqId, ageMs,
+               (message && message[0]) ? message : "");
+  if (ageMs >= ACK_SLOW_WARN_MS)
+    ackTraceDebt("SLOW", cmdByte, reqId, ageMs, "cerca del watch HMI");
   ackPush(buf);
 }
 
@@ -682,11 +749,23 @@ static void valveFinishJob()
 {
   const uint8_t flags = vpFlags;
   const uint8_t ackByte = vpAckByte;
+  const uint16_t reqId = vpReqId;
+  const unsigned long enqMs = vpEnqueuedMs;
   vpPhase = VP_IDLE;
   vpN = 0;
   vpFlags = 0;
-  if ((flags & JOB_ACK) && ackByte)
-    plcSendAck(ackByte, true, "", vpReqId);
+  vpEnqueuedMs = 0;
+  if ((flags & JOB_ACK) && ackByte) {
+    // Latencia desde el RX del comando (no desde el inicio del HIGH).
+    tcpReqMs = enqMs ? enqMs : tcpReqMs;
+#if PLC_ACK_TRACE
+    const unsigned long now = millis();
+    const unsigned long pulseAge = (enqMs && now >= enqMs) ? (now - enqMs) : 0;
+    ackTraceDebt("pulse_end", ackByte, reqId, pulseAge, "ACK al bajar GPIO");
+#endif
+    plcSendAck(ackByte, true, "", reqId);
+    tcpReqMs = 0;
+  }
   if (flags & (JOB_ACK | JOB_STATUS)) {
     peerTxEvents();
     plcTcpPushStateIfChanged();
@@ -705,16 +784,31 @@ static void valveStartNext()
   vpAckByte = j.ackByte;
   vpFlags = j.flags;
   vpReqId = j.reqId;
+  vpEnqueuedMs = j.enqueuedMs;
   const unsigned long now = millis();
   if (lastValvePulseEndMs != 0 && (now - lastValvePulseEndMs) < VALVE_PULSE_GAP_MS) {
     vpPhase = VP_GAP;
     vpPhaseMs = lastValvePulseEndMs;
+#if PLC_ACK_TRACE
+    if ((j.flags & JOB_ACK) && j.ackByte) {
+      const unsigned long waitMs = (j.enqueuedMs && now >= j.enqueuedMs)
+                                       ? (now - j.enqueuedMs) : 0;
+      ackTraceDebt("pulse_gap", j.ackByte, j.reqId, waitMs, "espera hueco KEEP");
+    }
+#endif
     return;
   }
   for (uint8_t i = 0; i < vpN; i++)
     valveWritePin(vpPins[i], true);
   vpPhase = VP_HIGH;
   vpPhaseMs = now;
+#if PLC_ACK_TRACE
+  if ((j.flags & JOB_ACK) && j.ackByte) {
+    const unsigned long waitMs = (j.enqueuedMs && now >= j.enqueuedMs)
+                                     ? (now - j.enqueuedMs) : 0;
+    ackTraceDebt("pulse_hi", j.ackByte, j.reqId, waitMs, "KEEP HIGH");
+  }
+#endif
 }
 
 static void serviceValvePulse()
@@ -826,6 +920,15 @@ static bool plcTcpDoByte(uint8_t cmdByte, const char* line)
   bool ok = false;
   bool deferred = false;
   const bool wantOn = plcTcpParseOn(line, cmdByte);
+#if PLC_ACK_TRACE
+  {
+    const unsigned long ageMs = (tcpReqMs && millis() >= tcpReqMs)
+                                    ? (millis() - tcpReqMs) : 0;
+    char note[40];
+    snprintf(note, sizeof(note), "want=%s", wantOn ? "ON" : "OFF");
+    ackTraceDebt("rx_cmd", cmdByte, tcpReqId, ageMs, note);
+  }
+#endif
 
   switch (cmdByte) {
     case PLC_CMD_CUTTER_R:
@@ -881,14 +984,24 @@ static bool plcTcpDoByte(uint8_t cmdByte, const char* line)
   if (ok)
     plcTcpStopPending = false;
   if (!ok) {
+#if PLC_ACK_TRACE
+    ackTraceDebt("reject", cmdByte, tcpReqId, 0, err);
+#endif
     plcSendAck(cmdByte, false, err, tcpReqId);
     return false;
   }
   // El ACK del pulso sale al bajar el GPIO. Si no hubo pulso, se confirma ya.
   if (!deferred) {
+#if PLC_ACK_TRACE
+    ackTraceDebt("imm", cmdByte, tcpReqId, 0, "sin pulso");
+#endif
     plcSendAck(cmdByte, true, "", tcpReqId);
     peerTxEvents();
     plcTcpPushStateIfChanged();
+  } else {
+#if PLC_ACK_TRACE
+    ackTraceDebt("defer", cmdByte, tcpReqId, 0, "ACK tras pulso");
+#endif
   }
   return true;
 }
@@ -914,6 +1027,8 @@ static void tcpHandleLine(const char* line)
 {
   if (!line || !line[0]) return;
   if (!strstr(line, "\"type\":\"command\"")) return;
+  if (!tcpReqMs)
+    tcpReqMs = millis();
   tcpReqId = (uint16_t)jInt(line, "id", 0);
 
   const int rawByte = jInt(line, "byte", -1);
@@ -1009,13 +1124,40 @@ static bool plcLineBlocks(const char* line)
       || nameEq(cmd, "ResetPLC") || nameEq(cmd, "reset");
 }
 
+// Byte efectivo para trazas (setOut CUTTERS → 0x2B; sin byte → command).
+static uint8_t plcTraceCmdByte(const char* line)
+{
+  const int b = jInt(line, "byte", -1);
+  if (b > 0) return (uint8_t)b;
+  char cmd[24];
+  char out[24];
+  char val[24];
+  jStr(line, "command", cmd, sizeof(cmd));
+  if (nameEq(cmd, "setOut") || nameEq(cmd, "setPlc") || nameEq(cmd, "plcSet")) {
+    jStr(line, "out", out, sizeof(out));
+    jStr(line, "value", val, sizeof(val));
+    const char* outName = out[0] ? out : val;
+    if (nameEq(outName, "CUTTER") || nameEq(outName, "CUTTERS"))
+      return PLC_CMD_CUTTERS;
+    if (nameEq(outName, "GRIPPER") || nameEq(outName, "GRIPPERS"))
+      return PLC_CMD_GRIPPER;
+    if (nameEq(outName, "HOLDER")) return PLC_CMD_HOLDER;
+    if (nameEq(outName, "ENCODER") || nameEq(outName, "FGTRAY") || nameEq(outName, "TRAY"))
+      return PLC_CMD_ENCODER;
+    if (nameEq(outName, "BLOWER")) return PLC_CMD_BLOWER;
+  }
+  return plcTcpResolveCmdByte(line);
+}
+
 static bool lineEnqueue(const char* line)
 {
   if (!line || lineQn >= LINE_Q) return false;
   if (strlen(line) > 238) return false;
-  char* dst = lineQ[(lineQHead + lineQn) % LINE_Q];
+  const uint8_t slot = (uint8_t)((lineQHead + lineQn) % LINE_Q);
+  char* dst = lineQ[slot];
   strncpy(dst, line, 239);
   dst[239] = 0;
+  lineQMs[slot] = millis();
   lineQn++;
   return true;
 }
@@ -1026,15 +1168,37 @@ static void tcpOnLine(const char* line)
   // Ping/poll se responden ya. Válvulas esperan a que el pulso anterior termine
   // para no encimar KEEP ni congelar el ACK.
   if (plcLineBlocks(line)) {
+    const unsigned long rxMs = millis();
+    const uint8_t tb = plcTraceCmdByte(line);
+    const uint16_t rid = (uint16_t)jInt(line, "id", 0);
     if (!ackCanAcceptCommand() || !lineEnqueue(line)) {
       Serial.println("[TCP] cola de comandos llena");
-      const int b = jInt(line, "byte", -1);
-      if (b > 0)
-        plcSendAck((uint8_t)b, false, "PLC ocupado", (uint16_t)jInt(line, "id", 0));
+      tcpReqMs = rxMs;
+      tcpReqId = rid;
+      if (tb) {
+        ackTraceDebt("full", tb, rid, 0, "lineQ/jobQ saturada");
+        // setOut CUTTERS confirma con 0x2B; el resto solo si trae byte de válvula.
+        const int rawB = jInt(line, "byte", -1);
+        if (rawB > 0)
+          plcSendAck((uint8_t)rawB, false, "PLC ocupado", rid);
+        else if (tb == PLC_CMD_CUTTERS)
+          plcSendAck(PLC_CMD_CUTTERS, false, "PLC ocupado", rid);
+      }
+      tcpReqMs = 0;
+      return;
     }
+#if PLC_ACK_TRACE
+    if (tb) {
+      char note[48];
+      snprintf(note, sizeof(note), "held debt=%u", (unsigned)ackDebt());
+      ackTraceDebt("hold_q", tb, rid, 0, note);
+    }
+#endif
     return;
   }
+  tcpReqMs = millis();
   tcpHandleLine(line);
+  tcpReqMs = 0;
 }
 
 static void plcDispatchHeld()
@@ -1042,9 +1206,22 @@ static void plcDispatchHeld()
   if (vpPhase != VP_IDLE || valveJobCount > 0 || !lineQn) return;
   char line[240];
   memcpy(line, lineQ[lineQHead], sizeof(line));
+  tcpReqMs = lineQMs[lineQHead];
+  if (!tcpReqMs)
+    tcpReqMs = millis();
   lineQHead = (lineQHead + 1) % LINE_Q;
   lineQn--;
+#if PLC_ACK_TRACE
+  {
+    const uint8_t tb = plcTraceCmdByte(line);
+    const uint16_t rid = (uint16_t)jInt(line, "id", 0);
+    const unsigned long ageMs = (millis() >= tcpReqMs) ? (millis() - tcpReqMs) : 0;
+    if (tb)
+      ackTraceDebt("dispatch", tb, rid, ageMs, "sale de lineQ");
+  }
+#endif
   tcpHandleLine(line);
+  tcpReqMs = 0;
 }
 
 static void tcpRxDrain()
@@ -1267,6 +1444,11 @@ void setup()
   bootGraceStartMs = millis();
   Serial.printf("Sensor boot grace %lums desde ahora\n", BOOT_GRACE_MS);
   Serial.printf("Firmware v%s · OTA red local hostname=%s\n", FW_VERSION, OTA_HOSTNAME);
+#if PLC_ACK_TRACE
+  Serial.println("[ACK] trace ON · tags: hold_q/dispatch/rx_cmd/defer/pulse_*/send_*/SLOW/full/DROP");
+  Serial.printf("[ACK] warn si age>=%lums (HMI watch ~2.5s)\n",
+                (unsigned long)ACK_SLOW_WARN_MS);
+#endif
 }
 
 static void plcHeapWatch()
@@ -1280,6 +1462,29 @@ static void plcHeapWatch()
   Serial.printf("[PLC] heap libre=%u min=%u\n", heap, minHeap);
 }
 
+#if PLC_ACK_TRACE
+// Un loop trabado retrasa tcpTxPump → el ACK no sale y la HMI vence el watch.
+static void plcLoopLagWatch()
+{
+  static unsigned long lastMs = 0;
+  const unsigned long now = millis();
+  if (lastMs) {
+    const unsigned long gap = now - lastMs;
+    if (gap >= 80)
+      Serial.printf("[ACK] loop_lag=%lums lineQ=%u jobQ=%u ackQ=%u vp=%u hold=%u\n",
+                    (unsigned long)gap,
+                    (unsigned)lineQn,
+                    (unsigned)valveJobCount,
+                    (unsigned)ackQn,
+                    (unsigned)vpPhase,
+                    (unsigned)txHold.len);
+  }
+  lastMs = now;
+}
+#else
+static void plcLoopLagWatch() {}
+#endif
+
 void loop()
 {
   if (arduinoOtaInProgress)
@@ -1290,6 +1495,7 @@ void loop()
     return;
   }
 
+  plcLoopLagWatch();
   tcpTxPump();
   serviceValvePulse();
   plcDispatchHeld();

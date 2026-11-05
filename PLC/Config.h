@@ -19,7 +19,7 @@ constexpr uint8_t  PLCA_PROTO_VER = 1;
 constexpr unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
 
 // --- Firmware / OTA (Arduino IDE, red local) ---
-#define FW_VERSION "1.1.1"
+#define FW_VERSION "1.1.2"
 #define OTA_PASSWORD "TCM_PF2026"
 #define OTA_HOSTNAME "plc"
 
@@ -81,3 +81,11 @@ constexpr uint8_t BIT_ENCODER = (1 << 5);
 
 constexpr unsigned long SENSOR_DEBOUNCE_MS = 150;
 constexpr unsigned long BOOT_GRACE_MS = 15000;
+
+// Trazas Serial [ACK] para diagnosticar timeouts HMI (PLC_ACK_WATCH_S ≈ 2.5 s).
+// 1 = ON (RX / defer / pulse / TX / drop). 0 = silenciar en producción.
+#ifndef PLC_ACK_TRACE
+#define PLC_ACK_TRACE 1
+#endif
+// Aviso en Serial si el ACK tarda más que esto desde RX/encola.
+constexpr unsigned long ACK_SLOW_WARN_MS = 800;

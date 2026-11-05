@@ -65,8 +65,12 @@ static const uint16_t REG_P5_016 = 0x0520;
 static const uint16_t REG_P0_046 = 0x005C;
 static const uint16_t ASDA_DO_ZSPD = 0x0004;
 static const uint16_t ASDA_DO_HOME = 0x0100;
-// Misma ventana que el ciclo HMI (MOTION_TARGET_TOL_MM).
-static const float ASDA_AT_TARGET_MM = 3.0f;
+// MOVE: banda de llegada. Si el PR termina fuera, se reescribe el destino
+// y se vuelve a disparar (ASDA_MOVE_CORRECT_MAX) antes de fallar.
+static const float ASDA_MOVE_TOL_MM = 0.5f;
+// HOME: el origen lo escribe el drive al terminar el tope. 1 mm = asda_home_eps.
+static const float ASDA_HOME_TOL_MM = 1.0f;
+static const uint8_t ASDA_MOVE_CORRECT_MAX = 3;
 static const uint16_t REG_P5_060 = 0x0578;
 static const uint16_t REG_P6_000 = 0x0600;
 static const uint16_t REG_P6_001 = 0x0602;

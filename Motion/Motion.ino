@@ -116,8 +116,6 @@ static bool asdaTcpStopPending = false;
 static bool asdaTcpNotifyReached = false;
 static int32_t asdaTcpReachedPos = 0;
 static uint8_t asdaTcpLastStateByte = 0;
-static bool motionTcpNotifyEncError = false;
-static bool motionTcpNotifyEncErrorL = false;
 static bool motionTcpNotifyFeedOkL = false;
 static bool motionTcpNotifyFeedNgL = false;
 static bool motionTcpNotifyFeedOkR = false;
@@ -523,6 +521,15 @@ static void modbusAbort() {
   mbRxLen = 0;
 }
 
+// El eco 0x06/0x10 tiene que ser de ESTA escritura. Un ACK rezagado
+// (misma longitud y CRC válido) confirmaba el registro anterior.
+static bool modbusWriteEchoOk() {
+  if (mbRxLen < 8 || mbTxLen < 6) return false;
+  if (mbRx[0] != mbTx[0] || mbRx[1] != mbTx[1]) return false;
+  return mbRx[2] == mbTx[2] && mbRx[3] == mbTx[3]
+      && mbRx[4] == mbTx[4] && mbRx[5] == mbTx[5];
+}
+
 static bool modbusParseRxOk() {
   if (mbRxLen < 5) return false;
   const uint16_t crcReceived = (uint16_t)mbRx[mbRxLen - 2]
@@ -531,7 +538,7 @@ static bool modbusParseRxOk() {
   if (mbRx[0] != MODBUS_ID) return false;
   if (mbRx[1] & 0x80) return false;
   if (mbRx[1] == 0x06 || mbRx[1] == 0x10)
-    return mbRxLen == 8 && mbRx[1] == mbExpectFunc;
+    return mbRxLen == 8 && mbRx[1] == mbExpectFunc && modbusWriteEchoOk();
   if (mbRx[1] == 0x03) {
     if (mbRxLen != mbExpectRxLen || mbRx[2] != (uint8_t)(mbReadRegCount * 2))
       return false;
@@ -607,8 +614,11 @@ static int modbusPoll() {
   switch (mbPhase) {
     case MB_GAP:
       if (millis() < mbGapEndMs) return 0;
+      // Bytes que entraron durante el gap no son la respuesta de este frame.
+      clearServoRx();
       ServoBus.write(mbTx, mbTxLen);
       ServoBus.flush();
+      clearServoRx();
       mbRxStartMs = millis();
       mbLastRxUs = micros();
       mbGotByte = false;
@@ -702,6 +712,12 @@ static bool motionJobHomeSeenLow = false;
 static bool motionJobTimeoutExtended = false;
 static int32_t motionJobStartPos = 0;
 static bool motionJobStartPosOk = false;
+// P5.007 al armar el job. 10001/20001 del PR anterior coincide con el done
+// del comando nuevo; la primera muestra no puede cerrar el movimiento.
+static uint16_t motionJobStaleTrigger = 0;
+static bool motionJobStaleValid = false;
+static bool motionJobStaleDoneSeen = false;
+static uint8_t motionJobPosAttempts = 0;
 
 uint8_t motionNestedServiceDepth = 0;
 
@@ -727,6 +743,10 @@ void motionJobBegin(uint16_t command, uint32_t timeoutMs) {
   motionJobTimeoutExtended = false;
   motionJobStartPos = cachedPosPuu;
   motionJobStartPosOk = cachedPosOk;
+  motionJobStaleTrigger = cachedP5007;
+  motionJobStaleValid = cachedTriggerOk;
+  motionJobStaleDoneSeen = false;
+  motionJobPosAttempts = 0;
 }
 
 static void motionJobCachePosFromModbus() {
@@ -736,12 +756,52 @@ static void motionJobCachePosFromModbus() {
   motionJobPosFresh = true;
 }
 
+// mmToWorkPuu guarda la magnitud en PUU negativo. puuToMm() usa abs(), así que
+// +N y -N daban el mismo mm y un feedback con signo volteado pasaba como llegado.
+static float asdaCmdMmFromPuu(int32_t puu) {
+  const float spm = cfgStepsPerMm;
+  if (spm < 0.001f) return 0.0f;
+  const float pasos = (float)(-(int64_t)puu) / (float)LINEAR_EGEAR_N;
+  return (pasos - cfgOffsetSteps) / spm;
+}
+
+static uint8_t motionJobCorrectLeft = 0;
+
 static bool motionJobPosAtTarget(int32_t pos) {
   if (!motionJobPosFresh) return false;
-  const float here = puuToMm(pos, false);
+  const float here = asdaCmdMmFromPuu(pos);
   if (motionJobCmd == 0)
-    return fabsf(here) <= ASDA_AT_TARGET_MM;
-  return fabsf(here - puuToMm(motionPrepTargetPuu, false)) <= ASDA_AT_TARGET_MM;
+    return fabsf(here) <= ASDA_HOME_TOL_MM;
+  return fabsf(here - asdaCmdMmFromPuu(motionPrepTargetPuu)) <= ASDA_MOVE_TOL_MM;
+}
+
+// El PR ya dijo "listo" pero P5.016 no está en la banda. Reescribir el mismo
+// absoluto y disparar otra vez. El drive recorre el faltante; no se cierra OK.
+static bool motionJobRetryTarget() {
+  if (motionJobCmd == 0 || motionJobCorrectLeft == 0 || !motionJobPosFresh)
+    return false;
+  motionJobCorrectLeft--;
+  const float here = asdaCmdMmFromPuu(motionJobPos);
+  const float tgt = asdaCmdMmFromPuu(motionPrepTargetPuu);
+  Serial.printf("ASDA reintenta %u/%u pos=%.2f objetivo=%.2f mm\n",
+                (unsigned)(ASDA_MOVE_CORRECT_MAX - motionJobCorrectLeft),
+                (unsigned)ASDA_MOVE_CORRECT_MAX, (double)here, (double)tgt);
+  motionJobActive = false;
+  motionJobPollPhase = MJP_IDLE;
+  motionJobCloseKind = 0;
+  motionJobConfirmOnly = false;
+  motionJobPendingPosKind = 0;
+  motionJobPosFresh = false;
+  motionPrepModbusWait = false;
+  motionPrepKind = MOT_PREP_MOVE;
+  motionPrepStep = 2;
+  float dist = fabsf(here - tgt);
+  if (dist < 1.0f) dist = 1.0f;
+  float rpm = motionPrepSpeed;
+  if (rpm < 1.0f) rpm = DEFAULT_MOVE_SPEED_RPM;
+  motionPrepTimeoutMs = calcTravelTimeoutMs(dist, rpm);
+  busyMotion = true;
+  return true;
 }
 
 // El presupuesto salió corto (caché de posición vieja, p. ej. 0 mm) pero el
@@ -786,7 +846,32 @@ static bool motionJobFinishAfterPosRead() {
       motionJobCloseKind = 1;
     } else if (motionJobExtendShortTimeout()) {
       return false;
+    } else if (motionJobRetryTarget()) {
+      return false;
     }
+  }
+  // MOVE: sin P5.016 fresco no hay llegada. Antes, un read fallido dejaba
+  // PosFresh en falso y el case 1/2 igual ponía OK.
+  const bool wantsTarget = (motionJobCloseKind == 1 || motionJobCloseKind == 2)
+      && motionJobCmd != 0;
+  if (wantsTarget && !motionJobPosFresh) {
+    motionJobPollPhase = MJP_IDLE;
+    motionJobCloseKind = 0;
+    if (motionJobPosAttempts < 3) {
+      motionJobPosAttempts++;
+      return false;
+    }
+    motionJobCloseKind = 5;
+  } else if (wantsTarget && !motionJobPosAtTarget(motionJobPos)) {
+    if (motionJobRetryTarget()) return false;
+    raiseMotionAlarm("ALARMA: posicion fuera de tolerancia al completar MOVE",
+                     MOT_ERR_ACTUATOR_TARGET);
+    motionJobOk = false;
+    motionJobDetail = "fuera de tolerancia";
+    motionJobPollPhase = MJP_IDLE;
+    motionJobActive = false;
+    busyMotion = false;
+    return true;
   }
   motionJobPollPhase = MJP_IDLE;
   motionJobActive = false;
@@ -812,7 +897,7 @@ static bool motionJobFinishAfterPosRead() {
       motionJobOk = false;
       break;
     case 5:
-      raiseMotionAlarm("ALARMA: Modbus timeout leyendo P5.007", MOT_ERR_ASDA_MODBUS);
+      raiseMotionAlarm("ALARMA: Modbus ASDA sin respuesta valida", MOT_ERR_ASDA_MODBUS);
       motionJobOk = false;
       break;
     default:
@@ -842,6 +927,12 @@ static bool motionJobBeginPosRead(uint8_t closeKind) {
       motionJobCloseKind = 0;
       return false;
     }
+    if (motionJobPosAttempts < 3) {
+      motionJobPosAttempts++;
+      motionJobCloseKind = 0;
+      return false;
+    }
+    motionJobCloseKind = 5;
     return motionJobFinishAfterPosRead();
   }
   motionJobPollPhase = MJP_WAIT_POS;
@@ -882,12 +973,24 @@ static bool motionJobEvaluateTrigger() {
   const bool doneT = got && trigger == doneTarget;
   const bool doneL = got && trigger == doneLoose;
   if (doneT || doneL) {
-    // En HOME, 10000/20000 sin haber visto el eco 0 es el valor viejo.
-    if (motionJobArmed || motionJobCmd != 0) {
-      // HOME: 20000 puede llegar antes de que el drive ponga el origen en 0.
-      motionJobConfirmOnly = (motionJobCmd == 0) || !motionJobArmed;
+    if (!motionJobArmed) {
+      // HOME: 10000/20000 sin el eco 0 es el PR anterior.
+      if (motionJobCmd == 0) return false;
+      // MOVE: la primera muestra igual al P5.007 viejo no es este comando.
+      // Con el mismo target de siempre, la posición ya estaba en la ventana
+      // y el job cerraba OK sin que el drive ejecutara el PR.
+      const bool sameAsStale = motionJobStaleValid
+          && trigger == motionJobStaleTrigger;
+      if (sameAsStale && !motionJobStaleDoneSeen) {
+        motionJobStaleDoneSeen = true;
+        return false;
+      }
+      motionJobConfirmOnly = true;
       return motionJobBeginPosRead(doneT ? 1 : 2);
     }
+    // HOME: 20000 puede llegar antes de que el drive ponga el origen en 0.
+    motionJobConfirmOnly = (motionJobCmd == 0);
+    return motionJobBeginPosRead(doneT ? 1 : 2);
   }
 
   if ((millis() - motionJobStartMs) >= motionJobTimeoutMs)
@@ -913,19 +1016,25 @@ static bool pollMotionOnce() {
     const int mb = modbusPoll();
     if (mb == 0) return false;
     if (mb < 0) {
-      if (motionJobPollPhase == MJP_WAIT_TRIGGER) {
+      const MotionJobPollPhase failed = motionJobPollPhase;
+      if (failed == MJP_WAIT_TRIGGER) {
         motionJobGotTrigger = false;
         motionJobPollPhase = MJP_IDLE;
         return motionJobEvaluateTrigger();
       }
-      if (motionJobPollPhase == MJP_WAIT_DO || motionJobConfirmOnly) {
-        motionJobConfirmOnly = false;
-        motionJobPollPhase = MJP_IDLE;
-        motionJobCloseKind = 0;
-        return false;
-      }
+      motionJobConfirmOnly = false;
       motionJobPollPhase = MJP_IDLE;
-      return motionJobFinishAfterPosRead();
+      motionJobCloseKind = 0;
+      motionJobPosFresh = false;
+      if (failed == MJP_WAIT_POS) {
+        if (motionJobPosAttempts < 3) {
+          motionJobPosAttempts++;
+          return false;
+        }
+        motionJobCloseKind = 5;
+        return motionJobFinishAfterPosRead();
+      }
+      return false;
     }
     if (motionJobPollPhase == MJP_WAIT_TRIGGER) {
       motionJobLastTrigger = mbReadRegs[0];
@@ -952,7 +1061,11 @@ static bool pollMotionOnce() {
     return motionJobBeginPosRead(3);
 
   const uint32_t now = millis();
-  if (lastMotionPollMs != 0 && (now - lastMotionPollMs) < MOTION_POLL_MIN_MS)
+  // Hasta ver el eco del comando, no espaciar el poll: el 1 de P5.007 dura
+  // poco en un PR corto y, si se pierde, solo queda el 20001 viejo.
+  if (motionJobArmed
+      && lastMotionPollMs != 0
+      && (now - lastMotionPollMs) < MOTION_POLL_MIN_MS)
     return false;
   lastMotionPollMs = now;
 
@@ -1310,6 +1423,7 @@ static bool asdaStartMove(int32_t position, float speed, String& err) {
   motionPrepTargetPuu = position;
   motionPrepSpeed = clampMoveRpm(speed);
   motionPrepTimeoutMs = calcMoveTimeoutMs(position, motionPrepSpeed);
+  motionJobCorrectLeft = ASDA_MOVE_CORRECT_MAX;
 
   busyMotion = true;
   clearMotionAlarm();
@@ -1906,8 +2020,6 @@ static bool motionExecResetErrors(String& err) {
   motionTcpClearFeedSidePending(true);
   motionTcpPendingDetailErr = 0;
   motionTcpPendingDetailName[0] = '\0';
-  motionTcpNotifyEncError = false;
-  motionTcpNotifyEncErrorL = false;
   err = "Errores limpiados";
   return true;
 }
@@ -2016,13 +2128,6 @@ bool feedLaserMaterialPresentRaw(bool sideR)
   return digitalRead(pin) == LOW;  // NPN/OC + pull-up: LOW = material ON
 }
 
-bool feedOmReadLiveMm(float* mmSignedOut)
-{
-  bool sideR = false;
-  if (!encFeedSide(sideR)) return false;
-  return feedOmReadLiveMmSide(sideR, mmSignedOut);
-}
-
 bool feedOmReadOfficialMm(float* officialOut, float* mmSignedOut, float* mmAbsOut)
 {
   bool sideR = false;
@@ -2050,8 +2155,6 @@ bool feedOmIsSettled() {
   if (!encFeedSide(sideR)) return false;
   return feedOmIsSettledSide(sideR);
 }
-
-float feedOmOfficialFromRaw(float mmAbs) { return omOfficialMm(mmAbs); }
 
 // --- ENCODER — JSON de estado dual L + R ---
 static int encoderSideJsonInto(char* out, size_t outSz, bool sideR) {
@@ -2932,9 +3035,6 @@ static void asdaTcpTxEvent(uint8_t byteCode, const char* name, int32_t posPuu) {
   motionTcpTxEvent("asda", byteCode, name, posPuu);
 }
 
-void motionTcpOnEncoderError() { motionTcpNotifyEncError = true; }
-void motionTcpOnEncoderErrorL() { motionTcpNotifyEncErrorL = true; }
-
 void motionTcpOnFeedOk(bool sideR) {
   if (sideR) motionTcpNotifyFeedOkR = true;
   else motionTcpNotifyFeedOkL = true;
@@ -3208,7 +3308,8 @@ static bool asdaTcpDoByte(uint8_t cmdByte, const char* line) {
       float speed = jsonHasKey(String(line), "speedRpm")
                       ? jsonFloat(String(line), "speedRpm", cfgMoveRpm)
                       : cfgMoveRpm;
-      ok = asdaStartMove(0, speed, err);
+      const int32_t position = mmToWorkPuu(0.0f, false);
+      ok = asdaStartMove(position, speed, err);
       break;
     }
     case ASDA_CMD_RESUME:
@@ -3498,12 +3599,6 @@ static void motionTcpPollMeasureEvents() {
 static void motionTcpPollFeedEvents() {
   if (!asdaTcpLinkOk()) return;
 
-  if (motionTcpNotifyEncError
-      && motionTcpTxEvent("encoder", ENC_TX_ERROR_R, "ErrorER"))
-    motionTcpNotifyEncError = false;
-  if (motionTcpNotifyEncErrorL
-      && motionTcpTxEvent("encoder", ENC_TX_ERROR_L, "ErrorEL"))
-    motionTcpNotifyEncErrorL = false;
   if (motionTcpNotifyFeedOkL
       && motionTcpTxEvent("feeder", FEED_TX_LENGTH_OK_L, "LenghtOK_L"))
     motionTcpNotifyFeedOkL = false;
@@ -3572,7 +3667,7 @@ void motionPollIoSensors() {
   static uint32_t tLaserR = 0, tLaserL = 0, tSafety = 0;
   const uint32_t now = millis();
 
-  // LR-X: status push; E004/E005 solo en ventana Feed Validator (FSP_VALIDATE*).
+  // LR-X: status push. E004/E005 los emite la FSM de feed al fallar el tope.
   const bool rLaserR = motionSensorActiveLaser(LRX_LaserR);
   if (rLaserR != rawLaserR) { rawLaserR = rLaserR; tLaserR = now; }
   else if ((now - tLaserR) >= MOT_SENSOR_DEBOUNCE_MS && rLaserR != lastLaserR) {

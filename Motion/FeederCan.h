@@ -107,10 +107,6 @@
 #define FEED_CAL_COUNTS_PER_MM_MIN  (FEED_ENC_COUNTS_PER_MM * 0.5f)
 #define FEED_CAL_COUNTS_PER_MM_MAX  (FEED_ENC_COUNTS_PER_MM * 1.5f)
 
-#define FEED_TEST_CHUNK_DEFAULT     200
-#define FEED_TEST_CHUNK_MIN         20
-#define FEED_TEST_CHUNK_MAX         2000
-
 #define FEED_SERVO_RAMP_MS          50
 #define FEED_SERVO_DEC_RAMP_MS      100
 #define FEED_SERVO_RAMP_MS_MIN      10u
@@ -123,8 +119,7 @@
 // ≥ ENC_SETTLE_MS (250): si es menor, R (y a veces L) lee OM antes de settle → solo approach.
 #define FEED_OM_SETTLE_MS           200 /// antes 280
 #define FEED_OM_HALT_SETTLE_MS      150 /// antes 500
-#define FEED_OM_TARGET_TOL_MM       0.5f   // legacy overview; Feed usa ventanas abajo
-#define FEED_OM_CORR_RETRY_MAX      1      // 1 corrección (aprox. no cuenta)
+#define FEED_OM_TARGET_TOL_MM       0.5f   // overview HTTP; el feed de ciclo usa la banda de control
 #define FEED_OM_READ_RETRY_MAX      3
 // issueMove falló (SDO 6064): reintentar en siguientes ticks de feedLoop antes de E026/E027.
 #define FEED_ISSUE_MOVE_RETRY_MAX   3
@@ -135,9 +130,7 @@
 
 // Ventanas Feed (TARGET fijo; no mezclar)
 #define FEED_TARGET_FIXED_MM        55.0f
-#define FEED_CONTROL_TOL_MM         1.0f   // 54–56 banda ideal (corrección apunta a 55)
-#define FEED_GOOD_TOL_MM            2.0f   // 53–57 (referencia; aceptación = PHYS)
-#define FEED_OM_PHYS_MIN_MM         50.0f  // techo/piso OM; láser ON no exige piso (tope de feed)
+#define FEED_CONTROL_TOL_MM         1.0f   // 54–56 banda ideal
 #define FEED_OM_PHYS_MAX_MM         58.0f
 #define FEED_OM_QUANTUM_MM          0.5f   // paso oficial omRoundMm; umbral OK |err|<=0.5 (no re-cuantizar)
 #define FEED_APPROACH_PCT_DEFAULT   80.0f
@@ -152,7 +145,6 @@
 #define FEED_LASER_SEEK_MS_MIN      200u
 #define FEED_LASER_SEEK_MS_MAX      5000u
 #define FEED_LASER_SEEK_POLL_MS     0u     // 0 = cada feedLoop (halt lo antes posible)
-#define FEED_LASER_SEEK_DIST_MARGIN 1.25f  // legacy; seek ya no usa un solo tramo
 #define FEED_LASER_HALT_BURST       3u     // CW Halt al flanco ON
 #define FEED_LASER_CREEP_MM         1.5f   // trozo máximo; tope de sobrepaso
 #define FEED_LASER_CREEP_MM_S       25.0f  // vel seek / hunt (ciclo normal)
@@ -168,7 +160,7 @@
 #define FEED_VELOCITY_PP_DEFAULT    FEED_SERVO_BASE_PP_DEFAULT
 #define FEED_PREFS_NS               "motion_feed"
 
-// Velocity + Sensor (experimental). Default de producción = Position + Sensor.
+// Velocity + Sensor: único modo de alimentación en ciclo. LR-X = tope de parada.
 #define FEED_VEL_FAST_PCT_DEFAULT   100.0f
 #define FEED_VEL_SLOW_PCT_DEFAULT   30.0f
 #define FEED_VEL_TRANS_PCT_DEFAULT  70.0f
@@ -191,12 +183,10 @@
 #define FEED_FAULT_REASON_MAX       96
 #define FEED_HALT_SETTLE_MS         30
 #define FEED_WAIT_EXTRA_MS          30000
-#define FEED_LOOP_YIELD_MS          2
 #define FEED_SS_ABS_MARGIN_MS       80
 #define FEED_SS_POLL_MIN_MS         40
 #define FEED_SS_TR_POLL_MS          80
 #define FEED_OM_READ_RETRY_DELAY_MS 50
-#define FEED_CORR_MIN_MM            0.15f
 #define FEED_PROFILE_SEARCH_ITERS   32
 #define FEED_PROFILE_SEARCH_EPS_MM  0.05f
 #define FEED_PROFILE_MARGIN_EPS_MM  0.001f
@@ -204,28 +194,17 @@
 
 // ====================== Tipos feed ======================
 enum FeedMode : uint8_t {
-  FEED_MODE_BYPASS = 0,
-  FEED_MODE_STEPS_SENSOR = 2,     // legacy: Position + Sensor
-  FEED_MODE_VELOCITY_SENSOR = 3   // producción: Velocity + Sensor (LR-X = tope)
+  FEED_MODE_VELOCITY_SENSOR = 3   // Velocity + Sensor (LR-X = tope)
 };
 
 // FSM por lado (L y R independientes)
 enum FeedSidePhase : uint8_t {
   FSP_IDLE = 0,
-  FSP_APPROACH,
-  FSP_HALT_SETTLE,  // halt emitido; espera FEED_HALT_SETTLE_MS sin delay()
-  FSP_WAIT_SERVO,
-  FSP_SETTLE,
-  FSP_VALIDATE,
-  FSP_CORRECTION,
-  FSP_WAIT_SERVO_CORR,
-  FSP_SETTLE_FINAL,
-  FSP_VALIDATE_FINAL,
-  FSP_LASER_SEEK,       // creep a trozos hasta láser ON o timeout
-  FSP_LASER_SEEK_HALT,  // halt por flanco ON; settle corto → SETTLE_FINAL
+  FSP_LASER_SEEK,       // purga: creep a trozos hasta láser ON o timeout
+  FSP_LASER_SEEK_HALT,  // halt por flanco ON
   FSP_VEL_PREPARE,      // PV: halt + Set0 + 0x6060=3
-  FSP_VEL_FAST,         // PV: 0x60FF fast (viaje largo; láser ya no hunt)
-  FSP_VEL_SLOW,         // PV: 0x60FF slow; hunt si LR-X OFF al start; tope = GPIO
+  FSP_VEL_FAST,         // PV: 0x60FF fast
+  FSP_VEL_SLOW,         // PV: 0x60FF slow; tope = GPIO
   FSP_VEL_STOPPING,     // CW Halt ya emitido; TVel=0 + espera 0x606C~0
   FSP_VEL_SETTLE,       // OM final + restaurar PP
   FSP_OFFSET,           // ciclo: tras FEED_OK, offL/offR relativo
@@ -242,21 +221,6 @@ enum FeedValResult : uint8_t {
   FVR_CORRECT,
   FVR_NG,
   FVR_INCONSISTENT
-};
-
-// Alias legacy (status JSON / HTTP)
-enum FeedPhase : uint8_t {
-  FEED_IDLE = 0,
-  FEED_RUNNING,
-  FEED_CHUNK_DELAY,
-  FEED_HOSE_DELAY,
-  FEED_PARALLEL_START_DELAY,
-  FEED_BYPASS,
-  FEED_SS_SOLID,
-  FEED_SS_TRANSITION,
-  FEED_SS_SLOW,
-  FEED_DONE,
-  FEED_ERROR
 };
 
 struct FeedProfilePlan {
@@ -287,15 +251,5 @@ struct FeedEncPlan {
 #include "MotionStates.h"
 
 struct FeedTestReq {
-  bool pending = false;
-  float solidMmL = 0.0f;
-  float solidMmR = 0.0f;
-  int32_t chunkL = 0;
-  int32_t chunkR = 0;
-  bool withCut = false;
   int8_t onlySide = -1;
-  uint32_t fastL = 0;
-  uint32_t fastR = 0;
-  uint16_t decRampL = FEED_SERVO_DEC_RAMP_MS;
-  uint16_t decRampR = FEED_SERVO_DEC_RAMP_MS;
 };

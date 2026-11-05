@@ -21,17 +21,13 @@ float feedOmGetOffsetMmSide(bool sideR);
 
 // Compat: lee el lado indicado por el último feed activo / L si hay HW
 bool feedOmReadOfficialMm(float* officialOut, float* mmSignedOut = nullptr, float* mmAbsOut = nullptr);
-bool feedOmReadLiveMm(float* mmSignedOut);
 bool feedOmResetLocal();
 float feedOmGetOffsetMm();
 bool feedOmIsSettled();
-float feedOmOfficialFromRaw(float mmAbs);
 
-// Laser = tope de feed (L y R). ON → FEED_OK (no pasar la referencia).
-// Hunt (láser OFF al start): sin approach rápido; creep a trozos + freeze al ON.
-// Prefetch (láser ya ON): approach normal, sin halt por nivel.
+// Laser = tope de feed (L y R).
 bool feedLaserMaterialPresent(bool sideR);
-// Pin crudo (sin debounce HMI) — halt en seek/corrección/Velocity.
+// Pin crudo (sin debounce HMI) — halt en purga y en Velocity.
 bool feedLaserMaterialPresentRaw(bool sideR);
 
 // —— CAN servos ——
@@ -44,8 +40,6 @@ bool setupServoFeeder();
 bool verifyServoEnergized();
 // Arranque en setup() (bus + nodos CAN).
 bool feedCanStartup();
-// Reinicio completo pedido por el operador (HTTP can-init).
-bool feedCanBootInit();
 bool feedCanInitRequest();
 void serviceCANRx();
 // Atiende TCP/HTTP/Modbus/CAN mientras se espera SDO (sin delay). No reentra feed.
@@ -79,7 +73,6 @@ extern volatile float feedVelSlowPct;
 extern volatile float feedVelTransitionPct;
 extern volatile float feedVelMaxTravelMm;
 extern volatile uint32_t feedVelTimeoutMs;
-extern FeedTestReq feedTestReq;
 extern bool feedCalibrationTest;
 extern char feedFaultReason[FEED_FAULT_REASON_MAX];
 extern float feedOmLastOfficialMm;
@@ -103,7 +96,6 @@ void feedRegisterHttpRoutes(WebServer& server);
 bool feedPhaseIsActive();
 bool feedSideIsActive(bool sideR);
 bool feedThisCycleSucceeded();
-bool runFeedCycle(bool skipEncoderConfirm, int8_t onlySide = -1);
 
 float feedMaxMmS(bool sideR);
 uint32_t feedMmSToPp(float mmS, bool sideR);
@@ -134,8 +126,6 @@ bool feedQueueTestSide(int8_t onlySide, String& err, bool skipValidate = false,
                        float targetMm = 0.0f, uint32_t feedDurationMs = 0);
 bool feedResetRuntime();
 
-void motionTcpOnEncoderError();
-void motionTcpOnEncoderErrorL();
 void motionTcpOnFeedOk(bool sideR);
 void motionTcpOnFeedNg(bool sideR);
 // Detalle no-Feed (ASDA/exhaust/…) — slot global

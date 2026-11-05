@@ -37,8 +37,6 @@ from cycle_analysis_log import (
 
 HMI_ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = HMI_ROOT / "config" / "cycle.json"
-LEGACY_CYCLE_CONFIG_PATH = HMI_ROOT / "config" / "cycle_config.json"
-LEGACY_APP_CONFIG_PATH = HMI_ROOT / "config" / "app_config.json"
 
 APP_CONFIG_JSON_KEYS: tuple[str, ...] = (
     "andonBuzzerMute",
@@ -130,33 +128,7 @@ ASDA_HOME_EPS_MM = 1.0
 # Espera del MOVE_ZERO, más estricta que la puerta de arriba: un Idle del HOME
 # anterior no debe dar por terminado un cero que todavía no se movió.
 ASDA_MOVE_ZERO_TOL_MM = 0.5
-MOTION_TARGET_TOL_MM = 3.0
-
-TIMING_LOG_DIR = HMI_ROOT / "logs" / "cycle_timing"
-TIMING_GAP_REPORT_S = 0.050
-TIMING_DELAY_OVERSHOOT_MS = 15
-TIMING_CMD_SLOW_S = 0.080
-TIMING_ENCODER_OUTLIER_MM = 120.0
-TIMING_SUMMARY_EVERY_PIECES = 100
-TIMING_OP_ORDER = (
-    "pf_trigger",
-    "feed_cmd",
-    "feed",
-    "grippers_on",
-    "holder_off",
-    "lineal_cmd",
-    "lineal",
-    "corte",
-    "depósito_cmd",
-    "depósito",
-    "grippers_off",
-    "despeje_cmd",
-    "despeje",
-    "home_cmd",
-    "home",
-    "feed_next_cmd",
-    "feed_next",
-)
+MOTION_TARGET_TOL_MM = 0.5
 
 FLOW_STEPS: list[dict[str, Any]] = [
     {"id": 1, "key": "holder_on", "label": "Sujetar tubo (primera pieza)", "kind": "action", "sbsPause": False},
@@ -300,25 +272,6 @@ class _OrEvent:
         return any(e.is_set() for e in self._events)
 
 
-_LEGACY_CYCLE_JSON_ALIASES: dict[str, str] = {
-    "holder_on_ms": "holderOnMs",
-    "holder_precut_ms": "holderPrecutMs",
-    "holder_open_ms": "holderOpenMs",
-    "grippers_on_ms": "grippersOnMs",
-    "gripper_release_ms": "gripperReleaseMs",
-    "cutter_pulse_ms": "cutterPulseMs",
-    "cutter_post_ms": "cutterPostMs",
-    "cutter_settle_ms": "cutterSettleMs",
-    "linear_done_ms": "linearDoneMs",
-    "asentar_ms": "asentarMs",
-    "dwell_at_dest_ms": "dwellAtDestMs",
-    "motion_wait_timeout_s": "motionWaitTimeoutS",
-    "feed_wait_timeout_s": "feedWaitTimeoutS",
-    "pf_ready_timeout_s": "pfReadyTimeoutS",
-    "piece_watch_timeout_s": "pieceWatchTimeoutS",
-}
-
-
 @dataclass
 class CycleConfig:
     deposit_batch_size: int = 50
@@ -360,12 +313,7 @@ class CycleConfig:
     pf_settle_before_idle_s: float = 15.0
     pf_tfeed_capture_after_pause_s: float = 0.5
     asda_home_eps_mm: float = 1.0
-    motion_target_tol_mm: float = 3.0
-    timing_gap_report_s: float = 0.050
-    timing_delay_overshoot_ms: int = 15
-    timing_cmd_slow_s: float = 0.080
-    timing_encoder_outlier_mm: float = 120.0
-    timing_summary_every_pieces: int = 100
+    motion_target_tol_mm: float = 0.5
 
     @staticmethod
     def normalize_feed_sides(raw: Any) -> str:
@@ -457,11 +405,6 @@ class CycleConfig:
             "pfTfeedCaptureAfterPauseS": "pf_tfeed_capture_after_pause_s",
             "asdaHomeEpsMm": "asda_home_eps_mm",
             "motionTargetTolMm": "motion_target_tol_mm",
-            "timingGapReportS": "timing_gap_report_s",
-            "timingDelayOvershootMs": "timing_delay_overshoot_ms",
-            "timingCmdSlowS": "timing_cmd_slow_s",
-            "timingEncoderOutlierMm": "timing_encoder_outlier_mm",
-            "timingSummaryEveryPieces": "timing_summary_every_pieces",
         }
 
     @classmethod
@@ -480,8 +423,6 @@ class CycleConfig:
                 "cutter_pulse_ms",
                 "cutter_post_ms",
                 "cutter_settle_ms",
-                "timing_delay_overshoot_ms",
-                "timing_summary_every_pieces",
             }
         )
 
@@ -647,7 +588,7 @@ def merge_cycle_json_document(
 def apply_cycle_config_runtime(cfg: CycleConfig) -> None:
     """Sincroniza constantes de módulo usadas por la secuencia y FLOW_STEPS."""
     global HOLDER_ON_MS, HOLDER_PRECUT_MS, HOLDER_OPEN_MS, GRIPPERS_ON_MS
-    global GRIPPER_RELEASE_MS, LINEAR_DONE_MS, DWELL_AT_DEST_MM, ASENTAR_MS
+    global GRIPPER_RELEASE_MS, LINEAR_DONE_MS, DWELL_AT_DEST_MS, ASENTAR_MS
     global CUTTER_PULSE_MS, CUTTER_POST_MS, CUTTER_SETTLE_MS
     global PURGE_WARNING_LEAD_S, WIP_BLOWER_START_DELAY_S
     global WIP_BLOWER_MIN_TRAVEL_MM, WIP_START_CACHE_TOL_MM
@@ -657,8 +598,6 @@ def apply_cycle_config_runtime(cfg: CycleConfig) -> None:
     global MOTION_IDLE_NO_TARGET_S, PF_TFEED_DONE_TIMEOUT_S
     global PF_SETTLE_BEFORE_IDLE_S, PF_TFEED_CAPTURE_AFTER_PAUSE_S
     global ASDA_HOME_EPS_MM, MOTION_TARGET_TOL_MM
-    global TIMING_GAP_REPORT_S, TIMING_DELAY_OVERSHOOT_MS, TIMING_CMD_SLOW_S
-    global TIMING_ENCODER_OUTLIER_MM, TIMING_SUMMARY_EVERY_PIECES
 
     HOLDER_ON_MS = int(cfg.holder_on_ms)
     HOLDER_PRECUT_MS = int(cfg.holder_precut_ms)
@@ -666,7 +605,7 @@ def apply_cycle_config_runtime(cfg: CycleConfig) -> None:
     GRIPPERS_ON_MS = int(cfg.grippers_on_ms)
     GRIPPER_RELEASE_MS = int(cfg.gripper_release_ms)
     LINEAR_DONE_MS = int(cfg.linear_done_ms)
-    DWELL_AT_DEST_MM = int(cfg.dwell_at_dest_ms)
+    DWELL_AT_DEST_MS = int(cfg.dwell_at_dest_ms)
     ASENTAR_MS = int(cfg.asentar_ms)
     CUTTER_PULSE_MS = int(cfg.cutter_pulse_ms)
     CUTTER_POST_MS = int(cfg.cutter_post_ms)
@@ -688,11 +627,6 @@ def apply_cycle_config_runtime(cfg: CycleConfig) -> None:
     PF_TFEED_CAPTURE_AFTER_PAUSE_S = float(cfg.pf_tfeed_capture_after_pause_s)
     ASDA_HOME_EPS_MM = float(cfg.asda_home_eps_mm)
     MOTION_TARGET_TOL_MM = float(cfg.motion_target_tol_mm)
-    TIMING_GAP_REPORT_S = float(cfg.timing_gap_report_s)
-    TIMING_DELAY_OVERSHOOT_MS = int(cfg.timing_delay_overshoot_ms)
-    TIMING_CMD_SLOW_S = float(cfg.timing_cmd_slow_s)
-    TIMING_ENCODER_OUTLIER_MM = float(cfg.timing_encoder_outlier_mm)
-    TIMING_SUMMARY_EVERY_PIECES = int(cfg.timing_summary_every_pieces)
 
     _CYCLE_STEP_DELAY_MS.update(
         {
@@ -703,7 +637,7 @@ def apply_cycle_config_runtime(cfg: CycleConfig) -> None:
             "wait_holder_precut": HOLDER_PRECUT_MS,
             "wait_cutter_pulse": CUTTER_PULSE_MS,
             "wait_cutter_post": CUTTER_POST_MS,
-            "wait_deposit_dwell": DWELL_AT_DEST_MM,
+            "wait_deposit_dwell": DWELL_AT_DEST_MS,
             "wait_gripper_release": GRIPPER_RELEASE_MS,
             "wait_asentar": ASENTAR_MS,
         }
@@ -714,31 +648,8 @@ def apply_cycle_config_runtime(cfg: CycleConfig) -> None:
             step["delayMs"] = _CYCLE_STEP_DELAY_MS[key]
 
 
-def migrate_legacy_config_files(path: Path = CONFIG_PATH) -> dict[str, Any]:
-    """Une cycle.json + legados app_config / cycle_config; borra legados tras fusionar."""
-    raw = _read_cycle_json(path)
-    legacy_cycle = _read_cycle_json(LEGACY_CYCLE_CONFIG_PATH)
-    legacy_app = _read_cycle_json(LEGACY_APP_CONFIG_PATH)
-    cycle_keys = _cycle_json_cycle_keys()
-    for src in (legacy_app, legacy_cycle, raw):
-        for key, val in src.items():
-            if key in APP_CONFIG_JSON_KEYS or key in cycle_keys:
-                raw[key] = val
-            elif key in _LEGACY_CYCLE_JSON_ALIASES:
-                canon = _LEGACY_CYCLE_JSON_ALIASES[key]
-                if canon in cycle_keys:
-                    raw[canon] = val
-    for legacy_path in (LEGACY_APP_CONFIG_PATH, LEGACY_CYCLE_CONFIG_PATH):
-        if legacy_path.is_file():
-            try:
-                legacy_path.unlink()
-            except OSError:
-                pass
-    return raw
-
-
 def load_cycle_config(path: Path = CONFIG_PATH) -> CycleConfig:
-    raw = migrate_legacy_config_files(path)
+    raw = _read_cycle_json(path)
     cycle_keys = _cycle_json_cycle_keys()
     cycle_raw = {k: raw[k] for k in cycle_keys if k in raw}
     cfg = CycleConfig.from_dict({**CycleConfig().to_dict(), **cycle_raw})
@@ -749,7 +660,7 @@ def load_cycle_config(path: Path = CONFIG_PATH) -> CycleConfig:
 
 def save_cycle_config(cfg: CycleConfig, path: Path = CONFIG_PATH) -> None:
     comments = _cycle_json_line_comments(path)
-    raw = migrate_legacy_config_files(path)
+    raw = _read_cycle_json(path)
     app = {k: raw[k] for k in APP_CONFIG_JSON_KEYS if k in raw}
     doc = merge_cycle_json_document(app, cfg.to_dict())
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -761,7 +672,7 @@ def save_app_config_section(
     cycle: dict[str, Any] | None = None,
     path: Path = CONFIG_PATH,
 ) -> None:
-    raw = migrate_legacy_config_files(path)
+    raw = _read_cycle_json(path)
     cycle_keys = _cycle_json_cycle_keys()
     if cycle is None:
         cycle = {k: raw[k] for k in cycle_keys if k in raw}
@@ -774,7 +685,7 @@ def save_app_config_section(
 
 
 def read_app_config_section(path: Path = CONFIG_PATH) -> dict[str, Any]:
-    raw = migrate_legacy_config_files(path)
+    raw = _read_cycle_json(path)
     return {k: raw[k] for k in APP_CONFIG_JSON_KEYS if k in raw}
 
 class CycleHost(Protocol):
@@ -928,7 +839,7 @@ def plc_ack_match_index(queue, seq: int, req_id: int) -> int | None:
 
 
 class CycleRunner:
-    """Ejecuta el flujo de CycleFlowCopy en un hilo (orquestación)."""
+    """Ejecuta la secuencia del lote en un hilo."""
     def __init__(self, host: CycleHost) -> None:
         self._host = host
         self._lock = threading.Lock()
@@ -956,7 +867,6 @@ class CycleRunner:
         self._lot_purge_request: tuple[float | None, float | None] | None = None
         self._suspend_piece_watch = False
         self._step = 0
-        self._parallel_group = ""
         self._rep = 0
         self._pieces_done = 0
         self._total_reps = 0
@@ -1074,7 +984,6 @@ class CycleRunner:
                     (s["label"] for s in FLOW_STEPS if s["id"] == self._step),
                     "",
                 ),
-                "parallelGroup": self._parallel_group,
                 "rep": self._rep,
                 # UI en piezas físicas: L+R → ×2 (espejo).
                 "piecesDone": int(self._pieces_done) * max(1, int(self._pieces_per_rep)),
@@ -1171,16 +1080,6 @@ class CycleRunner:
         with self._lock:
             return self._operator_pf_start_blocked_locked()
 
-    def is_lot_alive(self) -> bool:
-        """Lote con progreso vivo (corriendo, en pausa o interrumpido por error)."""
-        with self._lock:
-            if self._active:
-                return True
-            if self._total_reps > 0 and not self._last_ok:
-                if self._pieces_done < self._total_reps:
-                    return True
-            return False
-
     def is_refill_active(self) -> bool:
         with self._lock:
             return bool(self._refill_mode and self._active)
@@ -1235,17 +1134,6 @@ class CycleRunner:
     def is_e050_materialist_wait(self) -> bool:
         with self._lock:
             return bool(self._e050_materialist_wait)
-
-    def is_e050_materialist_path(self) -> bool:
-        """Sí Materialista ya decidido: terminar pieza / HOME / espera OFF.
-
-        El PLC sigue reportando EncoderE mientras el sensor esté activo.
-        No re-preguntar ni re-latchear E050 hasta salir de esta ruta.
-        """
-        with self._lock:
-            return bool(
-                self._e050_materialist_requested or self._e050_materialist_wait
-            )
 
     def _e050_finishing_piece(self) -> bool:
         """Sí Materialista, aún terminando/parking la pieza (antes del wait)."""
@@ -1717,21 +1605,6 @@ class CycleRunner:
         if self._pending_lot_decision:
             self.request_lot_continue_or_abort()
         self._host.cycle_notify()
-
-    def release_for_manual_refill(self, timeout_s: float = 2.0) -> dict[str, Any]:
-        """Suelta un lote en Pause (p. ej. E050) para arrancar purga suelta.
-
-        Comando de operador (Purge), no Stop automático por el EXXX.
-        """
-        if not self.is_active():
-            return {"ok": True}
-        self.request_stop()
-        th = self._thread
-        if th is not None and th.is_alive():
-            th.join(timeout=max(0.2, float(timeout_s)))
-        if self.is_active():
-            return {"ok": False, "error": "Detener ciclo para purgar"}
-        return {"ok": True}
 
     def request_refill(
         self,
@@ -2540,60 +2413,18 @@ class CycleRunner:
         self._host.cycle_notify()
         return {"ok": True, "action": "error_state"}
 
-    def apply_e050_policy(
-        self,
-        ui: str,
-        recovery: str = "recovery",
-    ) -> dict[str, Any]:
-        """E050 durante lote: primero pregunta si requiere Materialista."""
-        if self._e050_materialist_requested or self._e050_materialist_wait:
-            return {"ok": True, "action": "e050_path", "e050": True}
-        if self._recovery_awaiting and self._recovery_prompt == "e050_materialist":
-            self._fault = ui
-            return {"ok": True, "action": "pause", "e050": True}
-        self._fault = ui
-        self._recovery = "e050_materialist"
-        self._e050_normal_recovery = recovery or "recovery"
-        self._e050_finish_piece = False
-        self._e050_materialist_requested = False
-        self._e050_materialist_wait = False
-        self._asda_move_warning = False
-        self._recovery_after_error = False
-        self._recovery_confirm.clear()
-        self._recovery_reject.clear()
-        with self._lock:
-            self._recovery_prompt = "e050_materialist"
-            self._recovery_awaiting = True
-        if self.is_active():
-            self._pause.set()
-            with self._lock:
-                if self._pause_t0 is None:
-                    self._pause_t0 = time.monotonic()
-            self._cancel_wip_blower()
-        if not self.is_active():
-            self._last_ok = False
-        self._set_state(TX_ERROR, ui)
-        self._host.cycle_log("E050: Pause — ¿Requiere Materialista?")
-        self._host.cycle_notify()
-        return {"ok": True, "action": "pause", "e050": True}
-
     def _set_progress(self, rep: int, step: int, total: int) -> None:
-        meta = next((s for s in FLOW_STEPS if s["id"] == step), {})
         with self._lock:
             self._rep = rep
             self._step = step
             self._total_reps = total
-            # Solo exponer paralelo en pasos kind=parallel (start/join)
-            if meta.get("kind") == "parallel":
-                self._parallel_group = str(meta.get("parallelRole") or "parallel")
-            else:
-                self._parallel_group = ""
             if total > 0:
                 frac = ((rep - 1) + step / max(PROGRESS_STEPS, 1)) / total
                 self._progress = max(0, min(100, int(frac * 100)))
             else:
                 self._progress = 0
         self._host.cycle_notify()
+
     def _enter(self, rep: int, qty: int, key: str) -> bool:
         """Marca paso atómico. True = abortar."""
         # recovery: completar pieza (corte) → Pause en post_piece; esperar Reset+Resume.
@@ -2712,7 +2543,7 @@ class CycleRunner:
     ) -> bool | None:
         """True/False según caché ASDA vs destino (magnitud). None = sin dato.
 
-        tol_mm: la espera de corte/depósito usa MOTION_TARGET_TOL_MM (3 mm).
+        tol_mm: la espera de corte/depósito usa MOTION_TARGET_TOL_MM (0.5 mm).
         MOVE_ZERO usa ASDA_MOVE_ZERO_TOL_MM (0.5 mm): si no, una parada de
         ~0.5 mm parece «ya en 0» y la espera cierra con el Idle del HOME anterior.
         """
@@ -2751,6 +2582,7 @@ class CycleRunner:
             return False
         deadline = time.monotonic() + limit
         idle_off_target_since: float | None = None
+        reissue_left = 3
         while True:
             if self._should_abort() or self._restart_piece:
                 return False
@@ -2828,15 +2660,37 @@ class CycleRunner:
                         refresh()
                     if self._asda_at_target(target_mm, tol_mm) is True:
                         return True
+                    if reissue is not None and reissue_left > 0:
+                        reissue_left -= 1
+                        self._host.cycle_log(
+                            f"ASDA pos={self._fmt_asda_pos()} mm ≠ destino "
+                            f"{abs(float(target_mm)):.2f} mm — reenviar MOVE "
+                            f"({3 - reissue_left}/3)"
+                        )
+                        self._host.clear_motion_reached_flag()
+                        idle_off_target_since = None
+                        if not reissue():
+                            if not self._should_abort() and not self._fault:
+                                kind = ""
+                                if hasattr(self._host, "last_move_fail_kind"):
+                                    kind = self._host.last_move_fail_kind()
+                                self._raise_fault(
+                                    "E065" if kind == "transport" else "move_cmd"
+                                )
+                            return False
+                        remain = self._piece_watch_remaining_s()
+                        limit = float(MOTION_WAIT_TIMEOUT_S)
+                        if remain is not None:
+                            limit = min(limit, remain)
+                        deadline = time.monotonic() + max(0.1, limit)
+                        continue
                     self._host.cycle_log(
                         f"MOVE sin llegar a destino: ASDA pos={self._fmt_asda_pos()} mm, "
-                        f"destino={abs(float(target_mm)):.1f} mm (Idle sin Reached)"
+                        f"destino={abs(float(target_mm)):.2f} mm (Idle sin Reached)"
                     )
                     self._raise_fault("E015")
                     idle_off_target_since = None
-                    if reissue is None or not self._pause.is_set():
-                        return False
-                    continue
+                    return False
             if time.monotonic() >= deadline:
                 break
             if watch and (self._piece_watch_remaining_s() or 0.0) <= 0:
@@ -3010,7 +2864,6 @@ class CycleRunner:
             self._pieces_done = self._total_reps
             self._progress = 100
             self._step = 0
-            self._parallel_group = ""
             self._last_ok = True
 
     def _freeze_piece_clock(self) -> float:
@@ -3206,7 +3059,6 @@ class CycleRunner:
         op: dict[str, Any] | None,
         *,
         ok: bool = True,
-        extra: dict[str, Any] | None = None,
     ) -> float:
         if not op:
             return 0.0
@@ -3416,13 +3268,6 @@ class CycleRunner:
                 if not self._ensure_pf_buffer_full_after_resume():
                     return False
                 remaining = timeout_s
-                # Tras error: si la referencia ya está en el láser, no esperar otro feed.
-                if self._recovery_after_error and self._feed_reference_visible():
-                    sides_txt = "".join(sides)
-                    self._material_feed_done = True
-                    if log_ok:
-                        self._host.cycle_log(f"Feed OK lados={sides_txt}")
-                    return True
                 continue
             if not self._ensure_pf_buffer_full_after_resume():
                 return False
@@ -3814,11 +3659,10 @@ class CycleRunner:
         if not self._host.cmd_motion_move_zero(self._lot_rpm):
             self._raise_fault("home_cmd")
             return False
-        # Más estricto que la puerta de 1 mm y que la tolerancia de corte
-        # (3 mm). Con ~0.5 mm el Idle del HOME anterior cae dentro de 3 mm
-        # y esta espera volvía en el acto, con el MOVE_ZERO todavía en el
-        # drive. El lineal siguiente recibía «ocupado» y el Idle en 0
-        # disparaba E015.
+        # Banda de 0.5 mm, más estricta que la puerta de HOME de 1 mm.
+        # Si no, el Idle del HOME anterior parece «ya en 0» y esta espera
+        # vuelve con el MOVE_ZERO todavía en el drive. El lineal siguiente
+        # recibía «ocupado» y el Idle en 0 disparaba E015.
         if not self._wait_motion(
             target_mm=0.0,
             reissue=lambda: self._host.cmd_motion_move_zero(self._lot_rpm),
@@ -4644,7 +4488,6 @@ class CycleRunner:
             self._finished_elapsed = 0.0
             self._progress = 0
             self._step = 0
-            self._parallel_group = ""
         analysis_begin_lot(
             {
                 "length_mm": abs(float(length_mm)),
@@ -4703,9 +4546,6 @@ class CycleRunner:
         L = abs(float(self._lot_length_mm))
         gap = max(0.0, float(cfg.deposit_stack_gap_mm))
         return float(cfg.deposit_extra_mm) + (n - 1) * (L + gap)
-
-    def _deposit_target_mm(self, rep: int, target_mm: float) -> float:
-        return float(target_mm) + self._deposit_extra_mm(rep)
 
     def _mark_cutter_set(self) -> None:
         self._cutter_set_mono = time.monotonic()
@@ -5070,30 +4910,6 @@ class CycleRunner:
                                 self._host.cycle_log(
                                     f"Feed omitido (ya alimentado+offset) lados={sides_txt}"
                                 )
-                            elif (
-                                (
-                                    rep == 1
-                                    or self._recovery_skip_feed
-                                    or self._recovery_after_error
-                                )
-                                and self._feed_reference_visible()
-                            ):
-                                c2_or_rec = (
-                                    self._recovery_skip_feed or self._recovery_after_error
-                                )
-                                self._recovery_skip_feed = False
-                                self._material_feed_done = True
-                                sides_txt = "".join(self._feed_side_list())
-                                if c2_or_rec:
-                                    self._host.cycle_log(
-                                        f"Feed omitido (recovery/recovery): láser ya ON "
-                                        f"lados={sides_txt}"
-                                    )
-                                else:
-                                    self._host.cycle_log(
-                                        f"Feed omitido (referencia láser visible) "
-                                        f"lados={sides_txt}"
-                                    )
                             else:
                                 self._recovery_skip_feed = False
                                 if not self._run_feed():
@@ -5597,7 +5413,6 @@ class CycleRunner:
                 self._pieces_done = self._total_reps
                 self._progress = 100
                 self._step = 0
-                self._parallel_group = ""
             elif self._pieces_done > 0:
                 total = max(1, self._total_reps)
                 self._progress = max(
